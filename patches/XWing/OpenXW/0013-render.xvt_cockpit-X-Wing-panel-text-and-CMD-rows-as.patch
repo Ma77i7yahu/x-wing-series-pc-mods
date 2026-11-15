@@ -1,0 +1,400 @@
+From 70fd2a6156d81b7992cee6326c3dd1c07b1cfdd2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 17:03:00 +1100
+Subject: [PATCH 13/59] render.xvt_cockpit: X-Wing panel text and CMD rows as
+ in XvT
+
+X-Wing only (XwXvtCockpit_PanelText):
+- The empty craft name box in the lower left of XWING12 is filled with its
+  own dark interior.
+- XvT's panel text at its own .int positions: E/L/S under the power bars,
+  F/R beside the shield switch, the mission clock, throttle (capped at
+  100%) and speed readouts with THROTTLE and SPEED captions. X-Wing's clock
+  and max speed panes and its weapon icon (elements 23-26) are hidden.
+- CMD: range centred on the last row, orders on the left and their target
+  or the cargo on the right of the row above; no speed/throttle row.
+- The CMD header and 3D model drawing are shared helpers.
+---
+ src/xw_remaster/hud_readout.c  | 230 +++++++++++++++++++++++++--------
+ src/xw_remaster/hud_readout.h  |   2 +
+ src/xw_remaster/hud_renderer.c |   2 +
+ src/xw_remaster/xvt_cockpit.c  |  31 +++++
+ src/xw_remaster/xvt_cockpit.h  |   5 +
+ 5 files changed, 215 insertions(+), 55 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 6955f19..082c11f 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -110,6 +110,151 @@ static void Stat(char* out, size_t n, const char* label, int pct) {
+ 		snprintf(out, n, "%s %d%%", label, pct);
+ }
+ 
++/* Target name and the SHD/HULL/SYS row; returns how many stat rows were used. */
++static unsigned DrawTargetHeader(const Pen* pen, const XwSnapReadout* r, const XwSnapRect* box, float top,
++								 float line) {
++	Centered(pen, box, top, r->target_name,
++			 r->target_relation == 0 ? FRIENDLY : r->target_relation == 1 ? HOSTILE : OTHER);
++	char shd[16], hull[16], sys[16], stats[64];
++	Stat(shd, sizeof shd, "SHD", r->target_shield_pct);
++	Stat(hull, sizeof hull, "HULL", r->target_hull_pct);
++	Stat(sys, sizeof sys, "SYS", r->target_system_pct);
++	/* X-Wing's CMD is narrower than XvT's: tighten the spacing, drop the percent signs, shorten HULL, and as a
++	 * last resort put SYS on a line of its own. */
++	float fit = box->width - 2;
++	unsigned stat_lines = 1;
++	snprintf(stats, sizeof stats, "%s  %s  %s", shd, hull, sys);
++	if (Measure(pen, stats) > fit)
++		snprintf(stats, sizeof stats, "%s %s %s", shd, hull, sys);
++	if (Measure(pen, stats) > fit) {
++		char* out = stats;
++		for (const char* in = stats; *in; ++in)
++			if (*in != '%')
++				*out++ = *in;
++		*out = 0;
++	}
++	if (Measure(pen, stats) > fit) {
++		char* h = strstr(stats, "HULL");
++		if (h)
++			memmove(h + 3, h + 4, strlen(h + 4) + 1);
++	}
++	if (Measure(pen, stats) > fit) {
++		snprintf(stats, sizeof stats, "%s %s", shd, hull);
++		Centered(pen, box, top + 2 * line, sys, LABEL);
++		stat_lines = 2;
++	}
++	Centered(pen, box, top + line, stats, LABEL);
++	return stat_lines;
++}
++
++/* The live 3D view of the target between area_top and area_bottom, letterboxed to its aspect. */
++static void TargetModel(const XwHudDraw* d, const Pen* pen, const XwSnapRect* box, float area_top,
++						float area_bottom, bool translucent) {
++	float aspect = 1;
++	AeronTexture* view = XwTargetView_Texture(&aspect);
++	float area_h = area_bottom - area_top, area_w = box->width - 4;
++	if (!view || area_h <= 4 || area_w <= 4)
++		return;
++	float w = area_w * pen->sx, h = area_h * pen->sy;
++	if (w / h > aspect)
++		w = h * aspect;
++	else
++		h = w / aspect;
++	AeronDrawList2DSprite sprite = { .texture = view,
++									 .src_u0 = 0,
++									 .src_v0 = 0,
++									 .src_u1 = 1,
++									 .src_v1 = 1,
++									 .dst_x = d->offset_x + (box->x + box->width / 2.0f) * pen->sx - w / 2,
++									 .dst_y = d->offset_y + (area_top + area_h / 2) * pen->sy - h / 2,
++									 .dst_w = w,
++									 .dst_h = h,
++									 .tint = { 1, 1, 1, translucent ? 0.9f : 1 },
++									 .blend = AERON_BLIT2D_BLEND_PMA,
++									 .filter = AERON_BLIT2D_FILTER_LINEAR };
++	AeronDrawList_AddSprite(d->list, &sprite);
++}
++
++static unsigned FontHeight(const XwHudImage* font) {
++	unsigned height = 0;
++	for (unsigned i = 0; font && i < font->font.glyph_count; ++i)
++		if (font->font.glyphs[i].height > height)
++			height = font->font.glyphs[i].height;
++	return height;
++}
++
++/* At XvT forward element `index`, as XvT's panel text draws it; X-Wing's fonts are taller than XvT's, so
++ * text is kept on screen. Returns the x after the text. */
++static float PanelText(const Pen* pen, unsigned index, const char* text, uint32_t rgb) {
++	int x, y;
++	if (!XwXvtCockpit_XvtPosition(index, &x, &y))
++		return 0;
++	/* The speed readout sits on its caption, which the screen bottom pushes up. */
++	if (index == 40)
++		y -= 4;
++	int bottom = 480 - (int)FontHeight(pen->font);
++	Text(pen, x, y < bottom ? y : bottom, text, rgb, 80);
++	return x + Measure(pen, text);
++}
++
++enum {
++	PANEL_LABEL = 0xC8CCD8, /* E/L/S, THROTTLE, SPEED. */
++	PANEL_SWITCH = 0xE8A030, /* F/R beside the shield switch. */
++	PANEL_CLOCK = 0xF0D040,
++	PANEL_VALUE = 0xFF4A28
++};
++
++bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
++	const XwRenderSnapshot* s = d->snapshot;
++	if (!d->definition || !XwXvtCockpit_PanelText(s))
++		return true;
++	/* XvT draws the readouts in a larger font than the labels. */
++	const XwHudImage* fonts[2] = { NULL, NULL };
++	for (unsigned i = 0; i < 2; ++i)
++		if (d->definition->fonts[i])
++			fonts[i] = XwHudAssets_Image((XwHudImageKey) { .source = d->definition->fonts[i], .kind = XW_HUD_IMAGE_FONT });
++	if (!fonts[0] || !fonts[1])
++		return true;
++	bool first_larger = FontHeight(fonts[0]) >= FontHeight(fonts[1]);
++	const XwHudImage *large = fonts[first_larger ? 0 : 1], *small = fonts[first_larger ? 1 : 0];
++	const AeronRuntimeAtlas *large_atlas = XwHudAssets_Atlas(large), *small_atlas = XwHudAssets_Atlas(small);
++	if (!large_atlas || !small_atlas)
++		return true;
++	Pen labels = { d, small, small_atlas, d->layout.scale_x, d->layout.scale_y, d->offset_x, d->offset_y };
++	Pen values = { d, large, large_atlas, d->layout.scale_x, d->layout.scale_y, d->offset_x, d->offset_y };
++
++	/* XvT elements: 124/122/123 power gauge letters, 128/129 shield switch, 46 clock, 41 throttle, 40 speed,
++	 * 120/121 their captions. */
++	PanelText(&labels, 124, "E", PANEL_LABEL);
++	PanelText(&labels, 122, "L", PANEL_LABEL);
++	PanelText(&labels, 123, "S", PANEL_LABEL);
++	PanelText(&labels, 128, "F", PANEL_SWITCH);
++	PanelText(&labels, 129, "R", PANEL_SWITCH);
++	PanelText(&labels, 120, "THROTTLE", PANEL_LABEL);
++	PanelText(&labels, 121, "SPEED", PANEL_LABEL);
++
++	/* X-Wing's clock pane holds minutes then two second digits. */
++	char digits[16], text[40];
++	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_CLOCK, digits, sizeof digits);
++	size_t n = strlen(digits);
++	if (n >= 3) {
++		snprintf(text, sizeof text, "%.*s:%s", (int)(n - 2), digits, digits + n - 2);
++		PanelText(&values, 46, text[0] == '0' && text[1] != ':' ? text + 1 : text, PANEL_CLOCK);
++	}
++	const XwSnapWidget* lever = &s->cockpit.widgets[22];
++	unsigned columns = d->definition->width == 320 ? 38 : 74;
++	unsigned percent = lever->visible ? (lever->value * 100 + columns / 2) / columns : 0;
++	snprintf(text, sizeof text, "%u", percent < 100 ? percent : 100);
++	/* The large font's percent sign is a plain slash; XvT's is the small one. */
++	float after = PanelText(&values, 41, text, PANEL_VALUE);
++	int x, y;
++	if (after > 0 && XwXvtCockpit_XvtPosition(41, &x, &y))
++		Text(&labels, after, y + (float)FontHeight(large) - FontHeight(small), "%", PANEL_VALUE, 10);
++	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, digits, sizeof digits);
++	PanelText(&values, 40, digits[0] ? digits : "0", PANEL_VALUE);
++	return true;
++}
++
+ bool XwHudCmd_Active(const XwRenderSnapshot* s) {
+ 	const XwSnapCamera* c = &s->camera;
+ 	return XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
+@@ -140,9 +285,36 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 	bool cockpit_off = s->camera.hud_state == XW_SNAP_VIEW_FULL_FORWARD;
+ 
+ 	float top = box->y + 1, bottom = box->y + box->height;
++	if (xvt && XwXvtCockpit_PanelText(s)) {
++		/* XvT's layout: range centred on the last row, orders on the left and their target (or the cargo) on
++		 * the right of the row above; speed and throttle have their own boxes. */
++		if (!r->target_valid)
++			return true;
++		unsigned stat_lines = DrawTargetHeader(&pen, r, box, top, line);
++		char dist[24], detail[48];
++		snprintf(dist, sizeof dist, "DIST %u.%02u", r->target_distance_hundredths / 100,
++				 r->target_distance_hundredths % 100);
++		float last = bottom - line - 1, row = last - line;
++		Centered(&pen, box, last, dist, VALUE);
++		float half = box->width / 2.0f - 3;
++		if (r->target_order_target[0])
++			snprintf(detail, sizeof detail, "%s", r->target_order_target);
++		else if (r->cargo_valid)
++			snprintf(detail, sizeof detail, "%s", r->target_cargo);
++		else
++			detail[0] = 0;
++		float detail_w = detail[0] ? fminf(Measure(&pen, detail), half) : 0;
++		if (detail[0])
++			Text(&pen, box->x + box->width - 3 - detail_w, row, detail, VALUE, half);
++		/* Orders take whatever the right-hand text leaves. */
++		if (r->target_orders[0])
++			Text(&pen, box->x + 3, row, r->target_orders, LABEL, box->width - 6 - detail_w - (detail[0] ? 4 : 0));
++		TargetModel(d, &pen, box, top + (1 + stat_lines) * line, row - 1, false);
++		return true;
++	}
+ 	if (xvt) {
+ 		/* XvT's CMD screen is part of its art. Its bottom row shows speed and throttle. */
+-		char speed[16], throttle[24], value[16];
++		char speed[24], throttle[24], value[16];
+ 		XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, value, sizeof value);
+ 		snprintf(speed, sizeof speed, "SPD %s", value[0] ? value : "0");
+ 		const XwSnapWidget* lever = &s->cockpit.widgets[22];
+@@ -156,37 +328,8 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		Fill(&pen, box->x, box->y, box->width, box->height, BACKDROP, cockpit_off ? 0.55f : 1.0f);
+ 	if (!r->target_valid)
+ 		return true;
+-	Centered(&pen, box, top,
+-			 r->target_name, r->target_relation == 0 ? FRIENDLY : r->target_relation == 1 ? HOSTILE : OTHER);
+-	char shd[16], hull[16], sys[16], stats[64];
+-	Stat(shd, sizeof shd, "SHD", r->target_shield_pct);
+-	Stat(hull, sizeof hull, "HULL", r->target_hull_pct);
+-	Stat(sys, sizeof sys, "SYS", r->target_system_pct);
+-	/* X-Wing's CMD is narrower than XvT's: tighten the spacing, drop the percent signs, shorten HULL, and as a
+-	 * last resort put SYS on a line of its own. */
+ 	float fit = box->width - 2;
+-	unsigned stat_lines = 1;
+-	snprintf(stats, sizeof stats, "%s  %s  %s", shd, hull, sys);
+-	if (Measure(&pen, stats) > fit)
+-		snprintf(stats, sizeof stats, "%s %s %s", shd, hull, sys);
+-	if (Measure(&pen, stats) > fit) {
+-		char* out = stats;
+-		for (const char* in = stats; *in; ++in)
+-			if (*in != '%')
+-				*out++ = *in;
+-		*out = 0;
+-	}
+-	if (Measure(&pen, stats) > fit) {
+-		char* h = strstr(stats, "HULL");
+-		if (h)
+-			memmove(h + 3, h + 4, strlen(h + 4) + 1);
+-	}
+-	if (Measure(&pen, stats) > fit) {
+-		snprintf(stats, sizeof stats, "%s %s", shd, hull);
+-		Centered(&pen, box, top + 2 * line, sys, LABEL);
+-		stat_lines = 2;
+-	}
+-	Centered(&pen, box, top + line, stats, LABEL);
++	unsigned stat_lines = DrawTargetHeader(&pen, r, box, top, line);
+ 
+ 	/* Bottom rows as in XvT: range centred on the last line, orders (or an alert status) above it, and
+ 	 * cargo or the order's target above that. */
+@@ -236,30 +379,7 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		Centered(&pen, box, image_bottom + 1, detail, VALUE);
+ 	}
+ 
+-	/* The live 3D view between the stats and the bottom rows, letterboxed to its aspect. */
+-	float aspect = 1;
+-	AeronTexture* view = XwTargetView_Texture(&aspect);
+-	float area_top = top + (1 + stat_lines) * line, area_h = image_bottom - area_top, area_w = box->width - 4;
+-	if (view && area_h > 4 && area_w > 4) {
+-		float w = area_w * pen.sx, h = area_h * pen.sy;
+-		if (w / h > aspect)
+-			w = h * aspect;
+-		else
+-			h = w / aspect;
+-		AeronDrawList2DSprite sprite = { .texture = view,
+-										 .src_u0 = 0,
+-										 .src_v0 = 0,
+-										 .src_u1 = 1,
+-										 .src_v1 = 1,
+-										 .dst_x = d->offset_x + (box->x + box->width / 2.0f) * pen.sx - w / 2,
+-										 .dst_y = d->offset_y + (area_top + area_h / 2) * pen.sy - h / 2,
+-										 .dst_w = w,
+-										 .dst_h = h,
+-										 .tint = { 1, 1, 1, cockpit_off ? 0.9f : 1 },
+-										 .blend = AERON_BLIT2D_BLEND_PMA,
+-										 .filter = AERON_BLIT2D_FILTER_LINEAR };
+-		AeronDrawList_AddSprite(d->list, &sprite);
+-	}
++	TargetModel(d, &pen, box, top + (1 + stat_lines) * line, image_bottom, cockpit_off);
+ 	return true;
+ }
+ 
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+index 7808794..cdd9c5a 100644
+--- a/src/xw_remaster/hud_readout.h
++++ b/src/xw_remaster/hud_readout.h
+@@ -7,6 +7,8 @@
+ bool XwHudCmd_Active(const XwRenderSnapshot* snapshot);
+ /* Draws the XvT-style CMD into draw->list at the cockpit's CMD screen. */
+ bool XwHudCmd_Draw(const XwHudDraw* draw);
++/* render.xvt_cockpit: XvT's own panel text (power and shield switch letters, clock, throttle, speed). */
++bool XwHudXvtPanel_Draw(const XwHudDraw* draw);
+ /* view_target (Z) with render.xvt_targeting_computer: XvT's threat display frame and readouts replace the HUD.
+  * Active only when XvT's frame art loaded. */
+ bool XwHudThreat_Active(const XwRenderSnapshot* snapshot);
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 78a5920..50ad18f 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -242,6 +242,8 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		if (!(draw.xvt ? XwXvtCockpit_DrawBase(&draw) : XwHudDraw_Base(&draw)) ||
+ 			!XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
+ 			return false;
++		if (draw.xvt)
++			XwHudXvtPanel_Draw(&draw);
+ 		if (key.cmd_active)
+ 			XwHudCmd_Draw(&draw);
+ 		else
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 715e640..71996fa 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -44,6 +44,7 @@ enum {
+ 	EL_WARHEAD_COUNT = 13,
+ 	EL_CLOCK = 32,
+ 	EL_MAX_SPEED = 27,
++	EL_WEAPON_ICON = 23, /* Then three 1-pixel lights. */
+ 	XVT_HULL = 39,
+ 	XVT_ENGINE_POWER = 42,
+ 	XVT_CLOCK = 121 /* XvT's speed readout; in the cockpit-off HUD set, its lower right box. */
+@@ -238,6 +239,15 @@ static AeronTexture* Texture(const char* lfd_name, XwSnapRect aperture, const ui
+ 	if (panl && AeronPnl_DecodeIndexed(panl->data, panl->size, 0, -1, &frame, NULL)) {
+ 		if (mask)
+ 			ApplyMask(&frame, mask, aperture);
++		/* The X-Wing's craft name box (lower left) shows nothing in X-Wing; fill it with its own dark interior. */
++		if (!strcasecmp(lfd_name, "XWING12") && frame.width >= 640 && frame.height >= 480) {
++			uint8_t fill = frame.indices[(size_t)468 * frame.width + 140];
++			for (unsigned y = 457; y < 480; ++y)
++				for (unsigned x = 92; x < 192; ++x) {
++					frame.indices[(size_t)y * frame.width + x] = fill;
++					frame.coverage[(size_t)y * frame.width + x] = 255;
++				}
++		}
+ 		size_t pixels = (size_t)frame.width * frame.height;
+ 		uint8_t* rgba = malloc(pixels * 4);
+ 		if (rgba) {
+@@ -487,6 +497,9 @@ bool XwXvtCockpit_Element(const XwHudDraw* d, unsigned index, int* dx, int* dy)
+ 		/* XvT shows throttle as text in the CMD. */
+ 		if (index == EL_THROTTLE || o->state == 2)
+ 			return false;
++		/* X-Wing's weapon icon and its lights have no place on XvT's panel (its clock box). */
++		if (index >= EL_WEAPON_ICON && index <= EL_WEAPON_ICON + 3 && XwXvtCockpit_PanelText(d->snapshot))
++			return false;
+ 		if (o->state == 1) {
+ 			*dx = o->dx;
+ 			*dy = o->dy;
+@@ -529,6 +542,12 @@ bool XwXvtCockpit_Pane(const XwHudDraw* d, unsigned pane, int x, int y, int* dx,
+ 		case XW_SNAP_PANE_SPEED:
+ 		case XW_SNAP_PANE_THROTTLE:
+ 			return false;
++		/* XvT's own clock, throttle and speed readouts replace the clock and max speed. */
++		case XW_SNAP_PANE_CLOCK:
++		case XW_SNAP_PANE_MAX_SPEED:
++			if (view == 0 && XwXvtCockpit_PanelText(d->snapshot))
++				return false;
++			break;
+ 		case XW_SNAP_PANE_VIEW_LABEL:
+ 		case XW_SNAP_PANE_COURSE:
+ 		case XW_SNAP_PANE_FRAME_RATE:
+@@ -624,6 +643,18 @@ void XwXvtCockpit_PaneText(const XwRenderSnapshot* s, unsigned pane, char* out,
+ 	out[n] = 0;
+ }
+ 
++bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
++	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 && !strcmp(g_craft.name, "xwing");
++}
++
++bool XwXvtCockpit_XvtPosition(unsigned index, int* x, int* y) {
++	if (!g_craft.loaded || index >= HUD_BASE || !Placed(&g_craft.elements[index]))
++		return false;
++	*x = g_craft.elements[index].x;
++	*y = g_craft.elements[index].y;
++	return true;
++}
++
+ void XwXvtCockpit_Shutdown(void) {
+ 	for (unsigned i = 0; i < ART_CACHE; ++i)
+ 		Aeron_DestroyTexture(g_art[i].texture);
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index c6d46fe..bcb4d45 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -21,5 +21,10 @@ bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int*
+ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
+ /* Text of a captured HUD pane in reading order ("" when absent). */
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
++/* True when the forward cockpit also shows XvT's own panel text (E/L/S, F/R, clock, throttle and speed
++ * boxes) and the XvT CMD bottom rows. So far the X-Wing only. */
++bool XwXvtCockpit_PanelText(const XwRenderSnapshot* snapshot);
++/* Classic position of XvT forward element `index` for the current craft. False when it is not placed. */
++bool XwXvtCockpit_XvtPosition(unsigned index, int* x, int* y);
+ void XwXvtCockpit_Shutdown(void);
+ #endif

@@ -1,0 +1,299 @@
+From 832c8a6d2fea40cb5e4e41bcfc0507b4b2acb339 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 22:39:23 +1100
+Subject: [PATCH 38/59] XvT threat lights; ion cannons only disable TIEs
+
+- render.xvt_cockpit: XvT's four threat lights above the gunsight (elements
+  90-93) draw with XvT's panel sprites in both the cockpit and cockpit-off
+  views. render_readout.c CaptureThreats follows Hud_UpdateThreatIndicators:
+  a craft targeting the player with a cannon burst under way, a starship
+  turret whose firingGate names the player, and the warhead lock (flashing,
+  then steady). The beam light stays dark. All go dark with the weapon
+  warning system damaged, as X-Wing's own light does.
+- game.ion_disable_only ("Ion Cannons vs TIEs"): a TIE fighter, interceptor
+  or bomber disabled by ions no longer gets X-Wing's 60-tick lifetime, so it
+  stays disabled instead of exploding.
+---
+ resources/config.yaml                    |  3 +++
+ src/xw/flight/object/collide.c           |  6 ++++-
+ src/xw_app/settings/game_page.c          |  2 ++
+ src/xw_remaster/hud_renderer.c           |  9 +++++--
+ src/xw_remaster/xvt_cockpit.c            | 26 ++++++++++++++++++++
+ src/xw_remaster/xvt_cockpit.h            |  2 ++
+ src/xw_runtime/config/flight_tweaks.c    |  5 ++++
+ src/xw_runtime/config/flight_tweaks.h    |  4 +++
+ src/xw_runtime/config/preference_apply.c |  1 +
+ src/xw_runtime/config/settings.c         |  1 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ src/xw_runtime/snapshot/render_readout.c | 31 ++++++++++++++++++++++++
+ src/xw_runtime/snapshot/render_types.h   |  4 +++
+ 13 files changed, 92 insertions(+), 4 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 9f879e5..d884e4b 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -270,6 +270,9 @@ game:
+   # X-Wing vs TIE Fighter's engine wash: flying close behind a working freighter's or
+   # starship's engines drains the player's shields, then hull. 1998 flight only.
+   xvt_engine_wash: true
++  # Ion cannons only disable: a TIE fighter, interceptor or bomber knocked out by ions
++  # stays disabled like any other craft instead of exploding (X-Wing blows them up).
++  ion_disable_only: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index f19d567..df123b3 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -1747,7 +1747,11 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ #else
+ 						disabledType = g_objectTable[victimObjIdx].objectType;
+ #endif
+-						if (disabledType >= XW_OBJ_TIE_FIGHTER && disabledType <= XW_OBJ_TIE_BOMBER) {
++						if (disabledType >= XW_OBJ_TIE_FIGHTER && disabledType <= XW_OBJ_TIE_BOMBER
++#ifdef XW_MODERN
++							&& !XwFlightTweaks_IonDisableOnly()
++#endif
++						) {
+ 							g_objectTable[victimObjIdx].lifetimeTicks = COLLIDE_DISABLED_TIE_LIFETIME;
+ 						}
+ 					}
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index f03fb50..f02a4f1 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -110,6 +110,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "Normal", "Overcharged" }, 2);
+ 	AeronUi_Selector(ui, "Engine Wash", &draft->xvt_engine_wash,
+ 					 (const char* const[]) { "Off", "XvT (Capital Ships & Freighters)" }, 2);
++	AeronUi_Selector(ui, "Ion Cannons vs TIEs", &draft->ion_disable_only,
++					 (const char* const[]) { "X-Wing (Disabled TIEs Explode)", "Disable Only" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+ 					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 19f28b7..bb94d2d 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -20,6 +20,7 @@ typedef struct HudKey {
+ 	int cmd_active;     /* render.xvt_targeting_computer replaces the CMD panes. */
+ 	int threat_active;  /* view_target: XvT's threat display replaces the HUD. */
+ 	int xvt_cockpit;    /* render.xvt_cockpit: XvT art for this view. */
++	uint8_t threats[4]; /* XvT threat lights (with xvt_cockpit). */
+ 	XwSnapReadout readout;
+ 	const AeronTexture* target_view;
+ } HudKey;
+@@ -219,8 +220,10 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .cmd_active = XwHudCmd_Active(snapshot),
+ 				   .threat_active = XwHudThreat_Active(snapshot),
+ 				   .xvt_cockpit = XwXvtCockpit_Active(snapshot) };
+-	if (key.xvt_cockpit)
++	if (key.xvt_cockpit) {
+ 		XwHudXvtFont_Load();
++		memcpy(key.threats, snapshot->readout.threats, sizeof key.threats);
++	}
+ 	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+@@ -264,8 +267,10 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		if (!(draw.xvt ? XwXvtCockpit_DrawBase(&draw) : XwHudDraw_Base(&draw)) ||
+ 			!XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
+ 			return false;
+-		if (draw.xvt)
++		if (draw.xvt) {
+ 			XwHudXvtPanel_Draw(&draw);
++			XwXvtCockpit_DrawThreats(&draw);
++		}
+ 		if (key.cmd_active)
+ 			XwHudCmd_Draw(&draw);
+ 		else
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 4df1491..c798f82 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -47,7 +47,10 @@ enum {
+ 	EL_CLOCK = 32,
+ 	EL_MAX_SPEED = 27,
+ 	EL_WEAPON_ICON = 23, /* Then three 1-pixel lights. */
++	EL_GUNSIGHT = 37,
+ 	XVT_HULL = 39,
++	XVT_GUNSIGHT = 52,
++	XVT_THREAT = 90, /* Four lights: attack, turret, beam, warhead lock. */
+ 	XVT_ENGINE_POWER = 42,
+ 	XVT_CLOCK = 121 /* XvT's speed readout; in the cockpit-off HUD set, its lower right box. */
+ };
+@@ -922,6 +925,29 @@ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* d, unsigned index, const XwSna
+ 	return true;
+ }
+ 
++void XwXvtCockpit_DrawThreats(const XwHudDraw* d) {
++	unsigned view = d->snapshot->cockpit.view;
++	if ((view != 0 && view != VIEW_HUD) || !LoadPanel())
++		return;
++	/* The row sits above the gunsight. With the cockpit off the gunsight keeps X-Wing's place, so the row
++	 * keeps its XvT distance from it. */
++	const Element* gunsight = &g_craft.elements[XVT_GUNSIGHT];
++	int dx = 0, dy = 0;
++	if (view == VIEW_HUD) {
++		dx = d->definition->elements[EL_GUNSIGHT].x - gunsight->x;
++		dy = d->definition->elements[EL_GUNSIGHT].y - gunsight->y;
++	}
++	for (unsigned i = 0; i < 4; ++i) {
++		const Element* e = &g_craft.elements[XVT_THREAT + i];
++		if (!Placed(e) || e->selector < 0)
++			continue;
++		const Sprite* sprite = GetSprite((unsigned)e->selector + d->snapshot->readout.threats[i], (unsigned)e->color,
++										 PLAIN, 0, d->snapshot->cockpit.palette_argb);
++		if (sprite)
++			DrawSprite(d, sprite, e->x + dx, e->y + dy);
++	}
++}
++
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
+ 	return XwXvtCockpit_Active(s) && s->cockpit.view == 0;
+ }
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index f6dd383..dff7a80 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -15,6 +15,8 @@ bool XwXvtCockpit_Element(const XwHudDraw* draw, unsigned index, int* dx, int* d
+ /* Draws X-Wing widget `index` with XvT's own sprite (shields and hull), as XvT colors it. False leaves it to
+  * X-Wing's art. */
+ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* draw, unsigned index, const XwSnapWidget* widget);
++/* XvT's four threat lights above the gunsight (XvT elements 90-93), lit from snapshot->readout.threats. */
++void XwXvtCockpit_DrawThreats(const XwHudDraw* draw);
+ /* Instrument sprites larger than this many pixels are X-Wing's damage overlays, which do not fit XvT art. */
+ enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 4000 }; /* The gunsight (74x45) is smaller; the overlays are larger. */
+ /* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 7d220bc..af0d740 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -13,6 +13,11 @@ static bool s_xvt_shields = true;
+ static bool s_xvt_turning = true;
+ static bool s_start_overshield = true;
+ static bool s_xvt_engine_wash = true;
++static bool s_ion_disable_only = true;
++
++bool XwFlightTweaks_IonDisableOnly(void) { return s_ion_disable_only; }
++
++void XwFlightTweaks_SetIonDisableOnly(bool enabled) { s_ion_disable_only = enabled; }
+ 
+ bool XwFlightTweaks_XvtEngineWash(void) { return s_xvt_engine_wash; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index ee52f13..8e8ccbc 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -68,6 +68,10 @@ void XwFlightTweaks_SetStartOvershield(bool enabled);
+  * or starship's engine meshes, the player takes shield then hull damage every 29 ticks. 1998 flight only. */
+ bool XwFlightTweaks_XvtEngineWash(void);
+ void XwFlightTweaks_SetXvtEngineWash(bool enabled);
++/* game.ion_disable_only: a TIE fighter, interceptor or bomber disabled by ion cannons stays disabled, as every
++ * other craft does, instead of exploding a quarter second later (X-Wing's COLLIDE_DISABLED_TIE_LIFETIME). */
++bool XwFlightTweaks_IonDisableOnly(void);
++void XwFlightTweaks_SetIonDisableOnly(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 05d867a..b938321 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -39,6 +39,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtTurning(settings->xvt_turning != 0);
+ 	XwFlightTweaks_SetStartOvershield(settings->start_overshield != 0);
+ 	XwFlightTweaks_SetXvtEngineWash(settings->xvt_engine_wash != 0);
++	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index cb44504..2974cfd 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -116,6 +116,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_turning", xvt_turning),
+ 	SETTING_BOOL("game.start_overshield", start_overshield),
+ 	SETTING_BOOL("game.xvt_engine_wash", xvt_engine_wash),
++	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 175aaf7..0c5114b 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -39,7 +39,7 @@ typedef struct XwSettings {
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+-	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash;
++	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index f0649b6..ae339ae 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -284,11 +284,42 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 	}
+ }
+ 
++/* OpenXvT Hud_UpdateThreatIndicators with X-Wing's AI fields: a burst in progress (linkMode) at the player,
++ * a turret slot whose firingGate names the player, and panel_updateweaponwarnings' warhead lock. Like that
++ * warning light, all go dark when the weapon warning system is damaged. */
++static void CaptureThreats(XwSnapReadout* r) {
++	if (!(g_playerFlightState.craft->activeHudFeatureMask & PANEL_HUD_WEAPON_WARNING_FEATURE))
++		return;
++	uint16_t player = g_playerFlightState.objectIndex;
++	int16_t max_lock = 0;
++	for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
++		if (index == player || !LiveObject(index) || g_objectTable[index].familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		const CraftData* craft = g_objectTable[index].instanceData;
++		if (!craft || craft->workingSubsystems == 0)
++			continue;
++		if (craft->aiTargetRef == player) {
++			for (unsigned group = 0; group < craft->cannonClassCount; ++group)
++				if (craft->laserState.linkMode[group] != 0)
++					r->threats[0] = 1;
++			if (craft->aiManeuverId == PAIORDER_MANEUVER_ATTACK_ALTERNATE && craft->warheadLockTicks > max_lock)
++				max_lock = craft->warheadLockTicks;
++		}
++		for (unsigned slot = 0; slot < craft->laserSlotCount; ++slot)
++			if (craft->weaponSlots[slot].firingGate == (int16_t)(player + 1))
++				r->threats[1] = 1;
++	}
++	r->threats[3] = max_lock > PANEL_WEAPON_LOCK_COMPLETE_TICKS ? PANEL_WEAPON_WARNING_LOCKED
++					: max_lock > 0 ? (uint8_t)((g_missionElapsedClock.subsecondTicks / PANEL_WEAPON_WARNING_FLASH_TICKS) & 1)
++								   : 0;
++}
++
+ void XwReadout_Capture(XwSnapReadout* r) {
+ 	memset(r, 0, sizeof *r);
+ 	r->boarding_remaining_s = -1;
+ 	if (!g_playerFlightState.craft || !g_playerFlightState.object || g_replayviewmode)
+ 		return;
++	CaptureThreats(r);
+ 	const XwFlightPanelLayout* layout = XwFlightPanel_Layout();
+ 	r->cmd = (XwSnapRect) { g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].x,
+ 							g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].y, layout->width, layout->footerBottom };
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 6f8e633..bad352c 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -227,6 +227,10 @@ typedef struct XwSnapReadout {
+ 	 * whole boarding time still to come. */
+ 	int32_t boarding_remaining_s;
+ 	uint8_t boarding_docked;
++	/* XvT's threat lights above the gunsight (Hud_UpdateThreatIndicators): a craft firing its cannons with the
++	 * player as its target, a starship turret aimed at the player, a beam (always 0: X-Wing has none), and a
++	 * warhead lock (0 off, 1 flashing while locking, 2 locked). */
++	uint8_t threats[4];
+ } XwSnapReadout;
+ 
+ typedef struct XwSnapWidget {

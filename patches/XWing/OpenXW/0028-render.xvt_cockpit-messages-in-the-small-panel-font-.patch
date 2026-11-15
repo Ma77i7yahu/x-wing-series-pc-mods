@@ -1,0 +1,206 @@
+From c930178f7bdb3dd969f840ee8fde4b7c4579a20a Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 20:58:41 +1100
+Subject: [PATCH 28/59] render.xvt_cockpit: messages in the small panel font
+ above the cockpit; own-control confirmations hidden
+
+---
+ src/xw/flight/hud/msg.c                | 77 +++++++++++++++-----------
+ src/xw_remaster/xvt_cockpit.c          |  7 +--
+ src/xw_runtime/snapshot/render_hud.c   |  8 ---
+ src/xw_runtime/snapshot/render_hud.h   |  2 -
+ src/xw_runtime/snapshot/render_types.h |  4 +-
+ 5 files changed, 49 insertions(+), 49 deletions(-)
+
+diff --git a/src/xw/flight/hud/msg.c b/src/xw/flight/hud/msg.c
+index 31757ef..a6dd5d9 100644
+--- a/src/xw/flight/hud/msg.c
++++ b/src/xw/flight/hud/msg.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/hud/msg.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/snapshot/render_hud.h"
+ #endif
+ #include "xw/audio/fsfx.h"
+@@ -250,6 +251,40 @@ void msg_messageinit(void) {
+ }
+ 
+ #ifdef XW_MODERN
++/* render.xvt_cockpit: confirmations of the player's own controls (weapons, power, shields, throttle, S-foils, CMD
++ * mode) aren't shown; the panel already shows them. Damage, warnings, targets and mission traffic still are. */
++static bool MessageIsOwnAction(XwFlightMessageId id) {
++	switch (id) {
++		case XW_MSG_LASER_CANNONS_ARMED:
++		case XW_MSG_ION_CANNONS_ARMED:
++		case XW_MSG_WARHEAD_LAUNCHERS_ARMED:
++		case XW_MSG_WARHEAD_LAUNCHERS_SINGLE_FIRE:
++		case XW_MSG_WARHEAD_LAUNCHERS_DUAL_FIRE:
++		case XW_MSG_CANNONS_SINGLE_FIRE:
++		case XW_MSG_CANNONS_DUAL_FIRE:
++		case XW_MSG_CANNONS_LINKED_FIRE:
++		case XW_MSG_DEFLECTOR_SHIELD_DISTRIBUTION:
++		case XW_MSG_LASER_RECHARGE_RATE:
++		case XW_MSG_SHIELD_RECHARGE_RATE:
++		case XW_MSG_GRAPHICS_DETAIL_LEVEL:
++		case XW_MSG_MISSILE_TARGETED:
++		case XW_MSG_ENGINE_THROTTLE_SETTING:
++		case XW_MSG_COMBAT_DISPLAY_MODE:
++		case XW_MSG_SFOILS_OPENING:
++		case XW_MSG_SFOILS_CLOSING:
++		case XW_MSG_SFOILS_POSITION_REACHED:
++		case XW_MSG_TRANSFER_SHIELDS_TO_LASERS:
++		case XW_MSG_TRANSFER_LASERS_TO_SHIELDS:
++		case XW_MSG_WARHEAD_FIRED_SINGULAR:
++		case XW_MSG_WARHEAD_FIRED_PLURAL:
++		case XW_MSG_MATCHING_TARGET_SPEED:
++		case XW_MSG_MATCHING_TARGET_SPEED_MAX_THROTTLE:
++			return true;
++		default:
++			return false;
++	}
++}
++
+ /* Replacement template for the next msg_messageprintf call; it keeps messageId's identity. */
+ static const char* s_messageTemplateOverride;
+ 
+@@ -269,6 +304,10 @@ void msg_messageprintf(XwFlightMessageId messageId) {
+ 	int textLength = 0;
+ #ifdef XW_MODERN
+ 	XwHudInFlightMessageRecord message = { 0 };
++	if (XwFlightTweaks_XvtCockpit() && MessageIsOwnAction(messageId)) {
++		g_messageDynamicStringCursor = 0;
++		return;
++	}
+ #else
+ 	XwHudInFlightMessageRecord message;
+ #endif
+@@ -416,41 +455,10 @@ void msg_getmessagefromqueue(void) {
+ 	--g_readyMessageQueueCount;
+ }
+ 
+-#ifdef XW_MODERN
+-/* XvT puts mission traffic (sensor contacts, craft events, wingmen, mission state) at the top of the screen and
+- * ship status above the cockpit. */
+-static bool MessageIsTraffic(XwFlightMessageId id) {
+-	switch (id) {
+-		case XW_MSG_SENSORS_NEW_CRAFT_SINGULAR:
+-		case XW_MSG_SENSORS_NEW_CRAFT_PLURAL:
+-		case XW_MSG_PROVING_GROUNDS_LEVEL_COMPLETED:
+-		case XW_MSG_BONUS_POINTS_AWARDED:
+-		case XW_MSG_MISSION_TWO_MINUTES_REMAINING:
+-		case XW_MSG_MISSION_ONE_MINUTE_REMAINING:
+-		case XW_MSG_MISSION_TIME_EXPIRED_HYPERSPACE:
+-		case XW_MSG_MISSION_OBJECTIVES_FAILED_RETURN_TO_BASE:
+-		case XW_MSG_CRAFT_EVENT_NUMBERED:
+-		case XW_MSG_CRAFT_EVENT_UNNUMBERED:
+-		case XW_MSG_RADIO_ACKNOWLEDGED_NUMBERED:
+-		case XW_MSG_RADIO_ACKNOWLEDGED_UNNUMBERED:
+-		case XW_MSG_CRAFT_REPORT_NUMBERED:
+-		case XW_MSG_CRAFT_REPORT_UNNUMBERED:
+-		case XW_MSG_MISSION_COMPLETE:
+-		case XW_MSG_MISSION_COMPLETION_TEXT:
+-		case XW_MSG_PREVIOUS_LEVEL_POINTS_AWARDED:
+-		case XW_MSG_EXHAUST_PORT_DIRECT_HIT:
+-			return true;
+-		default:
+-			return false;
+-	}
+-}
+-#endif
+-
+ // FUNCTION: XW 0x412130
+ void msg_messagedisplay(void) {
+ #ifdef XW_MODERN
+ 	int hud_pane = XwHud_Push(XW_SNAP_PANE_READY_MESSAGE);
+-	XwHud_MessageTop(MessageIsTraffic(g_readyMessagePaneQueue[0].stateOrMessageId));
+ #endif
+ 
+ 	uint16_t index;
+@@ -489,6 +497,13 @@ void msg_messagedisplay(void) {
+ // FUNCTION: XW 0x4121B0
+ void msg_readymessage(void) {
+ 	festring_setfontsize(FLIGHT_FONT_TINY);
++#ifdef XW_MODERN
++	/* render.xvt_cockpit: the small font of XvT's panel text, keeping lower case (MICRO64 has it). */
++	if (XwFlightTweaks_XvtCockpit()) {
++		festring_setfontsize(FLIGHT_FONT_MICRO);
++		g_flightFontHasLowercase = 1;
++	}
++#endif
+ 	festring_setbackcolor(XW_MSG_BACKGROUND_COLOR);
+ 	g_flightTextShadowEnabled = 1;
+ 	festring_setdropcolor(XW_MSG_SHADOW_COLOR);
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 4414cde..21baa53 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -30,10 +30,7 @@ enum {
+ 	HUD_BASE = 144, /* XvT's cockpit-off HUD element set. */
+ 	VIEW_NONE = 18,
+ 	VIEW_HUD = 19,
+-	/* Messages leave the 1998 bottom strip as XvT's do (both centred): ship status just above the cockpit,
+-	 * mission traffic at the top between the radars. */
+-	MESSAGE_STATUS_Y = 208,
+-	MESSAGE_TRAFFIC_Y = 4,
++	MESSAGE_Y = 208, /* Messages move from the 1998 bottom strip to just above the cockpit, centred, as XvT's. */
+ 	MESSAGE_STRIP_Y = 457,
+ 	ART_CACHE = 24
+ };
+@@ -591,7 +588,7 @@ bool XwXvtCockpit_Pane(const XwHudDraw* d, unsigned pane, int x, int y, int* dx,
+ 	ComputeOffsets(def);
+ 	switch (pane) {
+ 		case XW_SNAP_PANE_READY_MESSAGE:
+-			*dy = (d->snapshot->cockpit.message_top ? MESSAGE_TRAFFIC_Y : MESSAGE_STATUS_Y) - MESSAGE_STRIP_Y;
++			*dy = MESSAGE_Y - MESSAGE_STRIP_Y;
+ 			*plain = true;
+ 			return true;
+ 		/* The CMD shows speed and throttle as XvT's does. */
+diff --git a/src/xw_runtime/snapshot/render_hud.c b/src/xw_runtime/snapshot/render_hud.c
+index 21808e9..30af66c 100644
+--- a/src/xw_runtime/snapshot/render_hud.c
++++ b/src/xw_runtime/snapshot/render_hud.c
+@@ -160,14 +160,6 @@ void XwHud_ViewSelection(unsigned view) {
+ 	}
+ }
+ 
+-void XwHud_MessageTop(bool top) {
+-	XwHudState* s = XwHud_Working();
+-	if (s && s->cockpit.message_top != top) {
+-		s->cockpit.message_top = top;
+-		XwHud_Changed(s);
+-	}
+-}
+-
+ void XwHud_Widget(unsigned element, unsigned value, unsigned segments, int step_x, int step_y, unsigned empty,
+ 				  unsigned filled, unsigned kind) {
+ 	XwHudState* s = XwHud_Working();
+diff --git a/src/xw_runtime/snapshot/render_hud.h b/src/xw_runtime/snapshot/render_hud.h
+index 6f9c8cf..973757a 100644
+--- a/src/xw_runtime/snapshot/render_hud.h
++++ b/src/xw_runtime/snapshot/render_hud.h
+@@ -14,8 +14,6 @@ void XwHud_ViewSelection(unsigned view);
+ void XwHud_View(unsigned view, const char* base, XwSnapRect aperture, bool mirrored);
+ void XwHud_Widget(unsigned element, unsigned value, unsigned segments, int step_x, int step_y, unsigned empty,
+ 				  unsigned filled, unsigned kind);
+-/* The message being drawn is mission traffic (true) or ship status (false). */
+-void XwHud_MessageTop(bool top);
+ void XwHud_Glyph(unsigned character, unsigned width, unsigned height);
+ void XwHud_Fill(int x0, int y0, int x1, int y1);
+ void XwHud_Sprite(const uint8_t* source, int x, int y, int transparent, int mirror);
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 38e8c39..d217739 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -282,9 +282,7 @@ typedef struct XwSnapCockpit {
+ 	uint16_t screen_width, screen_height;
+ 	XwSnapRect viewport;
+ 	int32_t projection_offset_y;
+-	uint8_t mirrored, suppressed, color_mode;
+-	uint8_t message_top; /* The message pane holds mission traffic rather than ship status. */
+-	uint32_t palette_argb[256]; /* HUD palette at composition, including RGB text conversion. */
++	uint8_t mirrored, suppressed, color_mode;	uint32_t palette_argb[256]; /* HUD palette at composition, including RGB text conversion. */
+ 	XwSnapWidget widgets[XW_SNAP_WIDGETS];
+ 	XwSnapRadar radar;
+ 	XwSnapHudPane panes[XW_SNAP_HUD_PANES];

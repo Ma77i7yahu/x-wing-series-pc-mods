@@ -1,0 +1,53 @@
+From 555697b916784e184ace2436e508cbcd6b80b962 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 21:25:19 +1100
+Subject: [PATCH 14/25] Turret gunners use Hard-difficulty skill on every
+ difficulty
+
+---
+ src/xvt/flight/object/laser.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index 1a9f6c4..6a9863b 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -1853,6 +1853,28 @@ void laser_UpdateMineWeaponFire(uint16_t mineObjIdx) {
+ }
+ 
+ // FUNCTION: XVT 0x4A7900
++#ifdef XVT_MODERN
++/* Turret gunners always use the skill Hard difficulty gives them: mission
++ * setup shifts hostile groups +2 / friendly -1 on Hard and hostile -1 /
++ * friendly +2 on Easy (none on Medium). Undo the current shift and apply
++ * Hard's, so turret lead and fire rate match Hard on every difficulty. */
++static uint16_t laser_TurretSkillAsHard(const ObjectRecord* source, uint16_t skill) {
++	enum { DIFFICULTY_EASY = 0, DIFFICULTY_HARD = 2, MAX_GROUP_AI = 5 };
++	if (g_flightMissionState.difficulty == DIFFICULTY_HARD || g_curCraft->effectiveAiObjectLink != 0)
++		return skill;
++	const XvtFlightGroup* group = &g_missionFlightGroups[source->flightGroupIdx].fg;
++	int playerIff = (uint16_t)g_players[g_localPlayer].playerIff;
++	int team = group->team;
++	int hostile = playerIff == team ? 0 : g_missionTeams[team].allies[playerIff] == 0;
++	int level = group->groupAI;
++	if (g_flightMissionState.difficulty == DIFFICULTY_EASY)
++		level += hostile ? 1 : -2;
++	level += hostile ? 2 : -1;
++	level = level < 0 ? 0 : level > MAX_GROUP_AI ? MAX_GROUP_AI : level;
++	return g_aiSkillValueQ16ByLevel[level];
++}
++#endif
++
+ void laser_firewarheadlauncher(uint16_t sourceObjIdx, uint16_t weaponSlotIdx, uint16_t targetRef) {
+ 	enum {
+ 		LASER_CHARGE_VALUE_MASK = 0x7F,
+@@ -1930,6 +1952,9 @@ void laser_firewarheadlauncher(uint16_t sourceObjIdx, uint16_t weaponSlotIdx, ui
+ 
+ 	sourceObject = &g_objectTable[sourceObjIdx];
+ 	effectiveSkill = pai_GetEffectiveSkillValue(g_curCraft);
++#ifdef XVT_MODERN
++	effectiveSkill = laser_TurretSkillAsHard(sourceObject, effectiveSkill);
++#endif
+ 	charge = (uint8_t)g_curCraft->weaponSlots[weaponSlotIdx].laserCharge;
+ 	chargeValue = charge & LASER_CHARGE_VALUE_MASK;
+ 	if (chargeValue != 0) {

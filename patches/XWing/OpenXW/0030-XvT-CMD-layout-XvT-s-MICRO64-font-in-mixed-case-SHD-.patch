@@ -1,0 +1,434 @@
+From ba2e469856f5d33c926be379f22d27d4d86899b3 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 21:25:45 +1100
+Subject: [PATCH 30/59] XvT CMD layout: XvT's MICRO64 font in mixed case,
+ SHD/HULL/SYS columns, orders and side-coloured target, cargo and Hull for
+ starships/freighters, XvT colors
+
+---
+ src/xw_remaster/hud_readout.c            | 137 ++++++++++++++++++++++-
+ src/xw_remaster/xvt_cockpit.c            |  14 +++
+ src/xw_remaster/xvt_cockpit.h            |   2 +
+ src/xw_runtime/snapshot/render_readout.c | 100 ++++++++++++-----
+ src/xw_runtime/snapshot/render_types.h   |   6 +-
+ 5 files changed, 229 insertions(+), 30 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index fd57b73..cd20c1a 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -4,9 +4,11 @@
+ #include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/target_view.h"
+ #include "xw_remaster/xvt_cockpit.h"
++#include <aeron/asset/bitmap_font.h>
+ #include <aeron/asset/pnl.h>
+ #include <aeron/log.h>
+ #include <aeron/vfs.h>
++#include <ctype.h>
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -18,6 +20,7 @@ typedef struct Pen {
+ 	const AeronRuntimeAtlas* atlas;
+ 	float sx, sy; /* Classic pixel to target pixel scales. */
+ 	float ox, oy; /* Target pixel origin of classic (0, 0). */
++	bool mixed_case; /* XvT's font has lowercase; X-Wing's fonts are drawn in capitals. */
+ } Pen;
+ 
+ static void Linear(uint32_t rgb, float alpha, float out[4]) {
+@@ -30,7 +33,7 @@ static void Linear(uint32_t rgb, float alpha, float out[4]) {
+ 
+ static const AeronDecodedGlyph* Glyph(const Pen* p, char c) {
+ 	const AeronDecodedFont* f = &p->font->font;
+-	unsigned ch = (unsigned char)c;
++	unsigned ch = (unsigned char)(p->mixed_case ? c : toupper((unsigned char)c));
+ 	if (ch < f->first_char || ch - f->first_char >= f->glyph_count)
+ 		return NULL;
+ 	return &f->glyphs[ch - f->first_char];
+@@ -284,11 +287,121 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	return true;
+ }
+ 
++/* XvT's mixed-case flight font (MICRO64.FNT, copied into RESOURCE xvt_cockpit at packaging time) for the
++ * XvT cockpits' CMD text. */
++static XwHudImage g_xvtFont;
++static AeronRuntimeAtlas g_xvtFontAtlas;
++static bool g_xvtFontTried, g_xvtFontReady;
++
++static bool LoadXvtFont(void) {
++	if (g_xvtFontTried)
++		return g_xvtFontReady;
++	g_xvtFontTried = true;
++	uint8_t* bytes = NULL;
++	size_t size = 0;
++	if (!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, "xvt_cockpit/MICRO64.FNT", 1 << 16, &bytes,
++						  &size)) {
++		Aeron_LogWarn("xw.hud", "XvT's MICRO64.FNT is missing; the CMD uses X-Wing's font");
++		return false;
++	}
++	AeronDecodedFont* f = &g_xvtFont.font;
++	AeronDecodeError error = { 0 };
++	bool ok = AeronBitmapFont_Decode(bytes, size, 4, 32, f, &error);
++	free(bytes);
++	uint8_t* rgba = ok ? malloc((size_t)f->width * f->height * 4) : NULL;
++	if (rgba) {
++		/* Premultiplied white; Text() tints it. */
++		for (size_t i = 0; i < (size_t)f->width * f->height; ++i)
++			memset(rgba + i * 4, f->foreground[i], 4);
++		AeronRuntimeAtlasFrame frame = { .rgba = rgba, .width = f->width, .height = f->height };
++		const AeronRuntimeAtlasOptions options = { .format = AERON_TEXTURE_FORMAT_RGBA8_SRGB,
++												   .color_space = AERON_COLOR_SPACE_SRGB,
++												   .alpha_mode = AERON_IMAGE_ALPHA_PREMULTIPLIED,
++												   .debug_name = "xw.xvt_cmd_font" };
++		AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
++		if (cmd && Aeron_RuntimeAtlasBuild(&g_xvtFontAtlas, cmd, &frame, 1, &options))
++			g_xvtFontReady = Aeron_SubmitCommandBuffer(cmd);
++		else if (cmd)
++			Aeron_CancelCommandBuffer(cmd);
++		free(rgba);
++	}
++	if (!g_xvtFontReady) {
++		Aeron_RuntimeAtlasRelease(&g_xvtFontAtlas);
++		AeronDecodedFont_Free(f);
++	}
++	g_xvtFont.atlas_frame = 0;
++	return g_xvtFontReady;
++}
++
++/* Colors measured from XvT's CMD. */
++enum {
++	XVT_LABEL = 0x2470C4,
++	XVT_VALUE = 0x44A0DC,
++	XVT_GREEN = 0x20AC30,
++	XVT_RED = 0xC03830,
++	XVT_YELLOW = 0xC0A030,
++	XVT_WHITE = 0xC4C4D4
++};
++
++static uint32_t XvtRelationColor(uint8_t relation) {
++	return relation == 0 ? XVT_GREEN : relation == 1 ? XVT_RED : relation == 3 ? XVT_WHITE : XVT_VALUE;
++}
++
++static void XvtStat(const Pen* p, float x, float y, const char* label, int pct) {
++	Text(p, x, y, label, XVT_LABEL, 60);
++	char value[8];
++	if (pct < 0)
++		snprintf(value, sizeof value, "--");
++	else
++		snprintf(value, sizeof value, "%3d%%", pct);
++	Text(p, x + Measure(p, label) + Measure(p, " "), y, value, pct == 0 ? XVT_RED : XVT_VALUE, 40);
++}
++
++/* XvT's CMD around its 3D view: the name, then SHD/HULL/SYS in three columns, above the view; below it, orders
++ * on the left with their target on the right (cargo and the targeted part, always the hull in X-Wing, for
++ * starships and freighters), then the range. */
++static void DrawXvtCmd(const XwHudDraw* d, const Pen* pen, const XwSnapReadout* r, const XwSnapRect* box,
++					   const XwSnapRect* view) {
++	float left = view->x, width = view->width + 2, right = left + width;
++	XwSnapRect row = { view->x, 0, width, 0 };
++	float name_y = fmaxf(box->y + 1, view->y - 27), stats_y = name_y + 13;
++	float orders_y = view->y + view->height + 2, dist_y = orders_y + 13;
++	Centered(pen, &row, name_y, r->target_name, XvtRelationColor(r->target_relation));
++	float scale = view->width / 160.0f;
++	XvtStat(pen, left + 4 * scale, stats_y, "SHD", r->target_shield_pct);
++	XvtStat(pen, left + 58 * scale, stats_y, "HULL", r->target_hull_pct);
++	XvtStat(pen, left + 114 * scale, stats_y, "SYS", r->target_system_pct);
++
++	const char *what = r->target_order_word, *detail = r->target_order_target;
++	uint32_t detail_rgb = XvtRelationColor(r->order_target_relation);
++	if (r->capital) {
++		if (r->cargo_valid)
++			what = r->target_cargo;
++		detail = "Hull";
++		detail_rgb = XVT_YELLOW;
++	}
++	Text(pen, left, orders_y, what, XVT_LABEL, width);
++	float avail = width - Measure(pen, what) - 6;
++	if (detail[0] && avail > 0)
++		Text(pen, right - fminf(Measure(pen, detail), avail), orders_y, detail, detail_rgb, avail);
++
++	char dist[16];
++	snprintf(dist, sizeof dist, "%u.%02u", r->target_distance_hundredths / 100, r->target_distance_hundredths % 100);
++	float label_w = Measure(pen, "DIST  "), x = left + (width - label_w - Measure(pen, dist)) / 2;
++	Text(pen, x, dist_y, "DIST", XVT_LABEL, label_w);
++	Text(pen, x + label_w, dist_y, dist, XVT_VALUE, width);
++
++	TargetModel(d, pen, view, view->y, view->y + view->height, false);
++}
++
+ bool XwHudCmd_Active(const XwRenderSnapshot* s) {
+ 	const XwSnapCamera* c = &s->camera;
+-	return XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
+-		   !c->replay_mode && !s->cockpit.suppressed &&
+-		   (c->hud_state == 0 || c->hud_state == XW_SNAP_VIEW_FULL_FORWARD);
++	bool active = XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
++				  !c->replay_mode && !s->cockpit.suppressed &&
++				  (c->hud_state == 0 || c->hud_state == XW_SNAP_VIEW_FULL_FORWARD);
++	if (active && XwXvtCockpit_Active(s))
++		LoadXvtFont();
++	return active;
+ }
+ 
+ bool XwHudCmd_Draw(const XwHudDraw* d) {
+@@ -319,6 +432,17 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		 * the right of the row above; speed and throttle have their own boxes. */
+ 		if (!r->target_valid)
+ 			return true;
++		XwSnapRect view;
++		if (XwXvtCockpit_CmdView(s, &view)) {
++			Pen xvt_pen = pen;
++			if (g_xvtFontReady) {
++				xvt_pen.font = &g_xvtFont;
++				xvt_pen.atlas = &g_xvtFontAtlas;
++				xvt_pen.mixed_case = true;
++			}
++			DrawXvtCmd(d, &xvt_pen, r, box, &view);
++			return true;
++		}
+ 		unsigned stat_lines = DrawTargetHeader(&pen, r, box, top, line);
+ 		char dist[24], detail[48];
+ 		snprintf(dist, sizeof dist, "DIST %u.%02u", r->target_distance_hundredths / 100,
+@@ -502,6 +626,11 @@ void XwHudThreat_Shutdown(void) {
+ 	Aeron_DestroyTexture(g_threatFrame);
+ 	g_threatFrame = NULL;
+ 	g_threatFrameFailed = false;
++	if (g_xvtFontReady) {
++		Aeron_RuntimeAtlasRelease(&g_xvtFontAtlas);
++		AeronDecodedFont_Free(&g_xvtFont.font);
++	}
++	g_xvtFontTried = g_xvtFontReady = false;
+ }
+ 
+ bool XwHudThreat_Active(const XwRenderSnapshot* s) {
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 21baa53..4df1491 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -693,6 +693,20 @@ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* s, XwSnapRect* rect) {
+ 	return true;
+ }
+ 
++bool XwXvtCockpit_CmdView(const XwRenderSnapshot* s, XwSnapRect* rect) {
++	if (!XwXvtCockpit_Active(s))
++		return false;
++	if (s->cockpit.view == 0) {
++		const Element* crt = &g_craft.elements[2];
++		*rect = (XwSnapRect) { crt->x, crt->y, crt->selector, crt->color };
++	} else if (s->cockpit.view == VIEW_HUD)
++		/* Inside the cockpit-off CMD panel, with the same rows above and below as the cockpit's. */
++		*rect = (XwSnapRect) { 240, 384, 160, 66 };
++	else
++		return false;
++	return true;
++}
++
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* s, unsigned pane, char* out, size_t capacity) {
+ 	size_t n = 0;
+ 	if (capacity)
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index 6f540cc..f6dd383 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -24,6 +24,8 @@ bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int*
+ void XwXvtCockpit_WarheadPlace(const XwHudDraw* draw, int x, int* dx, int* dy);
+ /* XvT's CMD screen in classic pixels. False when the X-Wing CMD position applies. */
+ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
++/* The CMD's 3D view (XvT element 2) inside that screen; XvT's text rows sit above and below it. */
++bool XwXvtCockpit_CmdView(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
+ /* Text of a captured HUD pane in reading order ("" when absent). */
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
+ /* True when the forward cockpit also shows XvT's own panel text (E/L/S, F/R, clock, throttle and speed
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 209e37b..1cd8ab3 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -23,7 +23,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-/* Copies visible text, dropping the flight font's color escapes, uppercased for the HUD fonts. */
++/* Copies visible text, dropping the flight font's color escapes. */
+ static void CopyText(char* out, size_t capacity, const char* in) {
+ 	size_t n = 0;
+ 	for (; in && *in && n + 1 < capacity; ++in) {
+@@ -36,11 +36,61 @@ static void CopyText(char* out, size_t capacity, const char* in) {
+ 		}
+ 		if (c < FLIGHT_TEXT_FIRST_DRAWABLE_BYTE && c != ' ')
+ 			continue;
+-		out[n++] = (char)toupper(c);
++		out[n++] = (char)c;
+ 	}
+ 	out[n] = 0;
+ }
+ 
++/* XvT writes names and words in title case ("Alpha 2", "Unknown"): all-capital words of letters only become
++ * title case. Type prefixes ("T/F") and designations with digits are kept. */
++static void TitleCase(char* text) {
++	for (char* word = text; *word;) {
++		char* end = word;
++		bool letters = true, upper = true;
++		while (*end && *end != ' ') {
++			letters = letters && isalpha((unsigned char)*end);
++			upper = upper && !islower((unsigned char)*end);
++			++end;
++		}
++		if (letters && upper && end - word >= 2)
++			for (char* c = word + 1; c < end; ++c)
++				*c = (char)tolower((unsigned char)*c);
++		word = *end ? end + 1 : end;
++	}
++}
++
++/* XvT's one-word order ("Attacking", "Following") for X-Wing's plan status phrase. */
++static void ShortOrder(char* out, size_t capacity, const char* phrase) {
++	static const struct {
++		const char *key, *word;
++	} kWords[] = {
++		{ "disable", "Disabling" },	   { "attack", "Attacking" },	 { "evasive", "Evading" },
++		{ "escort", "Escorting" },	   { "board", "Boarding" },		 { "capture", "Capturing" },
++		{ "dock", "Docking" },		   { "rendezvous", "Rendezvous" }, { "rescue", "Disabled" },
++		{ "home", "Returning" },	   { "entering", "Entering" },	 { "exiting", "Exiting" },
++		{ "patrol", "Patrolling" },	   { "holding", "Holding" },	 { "follow", "Following" },
++		{ "leading", "Following" },	   { "waiting", "Waiting" },	 { "awaiting", "Waiting" },
++		{ "aid", "Assisting" },		   { "ignoring", "Ignoring" },
++	};
++	for (unsigned i = 0; i < sizeof kWords / sizeof kWords[0]; ++i)
++		if (strstr(phrase, kWords[i].key)) {
++			snprintf(out, capacity, "%s", kWords[i].word);
++			return;
++		}
++	/* Otherwise the phrase's first word. */
++	size_t n = strcspn(phrase, " ");
++	snprintf(out, capacity, "%.*s", (int)n, phrase);
++	if (out[0])
++		out[0] = (char)toupper((unsigned char)out[0]);
++}
++
++static uint8_t Relation(uint16_t ref) {
++	if (ref >= XW_MISSION_OBJECT_REF_BASE)
++		return 2;
++	uint8_t iff = g_objectTable[ref].iff;
++	return iff == g_playerFlightState.object->iff ? 0 : iff <= 1 ? 1 : 2;
++}
++
+ static int Percent(int value, int maximum) {
+ 	if (maximum <= 0)
+ 		return -1;
+@@ -81,22 +131,20 @@ static void ObjectName(uint16_t ref, char* out, size_t capacity) {
+ 	panel_buildobjectname(ref, type);
+ 	CopyText(out, capacity, g_flightTextScratchBuffer);
+ 	memcpy(g_flightTextScratchBuffer, saved, sizeof saved);
++	TitleCase(out);
+ }
+ 
+ /* XvT's threat display: where the target's AI is heading, how far that is, and how long it will take. */
+ static void CaptureDestination(XwSnapReadout* r, uint16_t ref, const CraftData* craft) {
+ 	/* XWI point order: start 1, waypoints 1-3, starts 2-3, hyperspace. */
+-	static const char* const points[7] = { "START", "WAYPT 1", "WAYPT 2", "WAYPT 3", "START", "START",
+-										   "HYPERSPACE" };
++	static const char* const points[7] = { "Start", "Waypt 1", "Waypt 2", "Waypt 3", "Start", "Start",
++										   "Hyperspace" };
+ 	uint16_t aim = craft->aiTargetRef;
+ 	if (aim & 0x8000) {
+ 		unsigned index = aim & 0x7FFF;
+-		snprintf(r->destination, sizeof r->destination, "%s", index < 7 ? points[index] : "WAYPOINT");
++		snprintf(r->destination, sizeof r->destination, "%s", index < 7 ? points[index] : "Waypoint");
+ 	} else if (aim < XW_OBJECT_COUNT && LiveObject(aim)) {
+-		if (aim == g_playerFlightState.objectIndex)
+-			strcpy(r->destination, "OUR CRAFT");
+-		else
+-			ObjectName(aim, r->destination, sizeof r->destination);
++		ObjectName(aim, r->destination, sizeof r->destination);
+ 	} else
+ 		return;
+ 	r->destination_valid = 1;
+@@ -131,11 +179,7 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 	r->target_shield_pct = r->target_hull_pct = r->target_system_pct = -1;
+ 	ObjectName(ref, r->target_name, sizeof r->target_name);
+ 	/* Mission objects (mines, buoys) carry no IFF. */
+-	if (ref < XW_MISSION_OBJECT_REF_BASE) {
+-		uint8_t iff = g_objectTable[ref].iff;
+-		r->target_relation = iff == g_playerFlightState.object->iff ? 0 : iff <= 1 ? 1 : 2;
+-	} else
+-		r->target_relation = 2;
++	r->target_relation = Relation(ref);
+ 
+ 	/* pai_distancebetween changes trig2 globals; keep the CMD's distance scale (units * 161 >> 16). */
+ 	int32_t polar = g_trig2PolarDistance;
+@@ -152,12 +196,11 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 		/* Warheads report what they are tracking, as the CMD does. */
+ 		if (ref < XW_MISSION_OBJECT_REF_BASE && XwFlightTypes_IsWarhead(g_objectTable[ref].objectType)) {
+ 			const WarheadGuidanceState* guidance = g_objectTable[ref].instanceData;
+-			strcpy(r->target_orders, guidance && guidance->homingTier ? "TRACKING" : "UNGUIDED");
+-			if (guidance && guidance->homingTier) {
+-				if (guidance->targetObjIdx == g_playerFlightState.objectIndex)
+-					strcpy(r->target_order_target, "OUR CRAFT");
+-				else if (LiveObject(guidance->targetObjIdx))
+-					ObjectName(guidance->targetObjIdx, r->target_order_target, sizeof r->target_order_target);
++			strcpy(r->target_orders, guidance && guidance->homingTier ? "Tracking" : "Unguided");
++			strcpy(r->target_order_word, r->target_orders);
++			if (guidance && guidance->homingTier && LiveObject(guidance->targetObjIdx)) {
++				ObjectName(guidance->targetObjIdx, r->target_order_target, sizeof r->target_order_target);
++				r->order_target_relation = Relation(guidance->targetObjIdx);
+ 			}
+ 		}
+ 		return;
+@@ -177,19 +220,26 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 		char cargo[sizeof craft->cargoName + 1] = { 0 };
+ 		memcpy(cargo, craft->cargoName, sizeof craft->cargoName);
+ 		CopyText(r->target_cargo, sizeof r->target_cargo,
+-				 !craft->isInspected ? "UNKNOWN" : cargo[0] ? cargo : "NONE");
++				 !craft->isInspected ? "Unknown" : cargo[0] ? cargo : "None");
++		TitleCase(r->target_cargo);
+ 	}
++	uint8_t genus = g_objectTable[ref].genusId;
++	r->capital = genus == XW_GENUS_STARSHIP || genus == XW_GENUS_FREIGHTER;
+ 	if (craft->aiCurrentPlanId < USER_AI_STATUS_COUNT) {
+ 		unsigned message = g_aiPlanStatusMessageIds[craft->aiCurrentPlanId];
+ 		if (message && message < XW_MSG_TEMPLATE_COUNT)
+ 			CopyText(r->target_orders, sizeof r->target_orders, g_flightMessageTemplates[message]);
++		if (r->target_orders[0])
++			ShortOrder(r->target_order_word, sizeof r->target_order_word, r->target_orders);
+ 	}
+ 	CaptureDestination(r, ref, craft);
+ 	if (craft->aiTargetRef != ref && craft->aiTargetRef < XW_OBJECT_COUNT && LiveObject(craft->aiTargetRef)) {
+-		if (craft->aiTargetRef == g_playerFlightState.objectIndex)
+-			strcpy(r->target_order_target, "OUR CRAFT");
+-		else
+-			ObjectName(craft->aiTargetRef, r->target_order_target, sizeof r->target_order_target);
++		ObjectName(craft->aiTargetRef, r->target_order_target, sizeof r->target_order_target);
++		r->order_target_relation = Relation(craft->aiTargetRef);
++	} else if ((craft->aiTargetRef & 0x8000) && r->destination_valid) {
++		/* Flying to a waypoint: XvT names it ("Waypt 1"). */
++		snprintf(r->target_order_target, sizeof r->target_order_target, "%s", r->destination);
++		r->order_target_relation = 3;
+ 	}
+ }
+ 
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index d217739..c95564b 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -203,16 +203,20 @@ typedef struct XwSnapTargetBox {
+ } XwSnapTargetBox;
+ 
+ /* render.xvt_targeting_computer: XvT-style targeting computer contents, captured from flight state each world
+- * frame. Strings are uppercase ASCII; percentages are -1 when not applicable. */
++ * frame. Strings are mixed-case ASCII, as XvT shows them (X-Wing fonts uppercase them when drawing);
++ * percentages are -1 when not applicable. */
+ typedef struct XwSnapReadout {
+ 	uint8_t valid, target_valid, target_relation; /* relation: 0 friendly, 1 hostile, 2 other. */
+ 	uint8_t cargo_valid;
++	uint8_t order_target_relation; /* As target_relation; 3 for a waypoint. */
++	uint8_t capital;               /* Starship or freighter: XvT shows cargo and the targeted part. */
+ 	XwSnapObjectId target;                        /* Rendered as a 3D model in the CMD. */
+ 	int16_t target_shield_pct, target_hull_pct, target_system_pct;
+ 	uint16_t target_distance_hundredths; /* Hundredths of a kilometre, as the CMD shows. */
+ 	uint16_t target_extent;              /* The game's model size (maxBoundsExtent), in world units. */
+ 	XwSnapRect cmd;                      /* The CMD screen in classic cockpit pixels. */
+ 	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
++	char target_order_word[16]; /* XvT's one-word form of target_orders ("Attacking"). */
+ 	/* view_target (Z): XvT's threat display. The destination is the target's current AI aim (waypoint or
+ 	 * craft); time_remaining_s is -1 when unknown (stationary). */
+ 	uint8_t threat_view, destination_valid;

@@ -1,0 +1,58 @@
+From db6141ec5a3898052eb3d6f4f33502aa72e1b3c5 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 22:33:02 +1100
+Subject: [PATCH 37/59] E cycles through craft attacking the player, as in XvT
+
+---
+ src/xw/flight/player/user.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 3627987..cedce2a 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -183,6 +183,32 @@ static uint16_t user_findattackeroftarget(uint16_t target) {
+ 	return nearest;
+ }
+ 
++/* E, cycling as XvT's does (OpenXvT flight.c FLIGHT_KEY_E): when the current target is attacking the player,
++ * the next attacker after it in slot order, wrapping; otherwise X-Wing's nearest attacker. Attackers are those
++ * user_findclosestattacker counts: hostile craft whose AI target is the player. */
++static int user_isplayerattacker(uint16_t index) {
++	const CraftData* craft;
++	if (index >= XW_CRAFT_OBJECT_COUNT || index == g_playerFlightState.objectIndex ||
++		g_objectTable[index].objectType == XW_OBJ_NONE || g_objectTable[index].genusId == XW_GENUS_EXPLOSION_EFFECT ||
++		g_objectTable[index].iff == g_playerFlightState.object->iff)
++		return 0;
++	craft = g_objectTable[index].instanceData;
++	return craft && craft->aiTargetRef == g_playerFlightState.objectIndex &&
++		   (XwFlightTypes_Dos() || craft->workingSubsystems != 0);
++}
++
++static uint16_t user_nextattacker(void) {
++	uint16_t current = g_playerFlightState.currentTargetObjectIdx;
++	if (!user_isplayerattacker(current))
++		return (uint16_t)user_findclosestattacker();
++	for (uint16_t step = 1; step < XW_CRAFT_OBJECT_COUNT; ++step) {
++		uint16_t index = (uint16_t)((current + step) % XW_CRAFT_OBJECT_COUNT);
++		if (user_isplayerattacker(index))
++			return index;
++	}
++	return current;
++}
++
+ /* Leaves the target view; the caller has already pointed the camera focus back at the player. */
+ static void user_endtargetview(void) {
+ 	s_targetViewFlag = 0;
+@@ -1646,7 +1672,11 @@ void user_inputforplane(void) {
+ 			}
+ 			break;
+ 		case 'e':
++#ifdef XW_MODERN
++			user_setnewtarget(user_nextattacker());
++#else
+ 			user_setnewtarget(user_findclosestattacker());
++#endif
+ 			break;
+ 		case '\r':
+ 			if (g_playerFlightState.currentTargetObjectIdx != XW_PLAYER_NO_TARGET) {

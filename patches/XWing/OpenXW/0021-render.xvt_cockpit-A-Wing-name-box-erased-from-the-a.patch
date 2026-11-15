@@ -1,0 +1,52 @@
+From 8fc36d88a8c52f659b03bcd6a516b7cb51ee75f6 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 19:54:28 +1100
+Subject: [PATCH 21/59] render.xvt_cockpit: A-Wing name box erased from the
+ art; empty panes hidden in the forward view
+
+---
+ src/xw_remaster/xvt_cockpit.c | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index b43cc17..3cbe4f1 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -268,11 +268,18 @@ static AeronTexture* Texture(const char* lfd_name, XwSnapRect aperture, const ui
+ 	if (panl && AeronPnl_DecodeIndexed(panl->data, panl->size, 0, -1, &frame, NULL)) {
+ 		if (mask)
+ 			ApplyMask(&frame, mask, aperture);
+-		/* The X-Wing's craft name box (lower left) shows nothing in X-Wing; fill it with its own dark interior. */
+-		if (!strcasecmp(lfd_name, "XWING12") && frame.width >= 640 && frame.height >= 480) {
+-			uint8_t fill = frame.indices[(size_t)468 * frame.width + 140];
+-			for (unsigned y = 457; y < 480; ++y)
+-				for (unsigned x = 92; x < 192; ++x) {
++		/* The craft name box (lower left) shows nothing in X-Wing; fill it with a dark panel color sampled
++		 * beside it (the X-Wing's own interior; the A-Wing's panel to its right). */
++		static const struct {
++			const char* lfd;
++			uint16_t x0, y0, x1, sample_x, sample_y;
++		} kNameBoxes[] = { { "XWING12", 92, 457, 192, 140, 468 }, { "AWING12", 120, 459, 221, 224, 470 } };
++		for (unsigned i = 0; i < sizeof kNameBoxes / sizeof kNameBoxes[0]; ++i) {
++			if (strcasecmp(lfd_name, kNameBoxes[i].lfd) || frame.width < 640 || frame.height < 480)
++				continue;
++			uint8_t fill = frame.indices[(size_t)kNameBoxes[i].sample_y * frame.width + kNameBoxes[i].sample_x];
++			for (unsigned y = kNameBoxes[i].y0; y < 480; ++y)
++				for (unsigned x = kNameBoxes[i].x0; x < kNameBoxes[i].x1; ++x) {
+ 					frame.indices[(size_t)y * frame.width + x] = fill;
+ 					frame.coverage[(size_t)y * frame.width + x] = 255;
+ 				}
+@@ -600,8 +607,12 @@ bool XwXvtCockpit_Pane(const XwHudDraw* d, unsigned pane, int x, int y, int* dx,
+ 		*dy = box->y + 3 - def->elements[anchor].y;
+ 		return true;
+ 	}
+-	if (view != 0 || x == INT32_MAX)
++	if (view != 0)
+ 		return true;
++	/* An empty pane would leave only its backdrop, where X-Wing had a box that XvT's art may not (the A-Wing's
++	 * beside its right laser charge bar); XvT's art has its own boxes. */
++	if (x == INT32_MAX)
++		return false;
+ 	/* XvT's speed (121) and throttle (120) readout boxes take the clock and max speed; the CMD shows speed
+ 	 * and throttle. The offsets put the text inside the boxes as on the X-Wing's panel. */
+ 	if (pane == XW_SNAP_PANE_CLOCK || pane == XW_SNAP_PANE_MAX_SPEED) {

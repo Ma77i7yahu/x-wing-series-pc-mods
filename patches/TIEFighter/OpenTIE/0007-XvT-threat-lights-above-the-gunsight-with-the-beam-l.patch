@@ -1,0 +1,160 @@
+From 5915109665e5afefe3f7535c1d850a9cfd6da3a8 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 08:10:47 +1100
+Subject: [PATCH 07/18] XvT threat lights above the gunsight, with the beam
+ light (flight.xvt_hud)
+
+---
+ src/tie_remaster/flight/cockpit/renderer.c | 97 ++++++++++++++++++++++
+ src/tie_runtime/snapshot/hud_types.h       |  3 +
+ src/tie_runtime/snapshot/snapshot_hud.c    |  8 +-
+ 3 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index f91c05f..a6e1c39 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -1558,6 +1558,98 @@ static void TieCockpitRenderer_DrawShapeLever(TieCockpitRenderer* cg, AeronComma
+ 										 TieCockpitLayout_HdrBoost(&entry->layout, idx));
+ }
+ 
++/* flight.xvt_hud threat lights: X-Wing vs TIE Fighter's row above the
++ * gunsight (Balance of Power TIEFTR.INT elements 90-93, TIEFTRP.PNL frames
++ * 61/63/106/65) instead of TIE's three bars. TIE's incoming-fire, turret-lock
++ * and impact levers drive the attack, turret and warhead lights, as XvT's
++ * Hud_UpdateThreatIndicators does, and XvT's beam light is added. Sprites
++ * are copied pixel for pixel: 'b' is the lit border color, 'i' the lit
++ * inner color, and unlit lights fill every pixel with XvT's dark blue. */
++typedef struct TieCockpitRendererXvtThreat {
++	int dx; /* From the gunsight's corner, in 640x480 pixels; dy is -9. */
++	int w;
++	const char* rows[5];
++} TieCockpitRendererXvtThreat;
++
++static const TieCockpitRendererXvtThreat k_xvt_threats[4] = {
++	{ 5, 7, { "bbbbbbb", "bbbbbbb", "bbiiiii", "bbiiiii", "bbiiiii" } },
++	{ 14, 9, { "..bbbbb..", ".bbiiibb.", "bbiiiiibb", ".bbiiibb.", "..bbbbb.." } },
++	{ 25, 9, { "....b....", "...bbb...", "..bbibb..", ".bbiiibb.", "bbiiiiibb" } },
++	{ 36, 5, { ".bbb.", "bbibb", "biiib", "bbibb", ".bbb." } },
++};
++
++/* XvT cockpit palette (TFIGH64B) colors. */
++enum {
++	XVT_RGB_OFF = 0x00378B,
++	XVT_RGB_RED = 0xFF3700,
++	XVT_RGB_RED_IN = 0xC32B00,
++	XVT_RGB_GREEN = 0x3FFF00,
++	XVT_RGB_GREEN_IN = 0x13C300,
++	XVT_RGB_BLUE = 0x00B3FF,
++	XVT_RGB_BLUE_IN = 0x006FC3,
++	XVT_RGB_YELLOW = 0xD7A700,
++	XVT_RGB_YELLOW_IN = 0xAF7F00,
++};
++
++static void TieCockpitRenderer_DrawXvtThreatLights(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
++												   AeronRenderPass* pass, const TieCockpitRendererEntry* entry,
++												   int coord_w, int coord_h, const TieSnapshot* snap) {
++	const TieHudInstrument* gun = &snap->hud.instruments[TIE_HUDI_GUNSIGHT];
++	float gx, gy;
++	TieCockpitRenderer_InsAnchor(entry, TIE_HUDI_GUNSIGHT, gun->x, gun->y, snap, &gx, &gy);
++	const float px = (float)coord_w / 640.0f, py = (float)coord_h / 480.0f;
++	const float boost = TieCockpitLayout_HdrBoost(&entry->layout, TIE_HUDI_WARN_INCOMING);
++	const int lit[4] = {
++		TieCockpitRenderer_HudShapeValue(TIE_HUDI_WARN_INCOMING, snap),
++		TieCockpitRenderer_HudShapeValue(TIE_HUDI_WARN_LOCK, snap),
++		snap->hud.xvt_beam_threat,
++		TieCockpitRenderer_HudShapeValue(TIE_HUDI_WARN_IMPACT, snap),
++	};
++	for (int light = 0; light < 4; ++light) {
++		const TieCockpitRendererXvtThreat* t = &k_xvt_threats[light];
++		uint32_t border = XVT_RGB_OFF, inner = XVT_RGB_OFF;
++		if (lit[light]) {
++			switch (light) {
++				case 0:
++					border = XVT_RGB_RED, inner = XVT_RGB_RED_IN;
++					break;
++				case 1:
++					border = XVT_RGB_GREEN, inner = XVT_RGB_GREEN_IN;
++					break;
++				case 2:
++					border = lit[light] == 1 ? XVT_RGB_BLUE : XVT_RGB_YELLOW;
++					inner = lit[light] == 1 ? XVT_RGB_BLUE_IN : XVT_RGB_YELLOW_IN;
++					break;
++				default:
++					border = XVT_RGB_YELLOW, inner = XVT_RGB_YELLOW_IN;
++					break;
++			}
++		}
++		const float scale = lit[light] ? boost : 1.0f;
++		for (int row = 0; row < 5; ++row) {
++			const char* s = t->rows[row];
++			for (int x = 0; x < t->w;) {
++				if (s[x] == '.') {
++					++x;
++					continue;
++				}
++				/* One fill per run of a single color. */
++				const char c = s[x];
++				int end = x + 1;
++				while (end < t->w && s[end] == c)
++					++end;
++				float r, g, b;
++				TieScene2dSrgb_PalToLinearRgb(c == 'i' ? inner : border, &r, &g, &b);
++				TieCockpitRenderer_BlitCockpitQuad(cg, cmd, pass, NULL, coord_w, coord_h,
++												   gx + (float)(t->dx + x) * px, gy + (float)(row - 9) * py,
++												   (float)(end - x) * px, py, 0.0f, 0.0f, 1.0f, 1.0f, r * scale,
++												   g * scale, b * scale, 1.0f);
++				x = end;
++			}
++		}
++	}
++}
++
+ /* Subsystem-indicator pass (HUD instruments 45..57). Mirrors
+  * panel_updatecockpitdamage (panel.c:623): paint one cel per installed
+  * subsystem — frame 0 = intact-state plate, frame 13 = broken-state
+@@ -2853,6 +2945,11 @@ static void TieCockpitRenderer_DrawWidgetsForView(TieCockpitRenderer* cg, AeronC
+ 				TieCockpitRenderer_DrawShieldQuad(cg, cmd, pass, entry, coord_w, coord_h, idx, snap);
+ 				break;
+ 			case HUD_W_SHAPE_LEVER:
++				if (TieFlightTweaks_XvtHud() && idx >= TIE_HUDI_WARN_INCOMING && idx <= TIE_HUDI_WARN_IMPACT) {
++					if (idx == TIE_HUDI_WARN_INCOMING)
++						TieCockpitRenderer_DrawXvtThreatLights(cg, cmd, pass, entry, coord_w, coord_h, snap);
++					break;
++				}
+ 				TieCockpitRenderer_DrawShapeLever(cg, cmd, pass, entry, coord_w, coord_h, idx, snap);
+ 				break;
+ 			case HUD_W_BEAM_ARCBAR:
+diff --git a/src/tie_runtime/snapshot/hud_types.h b/src/tie_runtime/snapshot/hud_types.h
+index a8209fa..9b22982 100644
+--- a/src/tie_runtime/snapshot/hud_types.h
++++ b/src/tie_runtime/snapshot/hud_types.h
+@@ -226,6 +226,9 @@ typedef struct TieHudState {
+ 	/* flight.xvt_hud: target_cargo holds a starfighter's order word (drawn
+ 	 * left-aligned, as XvT does) and target_subsystem_text its order target. */
+ 	uint8_t cmd_orders;
++	/* flight.xvt_hud beam threat light: 0 off, 1 tractor beam, 2 jamming beam
++	 * on the player (XvT Hud_UpdateThreatIndicators). */
++	uint8_t xvt_beam_threat;
+ 	/* Cargo painted by panel_updatethreatname at instrument 70. */
+ 	char threat_cargo[24];
+ 
+diff --git a/src/tie_runtime/snapshot/snapshot_hud.c b/src/tie_runtime/snapshot/snapshot_hud.c
+index b4bb6ec..cb562d5 100644
+--- a/src/tie_runtime/snapshot/snapshot_hud.c
++++ b/src/tie_runtime/snapshot/snapshot_hud.c
+@@ -310,7 +310,13 @@ static void TieHudSnapshot_CaptureHud(void) {
+ 		if (oldinstruments[i] != 0xFFFE)
+ 			hud->instruments[i].value = oldinstruments[i];
+ 	}
+-	const uint8_t clock_minutes = mission.train_craft_type ? timeleft.minute : _date.minute;
++	/* Only the player fires beams in TIE Fighter; laser.c marks the craft
++	 * it holds with beam_state bit 0 (tractor) or 1 (jamming). */
++	hud->xvt_beam_threat = !pstate.player_craft                    ? 0
++						   : (pstate.player_craft->beam_state & 1) ? 1
++						   : (pstate.player_craft->beam_state & 2) ? 2
++																   : 0;
++	const uint8_t clock_minutes =mission.train_craft_type ? timeleft.minute : _date.minute;
+ 	const uint8_t clock_seconds = mission.train_craft_type ? timeleft.second : _date.second;
+ 	snprintf(hud->mission_clock_text, sizeof hud->mission_clock_text, "%2u:%02u", (unsigned)clock_minutes,
+ 			 (unsigned)clock_seconds);

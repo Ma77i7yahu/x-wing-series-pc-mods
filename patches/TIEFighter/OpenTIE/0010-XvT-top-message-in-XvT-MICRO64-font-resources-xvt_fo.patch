@@ -1,0 +1,157 @@
+From 354166486f5248fa9eff764c4c82dad58f68037c Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 08:33:43 +1100
+Subject: [PATCH 10/18] XvT top message in XvT MICRO64 font
+ (resources/xvt_fonts), TIE font scaled as fallback
+
+---
+ src/tie_remaster/flight/cockpit/renderer.c | 42 ++++++++++++++++++----
+ src/tie_remaster/flight/cockpit/text.h     |  1 +
+ src/tie_remaster/scene2d/text.c            |  4 +--
+ src/tie_remaster/scene2d/text.h            |  2 ++
+ src/tie_remaster/scene2d/text_layout.c     |  2 +-
+ 5 files changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index 0606196..26d3fb8 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -184,6 +184,7 @@ struct TieCockpitRenderer {
+ 	uint16_t original_font_width;
+ 	uint8_t original_micro_zero_advance;
+ 	float original_font_atlas_scale;
++	bool xvt_message_font; /* XvT's MICRO64 is in its font slot (flight.xvt_hud) */
+ };
+ 
+ static AeronTexture* TieCockpitRenderer_LoadKtx2(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+@@ -780,14 +781,12 @@ static bool TieCockpitRenderer_EnsureOriginalPalette(TieCockpitRenderer* cg) {
+ 	return true;
+ }
+ 
+-static bool TieCockpitRenderer_InstallOriginalFont(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+-												   const char* path, uint8_t row_bytes, uint8_t slot_id) {
+-	uint8_t* bytes = NULL;
+-	size_t size = 0;
++/* Takes ownership of ytes. */
++static bool TieCockpitRenderer_InstallFontBytes(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
++											   const char* path, uint8_t* bytes, size_t size, uint8_t row_bytes,
++											   uint8_t slot_id) {
+ 	TieCockpitFontAtlas decoded = { 0 };
+ 	TieFormatError codec_error = { 0 };
+-	if (!TieCockpitRenderer_ReadOriginalFile(cg, path, 1024u * 1024u, &bytes, &size))
+-		return false;
+ 	if (!TieCockpitFont_Decode(bytes, size, row_bytes, &decoded, &codec_error)) {
+ 		free(bytes);
+ 		return TIE_COCKPIT_ASSET_ERROR(path, codec_error.message);
+@@ -858,6 +857,31 @@ static bool TieCockpitRenderer_InstallOriginalFont(TieCockpitRenderer* cg, Aeron
+ 	return loaded || TIE_COCKPIT_ASSET_ERROR(path, "font atlas GPU creation failed");
+ }
+ 
++static bool TieCockpitRenderer_InstallOriginalFont(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
++												   const char* path, uint8_t row_bytes, uint8_t slot_id) {
++	uint8_t* bytes = NULL;
++	size_t size = 0;
++	if (!TieCockpitRenderer_ReadOriginalFile(cg, path, 1024u * 1024u, &bytes, &size))
++		return false;
++	return TieCockpitRenderer_InstallFontBytes(cg, cmd, path, bytes, size, row_bytes, slot_id);
++}
++
++/* flight.xvt_hud: X-Wing vs TIE Fighter's MICRO64.FNT, its thin mixed-case
++ * message font, copied into RESOURCE xvt_fonts by the packaging script. The
++ * message keeps TIE's font, scaled down, when it is missing. */
++static void TieCockpitRenderer_InstallXvtMessageFont(TieCockpitRenderer* cg, AeronCommandBuffer* cmd) {
++	static const char path[] = "xvt_fonts/MICRO64.FNT";
++	uint8_t* bytes = NULL;
++	size_t size = 0;
++	cg->xvt_message_font = false;
++	if (!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1024u * 1024u, &bytes, &size)) {
++		Aeron_LogWarn("tie.cockpit", "XvT message font %s is missing; messages keep TIE's font", path);
++		return;
++	}
++	cg->xvt_message_font =
++		TieCockpitRenderer_InstallFontBytes(cg, cmd, path, bytes, size, 4, TIE_SCENE2D_TEXT_RENDERER_FONT_SLOT_XVT_MESSAGE);
++}
++
+ static bool TieCockpitRenderer_EnsureOriginalFonts(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+ 												   uint16_t classic_width) {
+ 	if (cg->original_font_width == classic_width)
+@@ -870,6 +894,8 @@ static bool TieCockpitRenderer_EnsureOriginalFonts(TieCockpitRenderer* cg, Aeron
+ 		!TieCockpitRenderer_InstallOriginalFont(cg, cmd, svga ? "TINY64.FNT" : "TINY.FNT", svga ? 4 : 1,
+ 												TIE_SCENE2D_TEXT_RENDERER_FONT_SLOT_COCKPIT_TINY))
+ 		return false;
++	if (svga)
++		TieCockpitRenderer_InstallXvtMessageFont(cg, cmd);
+ 	/* InstallOriginalFont expands both source variants and their metrics by 4x. */
+ 	cg->original_font_atlas_scale = 4.0f;
+ 	cg->original_font_width = classic_width;
+@@ -2506,7 +2532,9 @@ static void TieCockpitRenderer_DrawMessageBar(TieCockpitRenderer* cg, AeronComma
+ 		if (xvt && snap->hud.msg_bar.present) {
+ 			/* XvT's message font is about 3/5 the height of TIE's: the body
+ 			 * draws at that scale from the record's origin, centred. */
+-			const float k = XVT_MESSAGE_SCALE;
++			const float k = cg->xvt_message_font ? 1.0f : XVT_MESSAGE_SCALE;
++			if (cg->xvt_message_font)
++				recs[0].font_id = FONT_XVT_MESSAGE;
+ 			const float w = TieScene2dTextRenderer_MeasureFestringClassic(
+ 				cg->text_renderer, TIE_FONT_DOMAIN_COCKPIT, recs[0].font_id, &message_space, recs[0].text);
+ 			const float sx = geometry.text_scale_x * k, sy = geometry.scale_y * k;
+diff --git a/src/tie_remaster/flight/cockpit/text.h b/src/tie_remaster/flight/cockpit/text.h
+index ec5ca1c..014bba8 100644
+--- a/src/tie_remaster/flight/cockpit/text.h
++++ b/src/tie_remaster/flight/cockpit/text.h
+@@ -21,6 +21,7 @@ uint8_t TieCockpitText_RemapColor(uint8_t logical_color);
+  *   setfontsize(1) → TINY64  (larger, used by threat readout + training CRT) */
+ #define FONT_MICRO64 3
+ #define FONT_TINY64 4
++#define FONT_XVT_MESSAGE 5 /* flight.xvt_hud top message */
+ 
+ /* Engine setbackcolor() values selected by each panel_update* function. */
+ #define COCKPIT_BG_CMD 0x30    /* panel_updatecmd */
+diff --git a/src/tie_remaster/scene2d/text.c b/src/tie_remaster/scene2d/text.c
+index 18ad73f..3bd4fde 100644
+--- a/src/tie_remaster/scene2d/text.c
++++ b/src/tie_remaster/scene2d/text.c
+@@ -29,7 +29,7 @@
+ typedef AeronFontGlyph TieScene2dTextGlyphMetric;
+ typedef AeronFontAtlas TieScene2dTextFontAtlas;
+ 
+-#define MAX_FONTS 7 /* Landru 0..3, title 4, cockpit 5..6. */
++#define MAX_FONTS 8 /* Landru 0..3, title 4, cockpit 5..6, XvT message 7. */
+ 
+ /* Title-crawl per-line flat-render slot. Each visible crawl line gets
+  * one slot in the offscreen text RT (`title_rt`). Glyphs render at
+@@ -108,7 +108,7 @@ static int TieScene2dText_FontSlot(uint8_t domain, uint8_t font_id) {
+ 		case TIE_FONT_DOMAIN_TITLE:
+ 			return 4;
+ 		case TIE_FONT_DOMAIN_COCKPIT:
+-			return font_id == 4 ? 6 : 5;
++			return font_id == 5 ? 7 : font_id == 4 ? 6 : 5;
+ 		case TIE_FONT_DOMAIN_LANDRU:
+ 		default:
+ 			return font_id;
+diff --git a/src/tie_remaster/scene2d/text.h b/src/tie_remaster/scene2d/text.h
+index 302c620..7bcb969 100644
+--- a/src/tie_remaster/scene2d/text.h
++++ b/src/tie_remaster/scene2d/text.h
+@@ -21,6 +21,8 @@ typedef struct TieScene2dTextRenderer TieScene2dTextRenderer;
+  * festring font IDs are mapped to these slots by the cockpit domain. */
+ #define TIE_SCENE2D_TEXT_RENDERER_FONT_SLOT_COCKPIT_MICRO 5
+ #define TIE_SCENE2D_TEXT_RENDERER_FONT_SLOT_COCKPIT_TINY 6
++/* flight.xvt_hud: X-Wing vs TIE Fighter's MICRO64 message font (cockpit font id 5). */
++#define TIE_SCENE2D_TEXT_RENDERER_FONT_SLOT_XVT_MESSAGE 7
+ 
+ /* Loads `<atlas_basename>.png` and `.fnt` and uploads the texture. */
+ TieScene2dTextRenderer* TieScene2dTextRenderer_Init(AeronCommandBuffer* cmd, AeronTextureFormat target_format,
+diff --git a/src/tie_remaster/scene2d/text_layout.c b/src/tie_remaster/scene2d/text_layout.c
+index eaa3196..7f8354f 100644
+--- a/src/tie_remaster/scene2d/text_layout.c
++++ b/src/tie_remaster/scene2d/text_layout.c
+@@ -81,7 +81,7 @@ static int TieScene2dText_FontSlot(uint8_t domain, uint8_t font_id) {
+ 		case TIE_FONT_DOMAIN_TITLE:
+ 			return 4;
+ 		case TIE_FONT_DOMAIN_COCKPIT:
+-			return font_id == 4 ? 6 : 5;
++			return font_id == 5 ? 7 : font_id == 4 ? 6 : 5;
+ 		case TIE_FONT_DOMAIN_LANDRU:
+ 		default:
+ 			return font_id;

@@ -1,0 +1,457 @@
+From 7e217c877664f0d23335564a2496e7737d0435be Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 07:25:13 +1100
+Subject: [PATCH 3/4] Add Starship Point Defence option (Original/Reduced/Off)
+ for warhead interception
+
+---
+ CMakeLists.txt                                |  1 +
+ src/xwa/config/game_config.c                  | 40 +++++++++++---
+ src/xwa/flight/ai/paifight.c                  | 48 ++++++++++++++++-
+ src/xwa/flight/object/object.c                |  1 +
+ src/xwa/flight/object/object.h                |  3 ++
+ src/xwa_app/host_config.c                     | 53 +++++++++++++++++++
+ src/xwa_app/host_config.h                     |  3 ++
+ src/xwa_app/main.c                            |  5 ++
+ .../config/modern_gameplay_options.c          | 40 ++++++++++++++
+ .../config/modern_gameplay_options.h          | 36 +++++++++++++
+ 10 files changed, 222 insertions(+), 8 deletions(-)
+ create mode 100644 src/xwa_runtime/config/modern_gameplay_options.c
+ create mode 100644 src/xwa_runtime/config/modern_gameplay_options.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f7e6598..25bb5c8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -193,6 +193,7 @@ set(XWA_RECOVERED_SOURCES
+ set(XWA_RUNTIME_SOURCES
+     src/xwa_runtime/config/modern_input_options.c
+     src/xwa_runtime/config/modern_controller_options_screen.c
++    src/xwa_runtime/config/modern_gameplay_options.c
+     src/xwa_runtime/config/modern_input_options_screen.c
+     src/xwa_runtime/config/modern_options_menu.c
+     src/xwa_runtime/config/modern_pilot_profiles_screen.c
+diff --git a/src/xwa/config/game_config.c b/src/xwa/config/game_config.c
+index 072cf89..7605116 100644
+--- a/src/xwa/config/game_config.c
++++ b/src/xwa/config/game_config.c
+@@ -36,6 +36,7 @@
+ 
+ #ifdef XWA_MODERN
+ #include "xwa_runtime/config/modern_controller_options_screen.h"
++#include "xwa_runtime/config/modern_gameplay_options.h"
+ #include "xwa_runtime/config/modern_input_options.h"
+ #include "xwa_runtime/config/modern_input_options_screen.h"
+ #include "xwa_runtime/config/modern_pilot_profiles_screen.h"
+@@ -50,6 +51,16 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* OpenXWA adds the Starship Point Defence row to the original 18. */
++#ifdef XWA_MODERN
++#define CONFIG_GENERAL_OPTIONS_ROW_COUNT 19
++#else
++#define CONFIG_GENERAL_OPTIONS_ROW_COUNT 18
++#endif
++
++static int Config_DrawOptionCycleRow(uint8_t* value, const char* label, const char* valueText, int optionCount,
++									 int* y, int* rowIndex, char* keyState, int buttonId, int disabled);
++
+ // GLOBAL: XWA 0xB0C7A0
+ GameConfig g_gameConfig;
+ // GLOBAL: XWA 0xB0CE20
+@@ -508,13 +519,13 @@ int Config_GeneralOptionsScreen(void) {
+ 		Keyboard_FlushCharBuffer();
+ 		keyState = 0;
+ 		if (--g_menuCursorRow < 0) {
+-			g_menuCursorRow = 17;
++			g_menuCursorRow = CONFIG_GENERAL_OPTIONS_ROW_COUNT - 1;
+ 		}
+ 	} else if (keyState == CONFIG_KEY_VK_DOWN) {
+ 		FrontendSound_PlayUISound("configsound", 1, 0, 255, 12 * g_gameConfig.sfxDatapadVolume, 63);
+ 		Keyboard_FlushCharBuffer();
+ 		keyState = 0;
+-		if (++g_menuCursorRow >= 18) {
++		if (++g_menuCursorRow >= CONFIG_GENERAL_OPTIONS_ROW_COUNT) {
+ 			g_menuCursorRow = 0;
+ 		}
+ 	}
+@@ -545,6 +556,18 @@ int Config_GeneralOptionsScreen(void) {
+ 		Config_DrawOptionCycle(&g_gameConfig.unlimitedAmmo, STR_GAME_UNLIMITED_AMMO, STR_CONFIG_NO, 2, &y,
+ 							   &rowIndex, &keyState, 36);
+ 	}
++#ifdef XWA_MODERN
++	{
++		static const char* const pointDefenseTexts[XWA_POINT_DEFENSE_COUNT] = { "Original", "Reduced", "Off" };
++		uint8_t pointDefense;
++
++		pointDefense = (uint8_t)XwaModernGameplayOptions_GetPointDefense();
++		if (Config_DrawOptionCycleRow(&pointDefense, "Starship Point Defence", pointDefenseTexts[pointDefense],
++									  XWA_POINT_DEFENSE_COUNT, &y, &rowIndex, &keyState, 37, 0)) {
++			XwaModernGameplayOptions_SetPointDefense((XwaPointDefense)pointDefense);
++		}
++	}
++#endif
+ 
+ 	sprintf(g_frontendScratchBuffer, "%s 1", FrontendString_Get(STR_TAUNT_NUMBER));
+ 	Config_DrawOptionTextEdit(g_gameConfig.taunt1, 46, 0, g_frontendScratchBuffer, &y, &rowIndex, &keyState,
+@@ -3967,14 +3990,20 @@ int Config_VideoOptionsMenu(void) {
+ // FUNCTION: XWA 0x5232F0
+ int Config_DrawOptionCycleImpl(uint8_t* value, UIString labelId, int valueBaseStrId, int optionCount, int* y,
+ 							   int* rowIndex, char* keyState, int buttonId, int disabled) {
+-	const char* label;
+-	const char* valueText;
++	return Config_DrawOptionCycleRow(value, FrontendString_Get(labelId),
++									 FrontendString_Get((UIString)(valueBaseStrId + *value)), optionCount, y,
++									 rowIndex, keyState, buttonId, disabled);
++}
++
++/* Body of Config_DrawOptionCycleImpl, taking literal texts so OpenXWA-only
++ * options can use labels that are not in the original string table. */
++static int Config_DrawOptionCycleRow(uint8_t* value, const char* label, const char* valueText, int optionCount,
++									 int* y, int* rowIndex, char* keyState, int buttonId, int disabled) {
+ 	int labelX;
+ 	int valueX;
+ 	int changed;
+ 	int labelColor;
+ 
+-	label = FrontendString_Get(labelId);
+ 	labelX = FrontendText_MeasureWidth(label, 15);
+ 	labelX = g_configMenuCenterX - labelX - 10;
+ 	changed = 0;
+@@ -4003,7 +4032,6 @@ int Config_DrawOptionCycleImpl(uint8_t* value, UIString labelId, int valueBaseSt
+ 	}
+ 
+ 	valueX = g_configMenuCenterX + 10;
+-	valueText = FrontendString_Get((UIString)(valueBaseStrId + *value));
+ 	if (disabled) {
+ 		FrontendText_Draw(15, valueText, valueX, *y, g_colorGray);
+ 		changed = 0;
+diff --git a/src/xwa/flight/ai/paifight.c b/src/xwa/flight/ai/paifight.c
+index bdec87c..ee9f362 100644
+--- a/src/xwa/flight/ai/paifight.c
++++ b/src/xwa/flight/ai/paifight.c
+@@ -1,5 +1,9 @@
+ #include "xwa/flight/ai/ai_internal.h"
+ 
++#ifdef XWA_MODERN
++#include "xwa_runtime/config/modern_gameplay_options.h"
++#endif
++
+ // GLOBAL: XWA 0x917E60
+ int g_paifightSearchOriginX;
+ 
+@@ -34,6 +38,44 @@ static __inline int paifight_HasClearTurretSelfDefenseShotZXY(uint16_t targetObj
+ static __inline int paifight_GunnerSelfDefenseTargetIsAlreadyCovered(uint16_t targetObjIdx);
+ static __inline int paifight_IsCraftAttackingSelf(uint16_t candidateObjIdx, CraftData* candidateCraft);
+ 
++#ifdef XWA_MODERN
++/* OpenXWA point-defence setting: whether the current AI craft's turrets may
++ * engage this warhead. Only freighters, starships and platforms are affected;
++ * turreted transports such as the YT series keep their original defence.
++ * REDUCED rolls once per warhead (kept in mobj->pointDefenseRoll) so a skipped
++ * warhead stays skipped for its whole flight. The roll uses its own generator
++ * so the game's GameRand sequence is unchanged. */
++static int paifight_PointDefenseMayEngageWarhead(uint16_t projectileObjIdx) {
++	static uint32_t s_rollState = 0x2545f491u;
++	MobileObject* mobj;
++	int defenderGenus;
++
++	defenderGenus = g_objectTable[g_paiContext.aiObjIdx].genusId;
++	if (defenderGenus != GENUS_Freighter && defenderGenus != GENUS_Starship && defenderGenus != GENUS_Platform) {
++		return 1;
++	}
++	switch (XwaModernGameplayOptions_GetPointDefense()) {
++		case XWA_POINT_DEFENSE_OFF:
++			return 0;
++		case XWA_POINT_DEFENSE_REDUCED:
++			break;
++		default:
++			return 1;
++	}
++	mobj = g_objectTable[projectileObjIdx].mobj;
++	if (mobj->pointDefenseRoll == 0) {
++		s_rollState ^= s_rollState << 13;
++		s_rollState ^= s_rollState >> 17;
++		s_rollState ^= s_rollState << 5;
++		mobj->pointDefenseRoll =
++			(uint8_t)((s_rollState % 100u) < XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT ? 1 : 2);
++	}
++	return mobj->pointDefenseRoll == 1;
++}
++#else
++#define paifight_PointDefenseMayEngageWarhead(projectileObjIdx) 1
++#endif
++
+ // FUNCTION: XWA 0x4A83F0
+ uint16_t paifight_SelectTargetComponentMesh(uint16_t targetObjIdx) {
+ 	uint16_t targetMesh;
+@@ -718,7 +760,8 @@ int16_t paifight_FindNearestAttackerOfMatchingTarget(uint16_t target1Type, uint1
+ #else
+ 							g_projectileWarheadClassByType[projectileType - OBJ_LaserRebel] != 0 &&
+ #endif
+-							projectileObject->mobj->pWarheadGuidance->targetObjIdx == targetObjIdx) {
++							projectileObject->mobj->pWarheadGuidance->targetObjIdx == targetObjIdx &&
++							paifight_PointDefenseMayEngageWarhead(projectileObjIdx)) {
+ 							uint32_t rangeScore;
+ 
+ 							rangeScore = (uint32_t)collide_roughdistance3d(
+@@ -3114,7 +3157,8 @@ char paifight_gunnerselfdefenseorder(void) {
+ 					projectileObj = &g_objectTable[projectileObjIdx];
+ 					if (projectileObj->objectType == OBJ_None || projectileObj->genusId == GENUS_Explosion ||
+ 						!paifight_IsWarheadClassProjectile(projectileObj->objectType) ||
+-						projectileObj->mobj->pWarheadGuidance->targetObjIdx != g_paiContext.aiObjIdx) {
++						projectileObj->mobj->pWarheadGuidance->targetObjIdx != g_paiContext.aiObjIdx ||
++						!paifight_PointDefenseMayEngageWarhead((uint16_t)projectileObjIdx)) {
+ 						continue;
+ 					}
+ 
+diff --git a/src/xwa/flight/object/object.c b/src/xwa/flight/object/object.c
+index 7539806..25aadc7 100644
+--- a/src/xwa/flight/object/object.c
++++ b/src/xwa/flight/object/object.c
+@@ -159,6 +159,7 @@ uint16_t Object_AllocSlotForGenus(uint16_t genusId) {
+ 		if (g_objectTable[candidateObjIdx].objectType == 0) {
+ 			g_objectTable[candidateObjIdx].mobj->sourceObjIdx = -1;
+ 			g_objectTable[candidateObjIdx].mobj->instanceExtent = 0;
++			g_objectTable[candidateObjIdx].mobj->pointDefenseRoll = 0;
+ 			break;
+ 		}
+ 		++candidateObjIdx;
+diff --git a/src/xwa/flight/object/object.h b/src/xwa/flight/object/object.h
+index 2ea91b3..f2be1da 100644
+--- a/src/xwa/flight/object/object.h
++++ b/src/xwa/flight/object/object.h
+@@ -342,6 +342,9 @@ typedef struct MobileObject {
+ 	float                     spinAxisX;
+ 	float                     spinAxisY;
+ 	float                     spinAxisZ;
++	/* OpenXWA: starship point-defence decision for a warhead (0 = not yet rolled,
++	 * 1 = turrets may engage, 2 = turrets ignore). Cleared on slot allocation. */
++	uint8_t                   pointDefenseRoll;
+ 	char                      moveVectorDirty;
+ 	int16_t                   moveX;
+ 	int16_t                   moveY;
+diff --git a/src/xwa_app/host_config.c b/src/xwa_app/host_config.c
+index bd6ea9a..bac1177 100644
+--- a/src/xwa_app/host_config.c
++++ b/src/xwa_app/host_config.c
+@@ -200,6 +200,36 @@ static int host_config_remaster_options(const AeronConfigFile* config, int requi
+ static int host_config_input_options(const AeronConfigFile* config, int required, XwaModernInputOptions* out,
+ 									 char* error, size_t error_size);
+ 
++static const char* const g_hostConfigPointDefenseNames[XWA_POINT_DEFENSE_COUNT] = { "original", "reduced",
++																					 "off" };
++
++/* Lenient: an unknown value logs a warning and keeps the default rather than
++ * refusing to start, since this is a convenience setting. */
++static void host_config_point_defense(const AeronConfigFile* config, XwaPointDefense* out) {
++	const AeronConfigNode* node = AeronConfigFile_GetNode(config, "gameplay.point_defense");
++	const char* value;
++	int index;
++
++	if (!node) {
++		return;
++	}
++	/* YAML reads a bare off as boolean false. */
++	if (AeronConfigNode_Type(node) == AERON_CONFIG_BOOL) {
++		if (!AeronConfigNode_Bool(node, 1)) {
++			*out = XWA_POINT_DEFENSE_OFF;
++			return;
++		}
++	} else if ((value = AeronConfigNode_String(node, NULL)) != NULL) {
++		for (index = 0; index < XWA_POINT_DEFENSE_COUNT; ++index) {
++			if (strcmp(value, g_hostConfigPointDefenseNames[index]) == 0) {
++				*out = (XwaPointDefense)index;
++				return;
++			}
++		}
++	}
++	Aeron_LogWarn("xwa.config", "ignoring invalid 'gameplay.point_defense'; expected original, reduced, or off");
++}
++
+ static int host_config_load_shipped_config(AeronVfs* vfs, XwaHostConfig* out, char* error,
+ 										   size_t error_size) {
+ 	static const char* path = "remaster/config.yaml";
+@@ -845,6 +875,7 @@ int XwaHostConfig_Load(AeronVfs* vfs, XwaHostConfig* out, char* error, size_t er
+ 	}
+ 	memset(out, 0, sizeof *out);
+ 	out->flight_simulation_step_ticks = 1;
++	out->point_defense = XWA_POINT_DEFENSE_DEFAULT;
+ 	if (!host_config_load_shipped_config(vfs, out, error, error_size)) {
+ 		return 0;
+ 	}
+@@ -891,6 +922,7 @@ int XwaHostConfig_Load(AeronVfs* vfs, XwaHostConfig* out, char* error, size_t er
+ 			return host_config_error(error, error_size, "'input' must be a mapping in %s", path);
+ 		}
+ 	}
++	host_config_point_defense(config, &out->point_defense);
+ 	if (AeronConfigFile_GetNode(config, "paths.resources")) {
+ 		Aeron_LogWarn("xwa.config",
+ 					  "deprecated setting 'paths.resources' is ignored; resources are application-owned");
+@@ -1199,6 +1231,27 @@ int XwaHostConfig_SaveInputOptions(AeronVfs* vfs, const XwaModernInputOptions* o
+ 	return host_config_save_user_document(vfs, document, error, error_size);
+ }
+ 
++int XwaHostConfig_SavePointDefense(AeronVfs* vfs, XwaPointDefense point_defense, char* error,
++								   size_t error_size) {
++	AeronConfigFile* document = NULL;
++	AeronConfigError config_error = { 0 };
++
++	if (!vfs || point_defense < XWA_POINT_DEFENSE_ORIGINAL || point_defense >= XWA_POINT_DEFENSE_COUNT) {
++		return host_config_error(error, error_size, "cannot save invalid gameplay settings to %s",
++								 "config.yaml");
++	}
++	if (!host_config_prepare_user_document(vfs, &document, error, error_size)) {
++		return 0;
++	}
++	if (!AeronConfigFile_SetString(document, "gameplay.point_defense",
++								   g_hostConfigPointDefenseNames[point_defense], &config_error)) {
++		AeronConfigFile_Destroy(document);
++		return host_config_error(error, error_size, "could not update user configuration: %s",
++								 config_error.message);
++	}
++	return host_config_save_user_document(vfs, document, error, error_size);
++}
++
+ int XwaHostConfig_SaveVideoOptions(AeronVfs* vfs, const XwaModernVideoOptions* options, char* error,
+ 								   size_t error_size) {
+ 	AeronConfigFile* document = NULL;
+diff --git a/src/xwa_app/host_config.h b/src/xwa_app/host_config.h
+index 3e27b97..8599983 100644
+--- a/src/xwa_app/host_config.h
++++ b/src/xwa_app/host_config.h
+@@ -2,6 +2,7 @@
+ #define XWA_APP_HOST_CONFIG_H
+ 
+ #include "aeron/vfs.h"
++#include "xwa_runtime/config/modern_gameplay_options.h"
+ #include "xwa_runtime/config/modern_input_options.h"
+ #include "xwa_runtime/config/modern_video_options.h"
+ 
+@@ -26,12 +27,14 @@ typedef struct XwaHostConfig {
+ 	unsigned int video_options_override_mask;
+ 	XwaModernInputOptions input_defaults;
+ 	XwaModernInputOptions input_options;
++	XwaPointDefense point_defense;
+ } XwaHostConfig;
+ 
+ int XwaHostConfig_Load(AeronVfs* vfs, XwaHostConfig* out, char* error, size_t error_size);
+ int XwaHostConfig_SaveGameDataPath(AeronVfs* vfs, const char* game_data_path, char* error, size_t error_size);
+ int XwaHostConfig_SaveVideoOptions(AeronVfs* vfs, const XwaModernVideoOptions* options, char* error,
+ 								   size_t error_size);
++int XwaHostConfig_SavePointDefense(AeronVfs* vfs, XwaPointDefense point_defense, char* error, size_t error_size);
+ int XwaHostConfig_SaveInputOptions(AeronVfs* vfs, const XwaModernInputOptions* options, char* error,
+ 								   size_t error_size);
+ 
+diff --git a/src/xwa_app/main.c b/src/xwa_app/main.c
+index 42a1c71..a98d519 100644
+--- a/src/xwa_app/main.c
++++ b/src/xwa_app/main.c
+@@ -33,6 +33,10 @@ static int persist_modern_video_options(const XwaModernVideoOptions* options, ch
+ 	return XwaHostConfig_SaveVideoOptions(Aeron_GetVfs(), options, error, error_size);
+ }
+ 
++static int persist_point_defense(XwaPointDefense point_defense, char* error, size_t error_size) {
++	return XwaHostConfig_SavePointDefense(Aeron_GetVfs(), point_defense, error, error_size);
++}
++
+ /* Platform-conventional fullscreen toggle chord: Cmd+Ctrl+F on macOS,
+  * Alt+Enter on Windows, Alt+Enter or F11 elsewhere. */
+ static int fullscreen_hotkey_pressed(const AeronInputSnapshot* in) {
+@@ -370,6 +374,7 @@ int main(int argc, char** argv) {
+ 		XwaModernVideoOptions_Configure(&effective_video_options, apply_modern_video_options,
+ 										persist_modern_video_options);
+ 	}
++	XwaModernGameplayOptions_Configure(host_config.point_defense, persist_point_defense);
+ 	XwaModernInputOptions_Configure(&host_config.input_defaults, &host_config.input_options,
+ 									apply_modern_input_options, persist_modern_input_options);
+ 	apply_modern_input_options(&host_config.input_options);
+diff --git a/src/xwa_runtime/config/modern_gameplay_options.c b/src/xwa_runtime/config/modern_gameplay_options.c
+new file mode 100644
+index 0000000..568b00b
+--- /dev/null
++++ b/src/xwa_runtime/config/modern_gameplay_options.c
+@@ -0,0 +1,40 @@
++#include "xwa_runtime/config/modern_gameplay_options.h"
++
++#include "aeron/log.h"
++
++static struct {
++	XwaPointDefense point_defense;
++	XwaModernGameplayOptionsPersistFn persist;
++} g_modernGameplayOptions = { XWA_POINT_DEFENSE_DEFAULT, NULL };
++
++void XwaModernGameplayOptions_Configure(XwaPointDefense point_defense, XwaModernGameplayOptionsPersistFn persist) {
++	if (point_defense < XWA_POINT_DEFENSE_ORIGINAL || point_defense >= XWA_POINT_DEFENSE_COUNT) {
++		point_defense = XWA_POINT_DEFENSE_DEFAULT;
++	}
++	g_modernGameplayOptions.point_defense = point_defense;
++	g_modernGameplayOptions.persist = persist;
++}
++
++XwaPointDefense XwaModernGameplayOptions_GetPointDefense(void) { return g_modernGameplayOptions.point_defense; }
++
++int XwaModernGameplayOptions_SetPointDefense(XwaPointDefense point_defense) {
++	char error[512];
++
++	if (point_defense < XWA_POINT_DEFENSE_ORIGINAL || point_defense >= XWA_POINT_DEFENSE_COUNT) {
++		return 0;
++	}
++	if (point_defense == g_modernGameplayOptions.point_defense) {
++		return 1;
++	}
++	g_modernGameplayOptions.point_defense = point_defense;
++	if (!g_modernGameplayOptions.persist) {
++		return 1;
++	}
++	error[0] = '\0';
++	if (!g_modernGameplayOptions.persist(point_defense, error, sizeof error)) {
++		Aeron_LogError("xwa.config", "%s",
++					   error[0] ? error : "could not persist gameplay options to user configuration");
++		return 0;
++	}
++	return 1;
++}
+diff --git a/src/xwa_runtime/config/modern_gameplay_options.h b/src/xwa_runtime/config/modern_gameplay_options.h
+new file mode 100644
+index 0000000..cdf84fe
+--- /dev/null
++++ b/src/xwa_runtime/config/modern_gameplay_options.h
+@@ -0,0 +1,36 @@
++#ifndef XWA_RUNTIME_MODERN_GAMEPLAY_OPTIONS_H
++#define XWA_RUNTIME_MODERN_GAMEPLAY_OPTIONS_H
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* How readily starship laser turrets shoot down incoming warheads. ORIGINAL
++ * engages every warhead; REDUCED gives each warhead a single launch-time roll
++ * (XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT) on whether turrets engage it at
++ * all; OFF never engages warheads, as in the earlier Totally Games titles. */
++typedef enum XwaPointDefense {
++	XWA_POINT_DEFENSE_ORIGINAL = 0,
++	XWA_POINT_DEFENSE_REDUCED,
++	XWA_POINT_DEFENSE_OFF,
++	XWA_POINT_DEFENSE_COUNT,
++} XwaPointDefense;
++
++#define XWA_POINT_DEFENSE_DEFAULT XWA_POINT_DEFENSE_REDUCED
++#define XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT 33
++
++typedef int (*XwaModernGameplayOptionsPersistFn)(XwaPointDefense point_defense, char* error,
++												 size_t error_size);
++
++void XwaModernGameplayOptions_Configure(XwaPointDefense point_defense, XwaModernGameplayOptionsPersistFn persist);
++XwaPointDefense XwaModernGameplayOptions_GetPointDefense(void);
++/* Applies immediately and writes the user configuration. */
++int XwaModernGameplayOptions_SetPointDefense(XwaPointDefense point_defense);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

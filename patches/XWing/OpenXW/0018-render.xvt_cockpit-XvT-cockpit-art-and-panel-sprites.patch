@@ -1,0 +1,40 @@
+From 0e16038fb34c554a58f37eeb97be4b70239f4aea Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 17:33:36 +1100
+Subject: [PATCH 18/59] render.xvt_cockpit: XvT cockpit art and panel sprites
+ scale with bilinear filtering, as OpenXvT presents them
+
+---
+ src/xw_remaster/xvt_cockpit.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 6c0e1e7..c698cd4 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -334,6 +334,7 @@ static AeronTexture* CachedArt(const char* lfd_name, XwSnapRect aperture, const
+ 	return slot->texture;
+ }
+ 
++/* XvT's art is scaled with bilinear filtering, as OpenXvT presents it, rather than as hard pixel blocks. */
+ static void Blit(const XwHudDraw* d, AeronTexture* texture, float x0, float x1, float shift, bool mirrored) {
+ 	float u0 = x0 / 640.0f, u1 = x1 / 640.0f;
+ 	if (mirrored) {
+@@ -351,7 +352,7 @@ static void Blit(const XwHudDraw* d, AeronTexture* texture, float x0, float x1,
+ 									 .dst_h = 480 * d->layout.scale_y,
+ 									 .tint = { 1, 1, 1, 1 },
+ 									 .blend = AERON_BLIT2D_BLEND_PMA,
+-									 .filter = AERON_BLIT2D_FILTER_NEAREST };
++									 .filter = AERON_BLIT2D_FILTER_LINEAR };
+ 	AeronDrawList_AddSprite(d->list, &sprite);
+ }
+ 
+@@ -828,7 +829,7 @@ static void DrawSprite(const XwHudDraw* d, const Sprite* sprite, int x, int y) {
+ 								.dst_h = sprite->height * d->layout.scale_y,
+ 								.tint = { 1, 1, 1, 1 },
+ 								.blend = AERON_BLIT2D_BLEND_PMA,
+-								.filter = AERON_BLIT2D_FILTER_NEAREST };
++								.filter = AERON_BLIT2D_FILTER_LINEAR };
+ 	AeronDrawList_AddSprite(d->list, &s);
+ }
+ 

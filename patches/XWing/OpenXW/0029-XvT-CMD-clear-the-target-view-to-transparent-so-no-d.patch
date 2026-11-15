@@ -1,0 +1,26 @@
+From 31f790cbd01a664003cd55474727cc833469e4f6 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 21:12:14 +1100
+Subject: [PATCH 29/59] XvT CMD: clear the target view to transparent so no
+ dark box shows around the craft
+
+---
+ src/xw_remaster/target_view.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/xw_remaster/target_view.c b/src/xw_remaster/target_view.c
+index 0812ad0..2367be8 100644
+--- a/src/xw_remaster/target_view.c
++++ b/src/xw_remaster/target_view.c
+@@ -132,8 +132,9 @@ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 		return false;
+ 	if (!prepared && !(prepared = AeronScene_PrepareResources(scene, AERON_CULL_BACK)))
+ 		return false;
+-	/* The CMD backdrop colour (sRGB #020617) in linear light, so the image blends into the panel. */
+-	AeronScene_SetClearColor(scene, (const float[4]) { 0.0006f, 0.0018f, 0.0080f, 1 });
++	/* Transparent black: opaque surfaces write alpha 1, so the CMD art (or backdrop) shows around the craft as
++	 * in XvT, with no box. The texture is drawn premultiplied. */
++	AeronScene_SetClearColor(scene, (const float[4]) { 0, 0, 0, 0 });
+ 	AeronScene_SetPost(scene, &(AeronScenePostDesc) { 0 });
+ 	AeronScene_SetDirectionalShadow(scene, &(AeronSceneDirectionalShadowDesc) { .enabled = 0 });
+ 	/* Aeron validates the slice count even when clustering is off. */

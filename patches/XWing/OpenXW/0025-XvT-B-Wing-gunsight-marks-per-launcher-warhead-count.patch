@@ -1,0 +1,134 @@
+From f1de160fe15d22577f11279b8b033515729647cc Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 20:31:28 +1100
+Subject: [PATCH 25/59] XvT B-Wing: gunsight marks, per-launcher warhead
+ counts, captions
+
+- B-Wing gunsight laser marks are X-Wing 38-43 (XvT 53-58) and range marks
+  66-71 (XvT 61-66); the shared 42-45 range group no longer applies to it.
+- Warhead counts each follow their own XvT element (XvT spaces the B-Wing's
+  wider than X-Wing).
+- THROTTLE/SPEED captions under the B-Wing readout boxes.
+---
+ src/xw_remaster/hud_readout.c  |  9 +++++++--
+ src/xw_remaster/hud_renderer.c |  6 ++++++
+ src/xw_remaster/xvt_cockpit.c  | 21 +++++++++++++++++----
+ src/xw_remaster/xvt_cockpit.h  |  4 +++-
+ 4 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 70516ed..09d048b 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -264,9 +264,14 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	BoxText(&labels, &throttle_box, text, PANEL_VALUE);
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, digits, sizeof digits);
+ 	BoxText(&labels, &speed_box, digits[0] ? digits : "0", PANEL_VALUE);
+-	/* The B-Wing's caption elements are placed but unused (selector 0): XvT shows no captions there. */
+-	if (!strcmp(kBoxes[craft].craft, "bwing"))
++	/* The B-Wing's caption elements are placed but unused (selector 0); its captions go under the boxes. */
++	if (!strcmp(kBoxes[craft].craft, "bwing")) {
++		XwSnapRect under = { throttle_box.x - 12, 0, throttle_box.width + 24, 0 };
++		Centered(&labels, &under, throttle_box.y + throttle_box.height + 3, "THROTTLE", PANEL_LABEL);
++		under = (XwSnapRect) { speed_box.x - 12, 0, speed_box.width + 24, 0 };
++		Centered(&labels, &under, speed_box.y + speed_box.height + 3, "SPEED", PANEL_LABEL);
+ 		return true;
++	}
+ 	if (!xwing) {
+ 		PanelText(&labels, 121, "SPD", PANEL_LABEL);
+ 		PanelText(&labels, 120, "THROTTLE", PANEL_LABEL);
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 50ad18f..52d0a2c 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -133,6 +133,12 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 				draw->pane_shift = shifts[p];
+ 				place = places[p];
+ 				skip = (skip_cmd && CmdPane(p)) || place.hidden || (place.plain && order[i].kind == 1);
++				if (p == XW_SNAP_PANE_WARHEADS && draw->xvt && !skip)
++					XwXvtCockpit_WarheadPlace(draw,
++											  order[i].kind == 0   ? c->glyphs[index].x
++											  : order[i].kind == 1 ? c->paint[index].x0
++																   : c->sprites[index].destination.x,
++											  &place.dx, &place.dy);
+ 				break;
+ 			}
+ 		}
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 1d31e6d..f15d0c8 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -416,13 +416,14 @@ typedef struct Group {
+ } Group;
+ 
+ /* XvT gives each cannon role eight slots. The B-Wing's six cannons use X-Wing's slots 3-8 for charge bars,
+- * 58-63 for ready lights and 66-71 for the gunsight marks. */
++ * 58-63 for ready lights, 38-43 for the gunsight laser marks and 66-71 for the range marks. */
+ static const Group kGroups[] = {
+ 	{ '-', 4, { 3, 4, 5, 6 }, { 3, 4, 5, 6 } },                       /* Laser charge bars. */
+ 	{ '-', 4, { 7, 8, 9, 10 }, { 11, 12, 13, 14 } },                  /* Laser ready lights. */
+ 	{ 'b', 6, { 3, 4, 5, 6, 7, 8 }, { 3, 4, 5, 6, 7, 8 } },
+ 	{ 'b', 6, { 58, 59, 60, 61, 62, 63 }, { 11, 12, 13, 14, 15, 16 } },
+-	{ 'b', 6, { 66, 67, 68, 69, 70, 71 }, { 53, 54, 55, 56, 57, 58 } },
++	{ 'b', 6, { 38, 39, 40, 41, 42, 43 }, { 53, 54, 55, 56, 57, 58 } },
++	{ 'b', 6, { 66, 67, 68, 69, 70, 71 }, { 61, 62, 63, 64, 65, 66 } },
+ 	{ 0, 2, { 11, 12 }, { 19, 20 } },                                 /* Linked fire lights. */
+ 	{ 0, 2, { 13, 14 }, { 27, 28 } },                                 /* Warhead counts. */
+ 	{ 0, 1, { 15 }, { 35 } },                                         /* Front shield. */
+@@ -441,7 +442,7 @@ static const Group kGroups[] = {
+ 	{ 0, 1, { 36 }, { 50 } },                                         /* Critical warning. */
+ 	{ 0, 1, { 37 }, { 52 } },                                         /* Gunsight. */
+ 	{ '-', 4, { 38, 39, 40, 41 }, { 53, 54, 55, 56 } },               /* Gunsight laser marks. */
+-	{ 0, 4, { 42, 43, 44, 45 }, { 61, 62, 63, 64 } },                 /* Gunsight range marks. */
++	{ '-', 4, { 42, 43, 44, 45 }, { 61, 62, 63, 64 } },               /* Gunsight range marks. */
+ };
+ 
+ typedef struct Offset {
+@@ -562,7 +563,7 @@ bool XwXvtCockpit_Element(const XwHudDraw* d, unsigned index, int* dx, int* dy)
+ 	if (view != VIEW_HUD)
+ 		return true;
+ 	/* Cockpit off: the gunsight stays; shields wrap XvT's HUD hull icon; power bars go to the edges. */
+-	if (index >= 37 && index <= 45)
++	if ((index >= 37 && index <= 45) || (g_craft.name[0] == 'b' && index >= 66 && index <= 71))
+ 		return true;
+ 	if (index >= EL_SHIELD_FIRST && index <= EL_SHIELD_LAST && g_offsets[EL_HULL].state == 1) {
+ 		/* Arcs keep their place around the hull icon. */
+@@ -663,6 +664,18 @@ bool XwXvtCockpit_Pane(const XwHudDraw* d, unsigned pane, int x, int y, int* dx,
+ 	return true;
+ }
+ 
++void XwXvtCockpit_WarheadPlace(const XwHudDraw* d, int x, int* dx, int* dy) {
++	/* Each launcher's count goes to its own XvT element, which may be spaced wider than X-Wing's. */
++	if (d->snapshot->cockpit.view != 0 || g_offsets[EL_WARHEAD_COUNT].state != 1 ||
++		g_offsets[EL_WARHEAD_COUNT + 1].state != 1)
++		return;
++	const XwCockpitElement* e = d->definition->elements;
++	unsigned nearest = abs(x - e[EL_WARHEAD_COUNT].x) <= abs(x - e[EL_WARHEAD_COUNT + 1].x) ? EL_WARHEAD_COUNT
++																						 : EL_WARHEAD_COUNT + 1;
++	*dx = g_offsets[nearest].dx;
++	*dy = g_offsets[nearest].dy;
++}
++
+ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* s, XwSnapRect* rect) {
+ 	if (!XwXvtCockpit_Active(s))
+ 		return false;
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index f8b0edf..6f540cc 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -20,12 +20,14 @@ enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 4000 }; /* The gunsight (74x45) is smalle
+ /* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).
+  * `plain` drops the pane's fills and text backgrounds. */
+ bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int* dx, int* dy, bool* plain);
++/* Forward view: the warhead pane's item at classic x moves with its own launcher count instead of the pane. */
++void XwXvtCockpit_WarheadPlace(const XwHudDraw* draw, int x, int* dx, int* dy);
+ /* XvT's CMD screen in classic pixels. False when the X-Wing CMD position applies. */
+ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
+ /* Text of a captured HUD pane in reading order ("" when absent). */
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
+ /* True when the forward cockpit also shows XvT's own panel text (E/L/S, F/R, clock, throttle and speed
+- * boxes) and the XvT CMD bottom rows. So far the X-Wing, Y-Wing and A-Wing. */
++ * boxes) and the XvT CMD bottom rows. */
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* snapshot);
+ /* The loaded craft ("xwing", "ywing", ...; "" before any). */
+ const char* XwXvtCockpit_Craft(void);

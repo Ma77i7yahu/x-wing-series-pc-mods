@@ -1,0 +1,100 @@
+From f252bb9676e8dbd4d606b571c750758c3c261722 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 17:15:46 +1100
+Subject: [PATCH 16/59] render.xvt_cockpit: XvT cockpit art and panel sprites
+ are undithered like X-Wing's when Undither Cockpit Artwork is on
+
+---
+ src/xw_remaster/xvt_cockpit.c | 54 ++++++++++++++++++++---------------
+ 1 file changed, 31 insertions(+), 23 deletions(-)
+
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 93c7849..6c0e1e7 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -9,6 +9,8 @@
+  * xvt_cockpit by the packaging script. The .int holds 28 view descriptors (36 bytes), 288 element records
+  * (12 bytes: forward cockpit 0-143, cockpit-off HUD 144-287) and the panel sprite file name. */
+ #include "xw_remaster/xvt_cockpit.h"
++#include "xw_remaster/config.h"
++#include "xw_remaster/undither.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include <aeron/aeron.h>
+ #include <aeron/asset/lfd.h>
+@@ -202,11 +204,33 @@ static void ApplyMask(AeronIndexedFrame* frame, const AeronLfdEntry* mask, XwSna
+ 	}
+ }
+ 
++/* Identifies prepared art: its colors and whether it was undithered. */
+ static uint32_t Hash(const uint32_t colors[256]) {
+ 	uint32_t h = 2166136261u;
+ 	for (unsigned i = 0; i < 256; ++i)
+ 		h = (h ^ colors[i]) * 16777619u;
+-	return h;
++	return (h ^ (XwRemasterConfig_Effective()->cockpit_undither != 0)) * 16777619u;
++}
++
++/* Premultiplied RGBA of an indexed frame. With "Undither Cockpit Artwork" on, the dither patterns are smoothed
++ * as for X-Wing's own cockpit art. */
++static void FrameRgba(const AeronIndexedFrame* frame, const uint32_t colors[256], uint8_t* rgba) {
++	uint8_t palette[256][4];
++	for (unsigned i = 0; i < 256; ++i) {
++		palette[i][0] = (uint8_t)(colors[i] >> 16);
++		palette[i][1] = (uint8_t)(colors[i] >> 8);
++		palette[i][2] = (uint8_t)colors[i];
++		palette[i][3] = 255;
++	}
++	size_t pixels = (size_t)frame->width * frame->height;
++	for (size_t i = 0; i < pixels; ++i) {
++		if (frame->coverage[i])
++			memcpy(rgba + i * 4, palette[frame->indices[i]], 4);
++		else
++			memset(rgba + i * 4, 0, 4);
++	}
++	if (XwRemasterConfig_Effective()->cockpit_undither)
++		XwUndither_Apply(frame, (const uint8_t(*)[4])palette, 256, rgba);
+ }
+ 
+ /* Cockpit colors 0-63 come from the view's PLTT; the rest are the flight palette, as in XvT. */
+@@ -256,14 +280,7 @@ static AeronTexture* Texture(const char* lfd_name, XwSnapRect aperture, const ui
+ 		size_t pixels = (size_t)frame.width * frame.height;
+ 		uint8_t* rgba = malloc(pixels * 4);
+ 		if (rgba) {
+-			for (size_t i = 0; i < pixels; ++i) {
+-				uint32_t argb = colors[frame.indices[i]];
+-				bool covered = frame.coverage[i] != 0;
+-				rgba[i * 4 + 0] = covered ? (uint8_t)(argb >> 16) : 0;
+-				rgba[i * 4 + 1] = covered ? (uint8_t)(argb >> 8) : 0;
+-				rgba[i * 4 + 2] = covered ? (uint8_t)argb : 0;
+-				rgba[i * 4 + 3] = covered ? 255 : 0;
+-			}
++			FrameRgba(&frame, colors, rgba);
+ 			AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 			texture = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
+ 								.width = frame.width,
+@@ -765,20 +782,11 @@ static const Sprite* GetSprite(unsigned frame, unsigned key, unsigned level, int
+ 	size_t pixels = (size_t)bitmap.width * bitmap.height;
+ 	uint8_t* rgba = malloc(pixels * 4);
+ 	if (rgba) {
+-		for (size_t i = 0; i < pixels; ++i) {
+-			uint32_t argb = 0;
+-			if (bitmap.coverage[i]) {
+-				unsigned index = bitmap.indices[i];
+-				if (level != PLAIN)
+-					index = level == 0 ? kShieldColors[0] : (uint8_t)(index - fade + kShieldColors[level]);
+-				argb = colors[index & 255];
+-			}
+-			bool covered = bitmap.coverage[i] != 0;
+-			rgba[i * 4 + 0] = covered ? (uint8_t)(argb >> 16) : 0;
+-			rgba[i * 4 + 1] = covered ? (uint8_t)(argb >> 8) : 0;
+-			rgba[i * 4 + 2] = covered ? (uint8_t)argb : 0;
+-			rgba[i * 4 + 3] = covered ? 255 : 0;
+-		}
++		if (level != PLAIN)
++			for (size_t i = 0; i < pixels; ++i)
++				bitmap.indices[i] =
++					level == 0 ? kShieldColors[0] : (uint8_t)(bitmap.indices[i] - fade + kShieldColors[level]);
++		FrameRgba(&bitmap, colors, rgba);
+ 		AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 		AeronTexture* texture = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
+ 										  .width = bitmap.width,

@@ -1,0 +1,44 @@
+From 4fdcd4f893529f570a43b1afb8e5e3f94a34e2f3 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 07:00:48 +1100
+Subject: [PATCH 2/4] Remove single-player pilot rating locks (campaign cap, AI
+ victim rating)
+
+---
+ src/xwa/flight/fediskio.c        | 6 +++++-
+ src/xwa/flight/mission/mission.c | 5 +++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/xwa/flight/fediskio.c b/src/xwa/flight/fediskio.c
+index 29bacd2..0aca846 100644
+--- a/src/xwa/flight/fediskio.c
++++ b/src/xwa/flight/fediskio.c
+@@ -1844,7 +1844,11 @@ static __inline void PilotData_UpdatePromotion(unsigned int missionCategory) {
+ 
+ 	if (missionCategory == 3 || missionCategory == 0 || missionCategory == 1) {
+ 		pilotRating = g_pilotData.pilotRating;
+-		if (pilotRating < (g_missionHeader.body.missionType == XWA_MISSION_TYPE_SIMULATOR_2 ? 24 : 7)) {
++		// Single player lifts the rating-7 cap in campaigns and the Junkyard, so every rating is reachable.
++		if (pilotRating < ((g_missionHeader.body.missionType == XWA_MISSION_TYPE_SIMULATOR_2 ||
++							g_flightPlayerCount == 1)
++							   ? 24
++							   : 7)) {
+ 			currentPromo = g_pilotData.currentRatingPromoPoints +
+ 						   g_players[g_localPlayer].missionStats.ratingPromoPoints;
+ 			threshold = g_pilotRatingPromotionPointThresholds[pilotRating];
+diff --git a/src/xwa/flight/mission/mission.c b/src/xwa/flight/mission/mission.c
+index 1236560..7b3b982 100644
+--- a/src/xwa/flight/mission/mission.c
++++ b/src/xwa/flight/mission/mission.c
+@@ -8506,6 +8506,11 @@ void Mission_CreditDestructionDamageContributors(uint16_t sourceObjIdx, uint16_t
+ 			if (creditedOwnerIdx == -1) {
+ 				creditedPilotRating =
+ 					g_defaultPilotRatingByAiLevel[g_missionFlightGroups[flightGroupIdx].fg.groupAI];
++				// AI ratings stop at 11, so high-rated pilots only earn capped "worse" points and
++				// stall. In single player, rate AI victims at least at the player's own rating.
++				if (g_flightPlayerCount == 1 && creditedPilotRating < (int)player->pilotRating) {
++					creditedPilotRating = (int)player->pilotRating;
++				}
+ 			} else {
+ 				creditedPilotRating = g_players[creditedOwnerIdx].pilotRating;
+ 			}

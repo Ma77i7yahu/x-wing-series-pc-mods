@@ -1,0 +1,7 @@
+# MSYS2's SpeexDSP headers, linked against an import library for the release's libspeexdsp.dll
+# (MSYS2's own import library names libspeexdsp-1.dll). Windows-style paths, as CMake reads them.
+Name: speexdsp
+Description: SpeexDSP against the OpenX release DLL
+Version: 1.2.1
+Libs: -LG:/Dev/reldeps/implib -lspeexdsp
+Cflags: -IG:/msys64/mingw64/include

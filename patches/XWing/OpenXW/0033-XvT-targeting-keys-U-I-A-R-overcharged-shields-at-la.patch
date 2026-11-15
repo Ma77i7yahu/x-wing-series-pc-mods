@@ -1,0 +1,357 @@
+From 3baa8a84ed6fdd481b70da1b218302000dbc8000 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 21:57:19 +1100
+Subject: [PATCH 33/59] XvT targeting keys (U, I, A, R), overcharged shields at
+ launch
+
+- R (nearest enemy fighter) also picks shuttles, transports and tugs, as in
+  XvT (starfighter, transport and utility genus).
+- U: newest craft (one per flight group), from OpenXvT FLIGHT_KEY_U.
+- I: nearest warhead homing on the player, else on a friendly craft.
+  Targeting the announced warhead clears its space-bar prompt.
+- A: nearest craft attacking the current target (aiTargetRef, hostile to
+  a craft target), from Player_FindAttackerOfTarget.
+- X-Wing's own I (target identification) and U (crosshair target) move to
+  Alt+I and Alt+U.
+- game.start_overshield: the player launches with both banks at twice
+  nominal. No/half-shield mission starts are unchanged.
+---
+ resources/config.yaml                    |  12 ++-
+ src/xw/flight/object/create.c            |   8 ++
+ src/xw/flight/player/user.c              | 111 +++++++++++++++++++++++
+ src/xw/flight/player/user.h              |   4 +
+ src/xw_app/settings/game_page.c          |   2 +
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   5 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ src/xw_runtime/input/actions.c           |   4 +
+ src/xw_runtime/input/actions.h           |   3 +
+ 12 files changed, 156 insertions(+), 2 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 008fb57..5f91947 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -76,10 +76,17 @@ input:
+       - {key: "E"}
+     target_clear:
+       - {key: "O"}
++    # U, I and A follow X-Wing vs TIE Fighter; X-Wing's own I and U moved to Alt.
+     identify:
+-      - {key: "I"}
++      - {key: "I", modifiers: [alt]}
+     auto_target:
++      - {key: "U", modifiers: [alt]}
++    target_newest_craft:
+       - {key: "U"}
++    target_incoming_warhead:
++      - {key: "I"}
++    target_attacker_of_target:
++      - {key: "A"}
+     target_preset_recall_1:
+       - {key: "F5"}
+     target_preset_store_1:
+@@ -257,6 +264,9 @@ game:
+   # Player turn rate as in X-Wing vs TIE Fighter: tightest at 1/3 throttle (stock
+   # X-Wing rate), 2/3 of that at full throttle and 1/3 when stopped.
+   xvt_turning: true
++  # The player launches with both shield banks fully overcharged (twice normal strength,
++  # the most recharging can reach). Missions that start with no or half shields are unchanged.
++  start_overshield: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index d333c7c..9d3cc2a 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -13,6 +13,7 @@
+ #endif
+ #ifdef XW_MODERN
+ #include "xw_dos94/assets/models.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/runtime/port.h"
+@@ -4681,6 +4682,13 @@ uint16_t create_createcraft(void) {
+ 	if (objectIndex == g_playerFlightState.objectIndex) {
+ 		g_curCraft->shieldEnergy[XW_SHIELD_REAR] = definition->nominalShieldEnergy[XW_SHIELD_REAR];
+ 		g_curCraft->shieldDistribMode = 1;
++#ifdef XW_MODERN
++		/* game.start_overshield: launch with both banks at the recharge ceiling. */
++		if (XwFlightTweaks_StartOvershield()) {
++			g_curCraft->shieldEnergy[XW_SHIELD_FRONT] *= XW_SHIELD_MAX_CHARGE_MULTIPLIER;
++			g_curCraft->shieldEnergy[XW_SHIELD_REAR] *= XW_SHIELD_MAX_CHARGE_MULTIPLIER;
++		}
++#endif
+ 	} else {
+ 		g_curCraft->shieldEnergy[XW_SHIELD_FRONT] += definition->nominalShieldEnergy[XW_SHIELD_REAR];
+ 		g_curCraft->shieldEnergy[XW_SHIELD_REAR] = 0;
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 33f4410..3627987 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -99,6 +99,90 @@ static void user_frametargetview(uint16_t target) {
+ 	g_flightCamera.externalDistance = (int16_t)distance;
+ }
+ 
++/* XvT's U (OpenXvT flight.c FLIGHT_KEY_U): the most recently arrived craft, one per flight group (the
++ * leader, or a wingman whose leader is gone), skipping the player and craft that are dying or ejected. */
++static uint16_t user_findnewestcraft(void) {
++	uint16_t newest = XW_PLAYER_NO_TARGET;
++	uint16_t newestAge = UINT16_MAX;
++	for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
++		const ObjectRecord* object = &g_objectTable[index];
++		const CraftData* craft;
++		if (object->objectType == XW_OBJ_NONE || index == g_playerFlightState.objectIndex ||
++			object->genusId == XW_GENUS_EXPLOSION_EFFECT || object->familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		craft = object->instanceData;
++		if (craft->objectKind == XW_CRAFT_OBJECT_KIND_3 || craft->objectKind == XW_CRAFT_OBJECT_KIND_4)
++			continue;
++		if (craft->aiLeaderObjectIndex != XW_CRAFT_NO_AI_LEADER && craft->aiLeaderObjectIndex != index &&
++			craft->aiLeaderObjectIndex < XW_CRAFT_OBJECT_COUNT &&
++			g_objectTable[craft->aiLeaderObjectIndex].objectType != XW_OBJ_NONE)
++			continue;
++		if (object->ageSeconds < newestAge) {
++			newest = index;
++			newestAge = object->ageSeconds;
++		}
++	}
++	return newest;
++}
++
++/* XvT's I (OpenXvT flight.c FLIGHT_KEY_I): the nearest warhead homing on the player, otherwise the nearest
++ * one homing on a friendly craft. */
++static uint16_t user_findincomingwarhead(void) {
++	uint16_t player = g_playerFlightState.objectIndex;
++	uint16_t nearest = XW_PLAYER_NO_TARGET;
++	uint32_t nearestDistance = UINT32_MAX;
++	for (int pass = 0; pass < 2 && nearest == XW_PLAYER_NO_TARGET; ++pass) {
++		for (uint16_t index = XW_CRAFT_OBJECT_COUNT; index < USER_WARHEAD_SLOT_END; ++index) {
++			uint16_t type = g_objectTable[index].objectType;
++			uint16_t target;
++			if (type != XwFlightTypes_ObjectType(XW_OBJ_WARHEAD_149) &&
++				type != XwFlightTypes_ObjectType(XW_OBJ_TRACKED_WARHEAD))
++				continue;
++			target = g_warheadGuidanceTable[index - XW_CRAFT_OBJECT_COUNT].targetObjIdx;
++			if (pass == 0 ? target != player
++						  : target == player || target >= XW_CRAFT_OBJECT_COUNT ||
++								g_objectTable[target].objectType == XW_OBJ_NONE ||
++								g_objectTable[target].iff != g_playerFlightState.object->iff)
++				continue;
++			pai_distancebetween(player, index);
++			if ((uint32_t)g_trig2PolarDistance < nearestDistance) {
++				nearest = index;
++				nearestDistance = g_trig2PolarDistance;
++			}
++		}
++	}
++	return nearest;
++}
++
++/* XvT's A (OpenXvT player.c Player_FindAttackerOfTarget): the craft attacking the current target that is
++ * nearest to it, other than the player. X-Wing's AI keeps its attack target in aiTargetRef; requiring the
++ * attacker to be hostile to a craft target leaves out escorts and boarding craft. */
++static uint16_t user_findattackeroftarget(uint16_t target) {
++	uint16_t nearest = XW_PLAYER_NO_TARGET;
++	uint32_t nearestDistance = UINT32_MAX;
++	if (target == XW_PLAYER_NO_TARGET)
++		return XW_PLAYER_NO_TARGET;
++	for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
++		const ObjectRecord* object = &g_objectTable[index];
++		const CraftData* craft;
++		if (object->objectType == XW_OBJ_NONE || index == target || index == g_playerFlightState.objectIndex ||
++			object->genusId == XW_GENUS_EXPLOSION_EFFECT || object->familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		craft = object->instanceData;
++		if (craft->aiTargetRef != target || craft->objectKind == XW_CRAFT_OBJECT_KIND_3 ||
++			craft->objectKind == XW_CRAFT_OBJECT_KIND_4 || (!XwFlightTypes_Dos() && craft->workingSubsystems == 0))
++			continue;
++		if (target < XW_CRAFT_OBJECT_COUNT && object->iff == g_objectTable[target].iff)
++			continue;
++		pai_distancebetween(target, index);
++		if ((uint32_t)g_trig2PolarDistance < nearestDistance) {
++			nearest = index;
++			nearestDistance = g_trig2PolarDistance;
++		}
++	}
++	return nearest;
++}
++
+ /* Leaves the target view; the caller has already pointed the camera focus back at the player. */
+ static void user_endtargetview(void) {
+ 	s_targetViewFlag = 0;
+@@ -1206,10 +1290,19 @@ void user_inputforplane(void) {
+ 			uint32_t distance = UINT32_MAX;
+ 			uint16_t target = XW_PLAYER_NO_TARGET;
+ 			for (index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
++#ifdef XW_MODERN
++				/* As XvT's R: shuttles, transports and tugs count alongside fighters. */
++				uint8_t genus = g_objectTable[index].genusId;
++				if (g_objectTable[index].objectType != XW_OBJ_NONE &&
++					index != g_playerFlightState.objectIndex &&
++					(genus == XW_GENUS_STARFIGHTER || genus == XW_GENUS_TRANSPORT || genus == XW_GENUS_UTILITY) &&
++					g_objectTable[index].iff != g_objectTable[g_playerFlightState.objectIndex].iff) {
++#else
+ 				if (g_objectTable[index].objectType != XW_OBJ_NONE &&
+ 					index != g_playerFlightState.objectIndex &&
+ 					g_objectTable[index].genusId == XW_GENUS_STARFIGHTER &&
+ 					g_objectTable[index].iff != g_objectTable[g_playerFlightState.objectIndex].iff) {
++#endif
+ 					uint8_t kind = ((CraftData*)g_objectTable[index].instanceData)->objectKind;
+ 					if (kind == XW_CRAFT_OBJECT_KIND_0 || kind == XW_CRAFT_OBJECT_KIND_6) {
+ 						pai_distancebetween(g_playerFlightState.objectIndex, index);
+@@ -1223,6 +1316,24 @@ void user_inputforplane(void) {
+ 			user_setnewtarget(target);
+ 			break;
+ 		}
++#ifdef XW_MODERN
++		case USER_KEY_TARGET_NEWEST:
++			user_setnewtarget(user_findnewestcraft());
++			break;
++		case USER_KEY_TARGET_INCOMING_WARHEAD: {
++			uint16_t warhead = user_findincomingwarhead();
++			user_setnewtarget(warhead);
++			/* Targeting the announced warhead answers its "press space" prompt, as space does. */
++			if (warhead != XW_PLAYER_NO_TARGET &&
++				warhead == g_playerFlightState.incomingWarheadObjectIndex &&
++				g_playerFlightState.incomingWarheadAlertState == USER_WARHEAD_ALERT_TRACKING)
++				g_playerFlightState.incomingWarheadAlertState = 0;
++			break;
++		}
++		case USER_KEY_TARGET_ATTACKER_OF_TARGET:
++			user_setnewtarget(user_findattackeroftarget(g_playerFlightState.currentTargetObjectIdx));
++			break;
++#endif
+ 		case 'i':
+ 			g_playerFlightState.hudTargetDetailsEnabled ^= 1;
+ 			g_hudCachedTargetObjectIdx = USER_HUD_TARGET_CACHE_RESET;
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index f571004..cad5c7e 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -44,6 +44,10 @@ enum {
+ 	USER_KEY_THROTTLE_10 = 229,
+ 	USER_KEY_THROTTLE_11 = 230,
+ 	USER_KEY_THROTTLE_12 = 231,
++	/* Modern additions: X-Wing vs TIE Fighter's U, I and A targeting keys. Unused by the original. */
++	USER_KEY_TARGET_NEWEST = 232,
++	USER_KEY_TARGET_INCOMING_WARHEAD = 233,
++	USER_KEY_TARGET_ATTACKER_OF_TARGET = 234,
+ };
+ 
+ enum {
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index b192a27..fcb6088 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -106,6 +106,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing", "XvT" }, 2);
+ 	AeronUi_Selector(ui, "Shield Hits", &draft->xvt_shields,
+ 					 (const char* const[]) { "X-Wing", "XvT (Self-Balancing)" }, 2);
++	AeronUi_Selector(ui, "Shields at Launch", &draft->start_overshield,
++					 (const char* const[]) { "Normal", "Overcharged" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+ 					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 0c25752..b8fab51 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -11,6 +11,11 @@ static bool s_restore_pilot = true;
+ static bool s_xvt_cockpit = true;
+ static bool s_xvt_shields = true;
+ static bool s_xvt_turning = true;
++static bool s_start_overshield = true;
++
++bool XwFlightTweaks_StartOvershield(void) { return s_start_overshield; }
++
++void XwFlightTweaks_SetStartOvershield(bool enabled) { s_start_overshield = enabled; }
+ 
+ bool XwFlightTweaks_XvtShields(void) { return s_xvt_shields; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 00102d8..9c20f22 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -59,6 +59,11 @@ void XwFlightTweaks_SetXvtShields(bool enabled);
+  * throttle, full at 1/3 throttle, 2/3 at full throttle, plus XvT's power balance term. */
+ bool XwFlightTweaks_XvtTurning(void);
+ void XwFlightTweaks_SetXvtTurning(bool enabled);
++/* game.start_overshield: the player launches with both shield banks fully overcharged (twice nominal, the
++ * most the recharge can reach) instead of at nominal strength. Missions that start without shields or at
++ * half shields are unchanged. */
++bool XwFlightTweaks_StartOvershield(void);
++void XwFlightTweaks_SetStartOvershield(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index a41f39b..42ef645 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -37,6 +37,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
+ 	XwFlightTweaks_SetXvtShields(settings->xvt_shields != 0);
+ 	XwFlightTweaks_SetXvtTurning(settings->xvt_turning != 0);
++	XwFlightTweaks_SetStartOvershield(settings->start_overshield != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index f84d9cd..0534836 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -114,6 +114,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_throttle", xvt_throttle),
+ 	SETTING_BOOL("game.xvt_shields", xvt_shields),
+ 	SETTING_BOOL("game.xvt_turning", xvt_turning),
++	SETTING_BOOL("game.start_overshield", start_overshield),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index cfdcaf6..b025f3c 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -39,7 +39,7 @@ typedef struct XwSettings {
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+-	int xvt_cockpit, xvt_shields, xvt_turning;
++	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index c79da69..e2f1f58 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -25,6 +25,10 @@ static const struct {
+ 	{ "target_clear", "Clear target", XW_INPUT_ACTION_CATEGORY_TARGETING, 111 },
+ 	{ "identify", "Toggle target identification", XW_INPUT_ACTION_CATEGORY_TARGETING, 105 },
+ 	{ "auto_target", "Target in crosshairs", XW_INPUT_ACTION_CATEGORY_TARGETING, 155 },
++	/* Not in X-Wing: XvT's U, I and A targeting keys (USER_KEY_TARGET_NEWEST and following). */
++	{ "target_newest_craft", "Newest craft", XW_INPUT_ACTION_CATEGORY_TARGETING, 232 },
++	{ "target_incoming_warhead", "Nearest incoming warhead", XW_INPUT_ACTION_CATEGORY_TARGETING, 233 },
++	{ "target_attacker_of_target", "Target's attacker", XW_INPUT_ACTION_CATEGORY_TARGETING, 234 },
+ 	{ "target_preset_recall_1", "Recall target 1", XW_INPUT_ACTION_CATEGORY_TARGETING, 199 },
+ 	{ "target_preset_store_1", "Store target 1", XW_INPUT_ACTION_CATEGORY_TARGETING, 211 },
+ 	{ "target_preset_recall_2", "Recall target 2", XW_INPUT_ACTION_CATEGORY_TARGETING, 200 },
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index 678a02c..5519ba0 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -22,6 +22,9 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_TARGET_CLEAR,
+ 	XW_INPUT_ACTION_IDENTIFY,
+ 	XW_INPUT_ACTION_AUTO_TARGET,
++	XW_INPUT_ACTION_TARGET_NEWEST_CRAFT,
++	XW_INPUT_ACTION_TARGET_INCOMING_WARHEAD,
++	XW_INPUT_ACTION_TARGET_ATTACKER_OF_TARGET,
+ 	XW_INPUT_ACTION_TARGET_PRESET_RECALL_1,
+ 	XW_INPUT_ACTION_TARGET_PRESET_STORE_1,
+ 	XW_INPUT_ACTION_TARGET_PRESET_RECALL_2,

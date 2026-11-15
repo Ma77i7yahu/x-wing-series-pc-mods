@@ -1,0 +1,82 @@
+From c707c8d68d45a508a8e1b7867b75a40b033da03d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 19:49:10 +1100
+Subject: [PATCH 20/59] render.xvt_cockpit: XvT panel text for the A-Wing;
+ panel boxes as a per-craft table
+
+---
+ src/xw_remaster/hud_readout.c | 26 ++++++++++++++++----------
+ src/xw_remaster/xvt_cockpit.c |  2 +-
+ src/xw_remaster/xvt_cockpit.h |  2 +-
+ 3 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index d3a5c21..bf96419 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -233,15 +233,21 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	PanelText(&labels, 128, "F", PANEL_SWITCH);
+ 	PanelText(&labels, 129, "R", PANEL_SWITCH);
+ 	/* The clock, throttle and speed boxes (inside their frames), measured from each craft's panel art. The
+-	 * X-Wing's sit in its right-hand column with the captions centred under the lower two; the Y-Wing's clock
+-	 * is on the left console and XvT writes its captions at elements 121 (SPD) and 120 (THROTTLE). */
+-	bool ywing = !strcmp(XwXvtCockpit_Craft(), "ywing");
+-	XwSnapRect clock_box = { 421, 390, 39, 19 }, throttle_box = { 425, 416, 34, 19 }, speed_box = { 424, 451, 36, 18 };
+-	if (ywing) {
+-		clock_box = (XwSnapRect) { 130, 398, 46, 20 };
+-		throttle_box = (XwSnapRect) { 384, 448, 33, 17 };
+-		speed_box = (XwSnapRect) { 400, 427, 34, 16 };
+-	}
++	 * X-Wing's sit in its right-hand column with the captions centred under the lower two; on the others XvT
++	 * writes its captions at elements 121 (SPD) and 120 (THROTTLE). */
++	static const struct {
++		const char* craft;
++		XwSnapRect clock, throttle, speed;
++	} kBoxes[] = {
++		{ "xwing", { 421, 390, 39, 19 }, { 425, 416, 34, 19 }, { 424, 451, 36, 18 } },
++		{ "ywing", { 130, 398, 46, 20 }, { 384, 448, 33, 17 }, { 400, 427, 34, 16 } },
++		{ "awing", { 472, 428, 46, 20 }, { 232, 444, 33, 17 }, { 252, 421, 34, 16 } },
++	};
++	unsigned craft = 0;
++	while (craft + 1 < sizeof kBoxes / sizeof kBoxes[0] && strcmp(kBoxes[craft].craft, XwXvtCockpit_Craft()))
++		++craft;
++	bool xwing = craft == 0;
++	XwSnapRect clock_box = kBoxes[craft].clock, throttle_box = kBoxes[craft].throttle, speed_box = kBoxes[craft].speed;
+ 	char digits[16], text[40];
+ 	/* X-Wing's clock pane holds minutes then two second digits. */
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_CLOCK, digits, sizeof digits);
+@@ -257,7 +263,7 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	BoxText(&labels, &throttle_box, text, PANEL_VALUE);
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, digits, sizeof digits);
+ 	BoxText(&labels, &speed_box, digits[0] ? digits : "0", PANEL_VALUE);
+-	if (ywing) {
++	if (!xwing) {
+ 		PanelText(&labels, 121, "SPD", PANEL_LABEL);
+ 		PanelText(&labels, 120, "THROTTLE", PANEL_LABEL);
+ 		return true;
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 1cf1b86..b43cc17 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -862,7 +862,7 @@ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* d, unsigned index, const XwSna
+ 
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
+ 	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 &&
+-		   (!strcmp(g_craft.name, "xwing") || !strcmp(g_craft.name, "ywing"));
++		   (!strcmp(g_craft.name, "xwing") || !strcmp(g_craft.name, "ywing") || !strcmp(g_craft.name, "awing"));
+ }
+ 
+ const char* XwXvtCockpit_Craft(void) { return g_craft.name; }
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index 8bcde73..f8b0edf 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -25,7 +25,7 @@ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
+ /* Text of a captured HUD pane in reading order ("" when absent). */
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
+ /* True when the forward cockpit also shows XvT's own panel text (E/L/S, F/R, clock, throttle and speed
+- * boxes) and the XvT CMD bottom rows. So far the X-Wing and Y-Wing. */
++ * boxes) and the XvT CMD bottom rows. So far the X-Wing, Y-Wing and A-Wing. */
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* snapshot);
+ /* The loaded craft ("xwing", "ywing", ...; "" before any). */
+ const char* XwXvtCockpit_Craft(void);

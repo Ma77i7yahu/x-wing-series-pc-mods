@@ -1,0 +1,22 @@
+From 83eea3a7935ced82345ad6388eba52feae81c8d5 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 20:37:19 +1100
+Subject: [PATCH 26/59] XvT B-Wing: SPD caption, as on the other craft
+
+---
+ src/xw_remaster/hud_readout.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 09d048b..fd57b73 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -269,7 +269,7 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 		XwSnapRect under = { throttle_box.x - 12, 0, throttle_box.width + 24, 0 };
+ 		Centered(&labels, &under, throttle_box.y + throttle_box.height + 3, "THROTTLE", PANEL_LABEL);
+ 		under = (XwSnapRect) { speed_box.x - 12, 0, speed_box.width + 24, 0 };
+-		Centered(&labels, &under, speed_box.y + speed_box.height + 3, "SPEED", PANEL_LABEL);
++		Centered(&labels, &under, speed_box.y + speed_box.height + 3, "SPD", PANEL_LABEL);
+ 		return true;
+ 	}
+ 	if (!xwing) {

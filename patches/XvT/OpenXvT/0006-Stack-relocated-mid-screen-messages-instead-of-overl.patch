@@ -1,0 +1,97 @@
+From 9ab149d4210ef0791506ffa170230c1e3141fdd2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:33:26 +1100
+Subject: [PATCH 06/25] Stack relocated mid-screen messages instead of
+ overlapping
+
+---
+ src/xvt_remaster/hud_panes.c | 64 ++++++++++++++++++++++++++----------
+ 1 file changed, 47 insertions(+), 17 deletions(-)
+
+diff --git a/src/xvt_remaster/hud_panes.c b/src/xvt_remaster/hud_panes.c
+index 8e8fa1b..8278cf0 100644
+--- a/src/xvt_remaster/hud_panes.c
++++ b/src/xvt_remaster/hud_panes.c
+@@ -1,5 +1,6 @@
+ #include "xvt_remaster/hud_panes.h"
+ #include "xvt_remaster/hud_text.h"
++#include <limits.h>
+ 
+ static int DrawNumberInPhase(const XvtHudDraw* draw, const XvtCockpitNumber* number, unsigned phase,
+ 							 int score) {
+@@ -125,29 +126,58 @@ static int DrawOverlayGlyphs(const XvtHudDraw* parent, unsigned first, unsigned
+ 	return 1;
+ }
+ 
++/* Widescreen placement: top panes move below the panel strip; mid-screen panes
++ * stack upward from just above the console, lowest original pane first. */
++static void PlaceMessages(const XvtHudDraw* draw, XvtSnapRect placements[XVT_COCKPIT_MESSAGE_COUNT]) {
++	int top[XVT_COCKPIT_MESSAGE_COUNT], bottom[XVT_COCKPIT_MESSAGE_COUNT], floating[XVT_COCKPIT_MESSAGE_COUNT];
++	for (unsigned pane = 0; pane < XVT_COCKPIT_MESSAGE_COUNT; ++pane) {
++		const XvtCockpitMessage* message = &draw->state->messages.panes[pane];
++		placements[pane] = message->placement;
++		floating[pane] = 0;
++		if (message->placement.y < draw->message_top) {
++			placements[pane].y += draw->message_shift;
++			continue;
++		}
++		if (!draw->message_floor || !message->visible || message->placement.y * 3 <= draw->layout->source_height ||
++			message->placement.y >= draw->message_floor ||
++			message->first_glyph + message->glyph_count > draw->state->overlay_content.glyph_count)
++			continue;
++		top[pane] = INT_MAX;
++		bottom[pane] = 0;
++		for (unsigned index = 0; index < message->glyph_count; ++index) {
++			const XvtCockpitGlyph* glyph = &draw->state->overlay_content.glyphs[message->first_glyph + index];
++			if (glyph->y < top[pane])
++				top[pane] = glyph->y;
++			if (glyph->y + glyph->height > bottom[pane])
++				bottom[pane] = glyph->y + glyph->height;
++		}
++		floating[pane] = bottom[pane] > 0;
++	}
++	int floor = draw->message_floor - 2;
++	for (;;) {
++		int next = -1;
++		for (unsigned pane = 0; pane < XVT_COCKPIT_MESSAGE_COUNT; ++pane)
++			if (floating[pane] &&
++				(next < 0 || draw->state->messages.panes[pane].placement.y >
++								 draw->state->messages.panes[next].placement.y))
++				next = (int)pane;
++		if (next < 0)
++			break;
++		floating[next] = 0;
++		placements[next].y = floor - bottom[next];
++		floor = placements[next].y + top[next] - 2;
++	}
++}
++
+ int XvtHudPanes_DrawMessages(const XvtHudDraw* draw) {
+ 	if (!DrawPage(draw, MFD_PAGE_MESSAGE_LOG))
+ 		return 0;
++	XvtSnapRect placements[XVT_COCKPIT_MESSAGE_COUNT];
++	PlaceMessages(draw, placements);
+ 	for (unsigned pane = 0; pane < XVT_COCKPIT_MESSAGE_COUNT; ++pane) {
+ 		const XvtCockpitMessage* message = &draw->state->messages.panes[pane];
+-		XvtSnapRect placement = message->placement;
+-		if (placement.y < draw->message_top)
+-			placement.y += draw->message_shift;
+-		else if (draw->message_floor && message->visible && placement.y * 3 > draw->layout->source_height &&
+-				 placement.y < draw->message_floor &&
+-				 message->first_glyph + message->glyph_count <= draw->state->overlay_content.glyph_count) {
+-			/* Rest the text's lowest line two rows above the console. */
+-			int bottom = 0;
+-			for (unsigned index = 0; index < message->glyph_count; ++index) {
+-				const XvtCockpitGlyph* glyph = &draw->state->overlay_content.glyphs[message->first_glyph + index];
+-				if (glyph->y + glyph->height > bottom)
+-					bottom = glyph->y + glyph->height;
+-			}
+-			if (bottom)
+-				placement.y = draw->message_floor - 2 - bottom;
+-		}
+ 		if (message->visible && !DrawOverlayGlyphs(draw, message->first_glyph, message->glyph_count,
+-												   placement, XVT_COCKPIT_AFTER_CRT))
++												   placements[pane], XVT_COCKPIT_AFTER_CRT))
+ 			return 0;
+ 		if (pane == XVT_COCKPIT_MESSAGE_READY) {
+ 			for (unsigned field = XVT_COCKPIT_TEXT_NETWORK_PING; field <= XVT_COCKPIT_TEXT_NETWORK_LAG;

@@ -1,0 +1,67 @@
+From 8d2569a3389c2eef22577da6577838ba74c062f9 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 11 Nov 2026 03:39:05 +1100
+Subject: [PATCH 57/59] R skips disabled craft; E skips dying and departing
+ attackers
+
+R (nearest enemy fighter) passes over disabled craft, as XvT's does.
+E counted any hostile craft whose AI target was the player, including ones
+already destroyed and exploding or leaving, so a press could pick a craft
+that dropped out at once. Attackers now need X-Wing's flying object kinds
+(as R) and working systems, as XvT's Player_FindAttackerOfTarget; the C
+wingman order uses the same test. DOS flight unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xw/flight/player/user.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 8b4e75f..b657820 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -323,8 +323,14 @@ static int user_isplayerattacker(uint16_t index) {
+ 		g_objectTable[index].iff == g_playerFlightState.object->iff)
+ 		return 0;
+ 	craft = g_objectTable[index].instanceData;
+-	return craft && craft->aiTargetRef == g_playerFlightState.objectIndex &&
+-		   (XwFlightTypes_Dos() || craft->workingSubsystems != 0);
++	if (!craft || craft->aiTargetRef != g_playerFlightState.objectIndex)
++		return 0;
++	if (XwFlightTypes_Dos())
++		return 1;
++	/* As XvT's Player_FindAttackerOfTarget: not disabled, and still flying (not destroyed and exploding, or
++	 * leaving), with R's object kinds. */
++	return craft->workingSubsystems != 0 &&
++		   (craft->objectKind == XW_CRAFT_OBJECT_KIND_0 || craft->objectKind == XW_CRAFT_OBJECT_KIND_6);
+ }
+ 
+ static uint16_t user_nextattacker(void) {
+@@ -1560,6 +1566,12 @@ void user_inputforplane(void) {
+ 					g_objectTable[index].iff != g_objectTable[g_playerFlightState.objectIndex].iff) {
+ #endif
+ 					uint8_t kind = ((CraftData*)g_objectTable[index].instanceData)->objectKind;
++#ifdef XW_MODERN
++					/* XvT's R passes over disabled craft. */
++					if (!XwFlightTypes_Dos() &&
++						((CraftData*)g_objectTable[index].instanceData)->workingSubsystems == 0)
++						continue;
++#endif
+ 					if (kind == XW_CRAFT_OBJECT_KIND_0 || kind == XW_CRAFT_OBJECT_KIND_6) {
+ 						pai_distancebetween(g_playerFlightState.objectIndex, index);
+ 						if ((uint32_t)g_trig2PolarDistance < distance) {
+@@ -2896,11 +2908,11 @@ int16_t user_findclosestattacker(void) {
+ 		if (candidateIndex != g_playerFlightState.objectIndex &&
+ 			g_objectTable[candidateIndex].objectType != XW_OBJ_NONE &&
+ 			g_objectTable[candidateIndex].iff != g_playerFlightState.object->iff) {
+-			CraftData* candidateCraft = g_objectTable[candidateIndex].instanceData;
+-			if (candidateCraft->aiTargetRef == g_playerFlightState.objectIndex &&
+ #ifdef XW_MODERN
+-				(XwFlightTypes_Dos() || candidateCraft->workingSubsystems != 0)) {
++			if (user_isplayerattacker(candidateIndex)) {
+ #else
++			CraftData* candidateCraft = g_objectTable[candidateIndex].instanceData;
++			if (candidateCraft->aiTargetRef == g_playerFlightState.objectIndex &&
+ 				candidateCraft->workingSubsystems != 0) {
+ #endif
+ 				pai_roughdistancebetween(candidateIndex, g_playerFlightState.objectIndex);

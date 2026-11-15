@@ -1,0 +1,83 @@
+From 3d0778dbeb21e65840b78fc8c92addc81930d705 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 19:42:27 +1100
+Subject: [PATCH 19/59] render.xvt_cockpit: XvT panel text for the Y-Wing
+ (E/L/S, F/R, clock, SPD and THROTTLE boxes); weapon icon hidden
+
+---
+ src/xw_remaster/hud_readout.c | 19 +++++++++++++++----
+ src/xw_remaster/xvt_cockpit.c |  5 ++++-
+ src/xw_remaster/xvt_cockpit.h |  4 +++-
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 1571ed4..d3a5c21 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -232,10 +232,16 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	PanelText(&labels, 123, "S", PANEL_LABEL);
+ 	PanelText(&labels, 128, "F", PANEL_SWITCH);
+ 	PanelText(&labels, 129, "R", PANEL_SWITCH);
+-	/* The clock, throttle and speed boxes in XWING12's right-hand column (inside their frames), with the
+-	 * captions centred under the lower two, as XvT draws them. */
+-	static const XwSnapRect clock_box = { 421, 390, 39, 19 }, throttle_box = { 425, 416, 34, 19 },
+-							speed_box = { 424, 451, 36, 18 };
++	/* The clock, throttle and speed boxes (inside their frames), measured from each craft's panel art. The
++	 * X-Wing's sit in its right-hand column with the captions centred under the lower two; the Y-Wing's clock
++	 * is on the left console and XvT writes its captions at elements 121 (SPD) and 120 (THROTTLE). */
++	bool ywing = !strcmp(XwXvtCockpit_Craft(), "ywing");
++	XwSnapRect clock_box = { 421, 390, 39, 19 }, throttle_box = { 425, 416, 34, 19 }, speed_box = { 424, 451, 36, 18 };
++	if (ywing) {
++		clock_box = (XwSnapRect) { 130, 398, 46, 20 };
++		throttle_box = (XwSnapRect) { 384, 448, 33, 17 };
++		speed_box = (XwSnapRect) { 400, 427, 34, 16 };
++	}
+ 	char digits[16], text[40];
+ 	/* X-Wing's clock pane holds minutes then two second digits. */
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_CLOCK, digits, sizeof digits);
+@@ -251,6 +257,11 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	BoxText(&labels, &throttle_box, text, PANEL_VALUE);
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, digits, sizeof digits);
+ 	BoxText(&labels, &speed_box, digits[0] ? digits : "0", PANEL_VALUE);
++	if (ywing) {
++		PanelText(&labels, 121, "SPD", PANEL_LABEL);
++		PanelText(&labels, 120, "THROTTLE", PANEL_LABEL);
++		return true;
++	}
+ 	float caption_h = FontHeight(small);
+ 	XwSnapRect caption = { 412, 0, 56, 0 };
+ 	Centered(&labels, &caption, throttle_box.y + throttle_box.height + 3, "THROTTLE", PANEL_LABEL);
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index c698cd4..1cf1b86 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -861,9 +861,12 @@ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* d, unsigned index, const XwSna
+ }
+ 
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
+-	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 && !strcmp(g_craft.name, "xwing");
++	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 &&
++		   (!strcmp(g_craft.name, "xwing") || !strcmp(g_craft.name, "ywing"));
+ }
+ 
++const char* XwXvtCockpit_Craft(void) { return g_craft.name; }
++
+ bool XwXvtCockpit_XvtPosition(unsigned index, int* x, int* y) {
+ 	if (!g_craft.loaded || index >= HUD_BASE || !Placed(&g_craft.elements[index]))
+ 		return false;
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index 656f310..8bcde73 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -25,8 +25,10 @@ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
+ /* Text of a captured HUD pane in reading order ("" when absent). */
+ void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
+ /* True when the forward cockpit also shows XvT's own panel text (E/L/S, F/R, clock, throttle and speed
+- * boxes) and the XvT CMD bottom rows. So far the X-Wing only. */
++ * boxes) and the XvT CMD bottom rows. So far the X-Wing and Y-Wing. */
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* snapshot);
++/* The loaded craft ("xwing", "ywing", ...; "" before any). */
++const char* XwXvtCockpit_Craft(void);
+ /* Classic position of XvT forward element `index` for the current craft. False when it is not placed. */
+ bool XwXvtCockpit_XvtPosition(unsigned index, int* x, int* y);
+ void XwXvtCockpit_Shutdown(void);

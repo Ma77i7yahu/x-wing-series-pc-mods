@@ -1,0 +1,186 @@
+From 03e02e13740eb5835f93e39cd33c4403a5eee363 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:59:20 +1100
+Subject: [PATCH 08/59] Threat display follows every target change, including
+ warheads and mission objects
+
+---
+ src/xw/flight/player/user.c            | 67 +++++++++++++++-----------
+ src/xw/flight/player/user.h            |  3 ++
+ src/xw_runtime/runtime/flight_camera.c | 35 +++++++++-----
+ 3 files changed, 66 insertions(+), 39 deletions(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 1f156ab..dcc93f7 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -53,20 +53,43 @@
+ #include <string.h>
+ 
+ #ifdef XW_MODERN
+-/* view_target (Z): set while the camera chases the player's target. Other view keys can take the camera
+- * away, so it only counts while the camera is still external on a non-player object. */
++/* view_target (Z): XvT's threat display. The camera always shows the player's current target, whatever kind
++ * of object it is (craft, warhead or mission object such as a mine or buoy), so the game's own camera focus
++ * stays on the player and flight_camera.c places the view. Other view keys that leave the external view end
++ * it. */
+ static int s_targetViewFlag, s_targetViewPreviousExternal;
+ static int16_t s_targetViewPreviousDistance;
+-#define s_targetViewActive                                                                                  \
+-	(s_targetViewFlag && g_flightCamera.externalViewActive != 0 &&                                          \
+-	 g_flightCamera.focusObjectRef != g_playerFlightState.objectIndex)
++static uint16_t s_targetViewFramed;
++#define s_targetViewActive (s_targetViewFlag && g_flightCamera.externalViewActive != 0)
+ 
+ int user_targetviewactive(void) { return s_targetViewActive; }
+ 
+-/* XvT's threat display frames the target: chase distance from the game's own model size. */
++/* The player's target when it can be shown: a live object-table object or mission object. */
++static uint16_t user_viewabletarget(void) {
++	uint16_t target = g_playerFlightState.currentTargetObjectIdx;
++	if (target == XW_OBJECT_SLOT_UNAVAILABLE || target == g_playerFlightState.objectIndex)
++		return XW_OBJECT_SLOT_UNAVAILABLE;
++	if (target < XW_MISSION_OBJECT_REF_BASE)
++		return target < g_mainObjectSlotEnd && g_objectTable[target].objectType != XW_OBJ_NONE &&
++					   g_objectTable[target].genusId != XW_GENUS_EXPLOSION_EFFECT
++				   ? target
++				   : XW_OBJECT_SLOT_UNAVAILABLE;
++	return target - XW_MISSION_OBJECT_REF_BASE < MISSION_OBJECT_COUNT &&
++				   g_missionObjects[target - XW_MISSION_OBJECT_REF_BASE].objectType != XW_OBJ_NONE
++			   ? target
++			   : XW_OBJECT_SLOT_UNAVAILABLE;
++}
++
++uint16_t user_targetviewobject(void) { return s_targetViewActive ? user_viewabletarget() : XW_OBJECT_SLOT_UNAVAILABLE; }
++
++/* XvT's threat display frames the target: camera distance from the game's own model size. */
+ static void user_frametargetview(uint16_t target) {
++	uint16_t type = target < XW_MISSION_OBJECT_REF_BASE
++						? g_objectTable[target].objectType
++						: g_missionObjects[target - XW_MISSION_OBJECT_REF_BASE].objectType;
++	s_targetViewFramed = target;
+ 	/* Far enough that the whole craft fits the display window, as in XvT. */
+-	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 5;
++	int distance = g_modelTypeTable[type].maxBoundsExtent * 5;
+ 	if (distance < USER_CAMERA_MIN_DISTANCE)
+ 		distance = USER_CAMERA_MIN_DISTANCE;
+ 	/* Capital ships need more room than the manual zoom's USER_CAMERA_MAX_DISTANCE. */
+@@ -270,26 +293,17 @@ void user_userinterface(void) {
+ 	 * targeting computer (which happens as soon as a craft starts dying), or something else (the game's own
+ 	 * focus reset, another view key) has already pointed the camera back at the player. */
+ 	if (g_replayviewmode == 0 && s_targetViewFlag) {
+-		uint16_t focusRef = g_flightCamera.focusObjectRef;
+-		const ObjectRecord* focus = focusRef < XW_OBJECT_COUNT ? &g_objectTable[focusRef] : NULL;
+-		uint16_t target = g_playerFlightState.currentTargetObjectIdx;
+-		if (!g_flightCamera.externalViewActive) {
+-			/* Left through another view key; keep that view. */
++		uint16_t target = user_viewabletarget();
++		if (!g_flightCamera.externalViewActive || g_flightCamera.focusObjectRef != g_playerFlightState.objectIndex) {
++			/* Left through another view key (or the warhead camera); keep that view. */
+ 			s_targetViewFlag = 0;
+ 			g_flightCamera.externalDistance = s_targetViewPreviousDistance;
+-		} else if (!focus || focusRef == g_playerFlightState.objectIndex || focus->objectType == XW_OBJ_NONE ||
+-				   focus->genusId == XW_GENUS_EXPLOSION_EFFECT || focus->familyId != XW_OBJECT_FAMILY_CRAFT ||
+-				   target == XW_OBJECT_SLOT_UNAVAILABLE) {
+-			g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
++		} else if (target == XW_OBJECT_SLOT_UNAVAILABLE) {
+ 			user_endtargetview();
+ 			user_resetview();
+-		} else if (target != g_flightCamera.focusObjectRef && target < g_mainObjectSlotEnd &&
+-				   target != g_playerFlightState.objectIndex && g_objectTable[target].objectType != XW_OBJ_NONE &&
+-				   g_objectTable[target].familyId == XW_OBJECT_FAMILY_CRAFT) {
+-			/* As in XvT, cycling targets in the threat display moves the camera to the new target. */
+-			g_flightCamera.focusObjectRef = target;
++		} else if (target != s_targetViewFramed) {
++			/* As in XvT, the threat display follows every change of target. */
+ 			user_frametargetview(target);
+-			user_resetview();
+ 		}
+ 	}
+ #endif
+@@ -743,11 +757,9 @@ void user_inputforplane(void) {
+ 			if (g_replayviewmode != 0)
+ 				break;
+ 			if (s_targetViewActive) {
+-				g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
+ 				user_endtargetview();
+ 				user_resetview();
+-			} else if (g_playerFlightState.currentTargetObjectIdx < g_mainObjectSlotEnd &&
+-					   g_objectTable[g_playerFlightState.currentTargetObjectIdx].objectType != XW_OBJ_NONE) {
++			} else if (user_viewabletarget() != XW_OBJECT_SLOT_UNAVAILABLE) {
+ 				if (g_flightCamera.focusObjectRef == g_playerFlightState.objectIndex &&
+ 					g_flightCamera.externalViewActive == 0) {
+ 					g_flightCamera.savedHudState = g_flightCamera.hudStateLive;
+@@ -756,8 +768,9 @@ void user_inputforplane(void) {
+ 				}
+ 				s_targetViewPreviousExternal = g_flightCamera.externalViewActive;
+ 				s_targetViewPreviousDistance = g_flightCamera.externalDistance;
+-				g_flightCamera.focusObjectRef = g_playerFlightState.currentTargetObjectIdx;
+-				user_frametargetview(g_flightCamera.focusObjectRef);
++				/* The game's focus stays on the player; flight_camera.c views the current target. */
++				g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
++				user_frametargetview(user_viewabletarget());
+ 				g_flightCamera.externalViewActive = 1;
+ 				s_targetViewFlag = 1;
+ 				user_resetview();
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index cb1f27b..14c4550 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -139,6 +139,9 @@ extern const uint8_t g_aiPlanStatusMessageIds[USER_AI_STATUS_COUNT];
+ #ifdef XW_MODERN
+ /* view_target (Z): nonzero while the camera shows the player's target (XvT threat display). */
+ int user_targetviewactive(void);
++/* The object the threat display shows (object-table index or mission-object reference), or
++ * XW_OBJECT_SLOT_UNAVAILABLE. */
++uint16_t user_targetviewobject(void);
+ #endif
+ 
+ enum { USER_TURN_MODIFIER_MASK = 0xE, USER_TURN_ROLL_MODE = 2 };
+diff --git a/src/xw_runtime/runtime/flight_camera.c b/src/xw_runtime/runtime/flight_camera.c
+index 13581d8..12928b6 100644
+--- a/src/xw_runtime/runtime/flight_camera.c
++++ b/src/xw_runtime/runtime/flight_camera.c
+@@ -100,19 +100,30 @@ void XwFlightCamera_Update(void) {
+ 		}
+ 		fview_newcalcview(g_flightCamera.viewRoll, g_flightCamera.viewPitch, g_flightCamera.viewYaw, 0,
+ 						  g_flightCamera.hudAimX, g_flightCamera.hudAimY, NULL);
++	} else if (user_targetviewobject() != XW_OBJECT_SLOT_UNAVAILABLE) {
++		/* XvT's threat display: the player's current target (craft, warhead or mission object) as seen from
++		 * the player's craft, along the line of sight, with the player's roll so up matches the pilot's view. */
++		create_getworldposition(user_targetviewobject(), 0);
++		int32_t x = g_resolvedWorldX, y = g_resolvedWorldY, z = g_resolvedWorldZ;
++		XwFlightCamera_CartesianToPolar((int32_t)((uint32_t)x - (uint32_t)g_playerFlightState.object->worldX),
++										(int32_t)((uint32_t)y - (uint32_t)g_playerFlightState.object->worldY),
++										(int32_t)((uint32_t)z - (uint32_t)g_playerFlightState.object->worldZ));
++		g_flightCamera.viewRoll = g_playerFlightState.object->roll;
++		g_flightCamera.viewPitch = g_trig2Pitch;
++		g_flightCamera.viewYaw = g_trig2Yaw;
++		fview_newcalcview(g_flightCamera.viewRoll, g_flightCamera.viewPitch, g_flightCamera.viewYaw, 0, 0, 0,
++						  NULL);
++		g_flightCamera.worldPosition.x = (int32_t)((uint32_t)x - (uint32_t)(((int64_t)g_camMatR2_X *
++																			g_flightCamera.externalDistance) >>
++																		   XW_CAMERA_MATRIX_SHIFT));
++		g_flightCamera.worldPosition.y = (int32_t)((uint32_t)y - (uint32_t)(((int64_t)g_camMatR2_Y *
++																			g_flightCamera.externalDistance) >>
++																		   XW_CAMERA_MATRIX_SHIFT));
++		g_flightCamera.worldPosition.z = (int32_t)((uint32_t)z - (uint32_t)(((int64_t)g_camMatR2_Z *
++																			g_flightCamera.externalDistance) >>
++																		   XW_CAMERA_MATRIX_SHIFT));
+ 	} else if (g_flightCamera.externalViewActive != 0) {
+-		if (user_targetviewactive()) {
+-			/* XvT's threat display: the target as seen from the player's craft, along the line of sight,
+-			 * with the player's roll so up matches the pilot's view. */
+-			const ObjectRecord* focus = &g_objectTable[g_flightCamera.focusObjectRef];
+-			XwFlightCamera_CartesianToPolar(
+-				(int32_t)((uint32_t)focus->worldX - (uint32_t)g_playerFlightState.object->worldX),
+-				(int32_t)((uint32_t)focus->worldY - (uint32_t)g_playerFlightState.object->worldY),
+-				(int32_t)((uint32_t)focus->worldZ - (uint32_t)g_playerFlightState.object->worldZ));
+-			g_flightCamera.viewRoll = g_playerFlightState.object->roll;
+-			g_flightCamera.viewPitch = g_trig2Pitch;
+-			g_flightCamera.viewYaw = g_trig2Yaw;
+-		} else if (XwFlightTiming_IsUnlocked()) {
++		if (XwFlightTiming_IsUnlocked()) {
+ 			UpdateChase();
+ 		} else {
+ 			int16_t historyIndex = g_flightCamera.angleHistory.writeIndex - XW_EXTERNAL_VIEW_LAG;

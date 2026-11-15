@@ -1,0 +1,1628 @@
+From f493b980167675652db83e0440fc656060d9563d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 11:25:56 +1100
+Subject: [PATCH 12/18] XvT controls, gameplay, sounds and fixes: E cycles
+ attackers, Shift+' all cannon to shields, skip empty warheads, shield
+ balancing, turning, engine wash, launch overshield, recharge, control sounds;
+ wreck flip and dying turret fixes
+
+---
+ CMakeLists.txt                        |   2 +
+ resources/config.yaml                 |  23 +++
+ src/tie/collide.c                     | 252 +++++++++++++++++++++++++-
+ src/tie/collide.h                     |   6 +
+ src/tie/create.c                      |  10 +
+ src/tie/fsfx.c                        |   5 +
+ src/tie/fsfx.h                        |   8 +
+ src/tie/laser.c                       |  75 +++++++-
+ src/tie/laser.h                       |   4 +
+ src/tie/tie.c                         |   6 +
+ src/tie/user.c                        | 235 ++++++++++++++++++++++--
+ src/tie/user.h                        |   1 +
+ src/tie_app/application.c             |   2 +
+ src/tie_app/config/app_config.c       |  19 +-
+ src/tie_app/config/app_config.h       |   3 +
+ src/tie_app/settings/flight_options.c |   5 +-
+ src/tie_app/settings/settings.c       |  33 ++++
+ src/tie_runtime/audio/xvt_sounds.c    | 195 ++++++++++++++++++++
+ src/tie_runtime/audio/xvt_sounds.h    |  34 ++++
+ src/tie_runtime/hooks/flight_tweaks.c |  21 ++-
+ src/tie_runtime/hooks/flight_tweaks.h |  29 +++
+ src/tie_runtime/input/actions.c       |   4 +
+ src/tie_runtime/input/actions.h       |   2 +
+ 23 files changed, 948 insertions(+), 26 deletions(-)
+ create mode 100644 src/tie_runtime/audio/xvt_sounds.c
+ create mode 100644 src/tie_runtime/audio/xvt_sounds.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a604848..f64732f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -505,6 +505,8 @@ set(TIE_RUNTIME_SOURCES
+     src/tie_runtime/audio/flight_audio.h
+     src/tie_runtime/audio/flight_sound_bank.c
+     src/tie_runtime/audio/flight_sound_bank.h
++    src/tie_runtime/audio/xvt_sounds.c
++    src/tie_runtime/audio/xvt_sounds.h
+     src/tie_runtime/audio/frontend_voice.c
+     src/tie_runtime/audio/frontend_voice.h
+     src/tie_runtime/audio/player_engine.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 690939c..a504f2a 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -55,6 +55,27 @@ flight:
+   # Applies to every craft.
+   xvt_throttle: true
+   xvt_hud: true
++  # Player shields as in X-Wing vs TIE Fighter: after a hit, the hit bank draws
++  # energy from the other until they are even, and the shields return to balanced.
++  xvt_shields: true
++  # Player turn rate as in X-Wing vs TIE Fighter: tightest at 1/3 throttle (stock
++  # TIE rate), 2/3 of that at full throttle and 1/3 when stopped.
++  xvt_turning: true
++  # X-Wing vs TIE Fighter engine wash: flying in the exhaust behind a working
++  # freighter's or starship's engines drains your shields, then hull.
++  xvt_engine_wash: true
++  # Start each mission with the shields charged to double strength, as in XvT.
++  start_overshield: true
++  # Recharge as in X-Wing vs TIE Fighter: TIE Fighter and TIE Bomber cannons
++  # recharge half again as fast, Y-Wing shields twice as fast. Base rates match.
++  xvt_recharge: true
++  # W passes over warhead launchers with nothing left, and firing the last
++  # warhead switches back to the cannons, as in X-Wing vs TIE Fighter.
++  skip_empty_warheads: true
++  # X-Wing vs TIE Fighter's sounds for recharge rates (one tone per setting),
++  # energy transfers, weapon selection and the throttle keys
++  # (resources/xvt_control_sounds).
++  xvt_control_sounds: true
+   models:
+     source: original
+     smooth_angle_degrees: 90
+@@ -141,6 +162,8 @@ input:
+       - {key: "B"}
+     xfer_cannon_to_shields:
+       - {key: "'"}
++    xfer_all_cannon_to_shields:
++      - {key: "'", modifiers: [shift]}
+     xfer_shields_to_cannon:
+       - {key: ";"}
+     cycle_shield_mode:
+diff --git a/src/tie/collide.c b/src/tie/collide.c
+index 1ebb910..0873a94 100644
+--- a/src/tie/collide.c
++++ b/src/tie/collide.c
+@@ -26,6 +26,9 @@
+ #include "tie_runtime/runtime/inflight_state.h"
+ #include "tie_runtime/runtime/wide_arithmetic.h"
+ #ifdef TIE_MODERN
++#include "tie/modelbounds.h"
++#include "tie/option.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/snapshot/snapshot.h"
+ #include "tie_runtime/snapshot/snapshot_internal.h"
+ #endif
+@@ -83,6 +86,227 @@ int16_t instrumentdisable[] = { 0x200, 0x040, 0x020, 0x006, 0x400,  0x180, 0x010
+ #endif
+ };
+ 
++#ifdef TIE_MODERN
++/* flight.xvt_shields: XvT evens the player's banks after every hit. When the hit bank is below the other,
++ * half the difference moves across (a depleted bank takes half of the other), and the shields return to
++ * balanced. */
++static void collide_xvtbalanceshields(CraftData* cp, uint16_t hit_side) {
++	int16_t* banks = &cp->forward_shield;
++	int hit = banks[hit_side];
++	int other = banks[hit_side ^ 1];
++	int cap = 2 * spec_data[cp->species_idx].shield_points;
++	int moved;
++
++	if (!mission.difficulty)
++		cap *= 2;
++	if (hit >= other)
++		return;
++	moved = (other - hit) / 2;
++	if (hit + moved > cap)
++		moved = cap > hit ? cap - hit : 0;
++	if (moved <= 0)
++		return;
++	banks[hit_side] = (int16_t)(hit + moved);
++	banks[hit_side ^ 1] = (int16_t)(other - moved);
++	cp->is_player_craft = 1; /* shield distribution: balanced */
++}
++
++/* flight.xvt_engine_wash (OpenXvT collide_ApplyEngineWashDamage): flying in the exhaust behind a working
++ * freighter's or starship's engines drains the player's shields, then hull. The wash is a box behind each
++ * engine mesh of the OPT model that widens and weakens with depth. */
++enum {
++	COLLIDE_WASH_UPDATE_TICKS = 29,
++	COLLIDE_WASH_RANGE_SCALE = 3,
++	COLLIDE_WASH_LENGTH_SCALE = 8,
++	COLLIDE_WASH_MAX_DAMAGE = 64,
++	COLLIDE_WASH_PERCENT = 100,
++	COLLIDE_WASH_MESSAGE_TICKS = 5 * 236,
++	COLLIDE_WASH_SSD = 54,         /* XvT's SPECIAL_ENGINE_WASH_OBJECT_TYPE */
++	COLLIDE_WASH_CALAMARI = 49,    /* XvT's ASYMMETRIC_ENGINE_WASH_OBJECT_TYPE */
++};
++static int16_t s_wash_damage_override = -1;
++static uint16_t s_wash_accum;
++static uint32_t s_wash_message_wait;
++static uint8_t s_wash_was_active;
++/* XvT's engineWashSourceObjIdx/engineWashStrength: the strongest wash of the last update, for the sound. */
++static uint16_t s_wash_source = 0xFFFF;
++static int s_wash_strength;
++
++static int32_t collide_q15dot(int16_t ax, int16_t ay, int16_t az, int32_t bx, int32_t by, int32_t bz) {
++	return (int32_t)(((int64_t)ax * bx + (int64_t)ay * by + (int64_t)az * bz) >> 15);
++}
++
++/* Applies one source's wash to the player; returns nonzero when any engine's wash reached it. Model space is
++ * the OPT's: X side, Y aft, Z up (pai_calcrotatedpoint takes side = X, up = Z, forward = -Y). */
++static int collide_enginewash(uint16_t source_idx) {
++	FlightObject* source = &objects[source_idx];
++	FlightObject* player = pstate.player;
++	uint16_t type = source->ship_idx;
++	int extent = modelbounds_getmaxextent(type);
++	int32_t dx = (int32_t)((uint32_t)player->world_x - (uint32_t)source->world_x);
++	int32_t dy = (int32_t)((uint32_t)player->world_y - (uint32_t)source->world_y);
++	int32_t dz = (int32_t)((uint32_t)player->world_z - (uint32_t)source->world_z);
++	int32_t local_side, local_aft, local_up, nose_side, nose_aft, nose_up;
++	int mesh_count, mesh;
++	int washed = 0;
++
++	if (extent <= 0 || (int64_t)COLLIDE_WASH_RANGE_SCALE * extent < collide_roughdistance3d(dx, dy, dz))
++		return 0;
++	if (source->orient_dirty) {
++		fview_calcrotatemove(source->pitch, source->heading, source);
++		fview_calcrotateorient(source->roll, 0, source);
++	}
++	if (player->orient_dirty) {
++		fview_calcrotatemove(player->pitch, player->heading, player);
++		fview_calcrotateorient(player->roll, 0, player);
++	}
++	local_side = collide_q15dot(source->side_x, source->side_y, source->side_z, dx, dy, dz);
++	local_aft = -collide_q15dot(source->fwd_x, source->fwd_y, source->fwd_z, dx, dy, dz);
++	if (local_aft < -extent)
++		return 0;
++	local_up = collide_q15dot(source->up_x, source->up_y, source->up_z, dx, dy, dz);
++	/* The player's nose in the same model space picks the shield bank facing the engine. */
++	nose_side = collide_q15dot(source->side_x, source->side_y, source->side_z, player->fwd_x, player->fwd_y,
++							   player->fwd_z);
++	nose_aft = -collide_q15dot(source->fwd_x, source->fwd_y, source->fwd_z, player->fwd_x, player->fwd_y,
++							   player->fwd_z);
++	nose_up = collide_q15dot(source->up_x, source->up_y, source->up_z, player->fwd_x, player->fwd_y, player->fwd_z);
++
++	mesh_count = modelmesh_getcount(type);
++	for (mesh = 0; mesh < mesh_count; ++mesh) {
++		int min_x, min_y, min_z, max_x, max_y, max_z, cx, cy, cz;
++		int length_extent, side_extent, up_extent, wash_length, depth, side_offset, up_offset, damage;
++		int64_t to_engine;
++		CraftData* saved_craftptr;
++
++		if (modelmesh_gettype(type, mesh) != TIE_MESH_ENGINE)
++			continue;
++		cx = modelmesh_getcenterx(type, mesh);
++		cy = modelmesh_getcentery(type, mesh);
++		cz = modelmesh_getcenterz(type, mesh);
++		/* Engines on the front half (CAL.OPT's under-bow pods) would wash along the hull; XvT's models have
++		 * none there. */
++		if (cy < 0)
++			continue;
++		min_x = modelmesh_getboundsminx(type, mesh);
++		min_y = modelmesh_getboundsminy(type, mesh);
++		min_z = modelmesh_getboundsminz(type, mesh);
++		max_x = modelmesh_getboundsmaxx(type, mesh);
++		max_y = modelmesh_getboundsmaxy(type, mesh);
++		max_z = modelmesh_getboundsmaxz(type, mesh);
++		length_extent = max_y - min_y;
++		if (type == COLLIDE_WASH_SSD)
++			length_extent >>= 6;
++		side_extent = max_x - min_x;
++		up_extent = max_z - min_z;
++		if (type == COLLIDE_WASH_SSD && local_up > max_z)
++			continue;
++		if (type == COLLIDE_WASH_CALAMARI && cz < 0 && local_up > max_z)
++			continue;
++		if (length_extent < side_extent)
++			length_extent = side_extent;
++		if (length_extent < up_extent)
++			length_extent = up_extent;
++		wash_length = COLLIDE_WASH_LENGTH_SCALE * length_extent;
++		if (wash_length > 2 * extent)
++			wash_length = 2 * extent;
++		if (type == COLLIDE_WASH_SSD)
++			depth = (wash_length >> 8) - max_y + local_aft;
++		else
++			depth = local_aft - min_y;
++		if (depth <= 0 || wash_length < depth)
++			continue;
++		side_offset = abs(local_side - cx);
++		up_offset = abs(local_up - cz);
++		side_extent += side_extent >> 1;
++		side_extent += (int)((int64_t)depth * side_extent / wash_length);
++		up_extent += up_extent >> 1;
++		up_extent += (int)((int64_t)depth * up_extent / wash_length);
++		if (side_extent < side_offset || up_extent < up_offset || side_extent + up_extent <= 0)
++			continue;
++		damage = (wash_length >> 8) *
++				 (COLLIDE_WASH_PERCENT * (wash_length - depth) / wash_length *
++				  (COLLIDE_WASH_PERCENT * (side_extent + up_extent - up_offset - side_offset) /
++				   (side_extent + up_extent)) /
++				  COLLIDE_WASH_PERCENT) /
++				 COLLIDE_WASH_PERCENT;
++		if (type == COLLIDE_WASH_SSD) {
++			damage >>= 4;
++			damage += damage >> 1;
++		}
++		if (damage > COLLIDE_WASH_MAX_DAMAGE)
++			damage = COLLIDE_WASH_MAX_DAMAGE;
++		if (damage > s_wash_strength) {
++			s_wash_strength = damage;
++			s_wash_source = source_idx;
++		}
++		/* As XvT: with the shields down the wash only scorches the hull. */
++		if (pstate.player_craft->forward_shield + pstate.player_craft->rear_shield == 0)
++			damage >>= 3;
++		if (damage < 1)
++			damage = 1;
++		/* Facing the engine: front bank. */
++		to_engine = (int64_t)nose_side * (cx - local_side) + (int64_t)nose_aft * (cy - local_aft) +
++					(int64_t)nose_up * (cz - local_up);
++		saved_craftptr = craftptr;
++		s_wash_damage_override = (int16_t)damage;
++		collide_damagecraft(pstate.object_idx, 0xFFFF, source_idx, to_engine >= 0 ? 0 : 1);
++		s_wash_damage_override = -1;
++		craftptr = saved_craftptr;
++		washed = 1;
++		if (pstate.player_craft->flight_flag)
++			break;
++	}
++	return washed;
++}
++
++/* Every 29 ticks, as XvT, from frame ticks so replays repeat it. */
++static void collide_updateenginewash(void) {
++	uint16_t i;
++	int washed = 0;
++
++	if (!TieFlightTweaks_XvtEngineWash() || !TIE_FLIGHT_TIE98 || inflight_invulnerable || hyperspaceflag ||
++		mission.train_craft_type || pstate.player_craft->flight_flag || !pstate.player_craft->status_flags) {
++		s_wash_strength = 0;
++		return;
++	}
++	if (s_wash_message_wait > frameticks)
++		s_wash_message_wait -= frameticks;
++	else
++		s_wash_message_wait = 0;
++	s_wash_accum = (uint16_t)(s_wash_accum + frameticks);
++	if (s_wash_accum < COLLIDE_WASH_UPDATE_TICKS)
++		return;
++	s_wash_accum %= COLLIDE_WASH_UPDATE_TICKS;
++	s_wash_strength = 0;
++	s_wash_source = 0xFFFF;
++	for (i = 0; i < NUM_CRAFTS; ++i) {
++		FlightObject* source = &objects[i];
++
++		if (i == pstate.object_idx || !source->ship_idx || source->category ||
++			(source->genus != GENUS_FREIGHTER && source->genus != GENUS_STARSHIP))
++			continue;
++		if (!source->craft_ptr || !source->craft_ptr->status_flags)
++			continue;
++		washed |= collide_enginewash(i);
++		if (pstate.player_craft->flight_flag)
++			break;
++	}
++	if (washed && !replayviewmode && (!s_wash_was_active || !s_wash_message_wait)) {
++		msg_messagetext(MSG_COLLISION_OCCURRED, "You're taking damage from engine wash!");
++		s_wash_message_wait = COLLIDE_WASH_MESSAGE_TICKS;
++	}
++	s_wash_was_active = (uint8_t)washed;
++}
++
++int collide_enginewashsound(uint16_t* source_ship_idx) {
++	if (s_wash_strength <= 0 || s_wash_source >= NUM_CRAFTS || !objects[s_wash_source].ship_idx)
++		return 0;
++	*source_ship_idx = objects[s_wash_source].ship_idx;
++	return s_wash_strength;
++}
++#endif
++
+ /* ---------- 13. collide_collisions ----------
+  *
+  * Per-frame top-level dispatcher. See header doc-comment for the
+@@ -93,10 +317,17 @@ int16_t instrumentdisable[] = { 0x200, 0x040, 0x020, 0x006, 0x400,  0x180, 0x010
+ void collide_collisions(void) {
+ 	uint16_t projectile_idx;
+ 
+-	if (hyperspaceflag && !hyperabortflag)
++	if (hyperspaceflag && !hyperabortflag) {
++#ifdef TIE_MODERN
++		s_wash_strength = 0;
++#endif
+ 		return;
++	}
+ 
+ 	if (!pstate.player->genus) {
++#ifdef TIE_MODERN
++		collide_updateenginewash();
++#endif
+ 		CraftData* tgt_craft;
+ 		uint16_t hit_offset;
+ 		uint16_t target_idx;
+@@ -1218,6 +1449,10 @@ char collide_damagecraft(uint16_t target_obj_idx, uint16_t component_idx, uint16
+ 
+ 	if (objects[target_obj_idx].genus == GENUS_GATE)
+ 		damage = 0;
++#ifdef TIE_MODERN
++	if (s_wash_damage_override >= 0)
++		damage = s_wash_damage_override;
++#endif
+ 
+ 	/* Step 3: shield absorption. shield_side selects forward_shield (0)
+ 	 * or rear_shield (1), adjacent int16 fields at +0xCA / +0xCC. */
+@@ -1227,6 +1462,10 @@ char collide_damagecraft(uint16_t target_obj_idx, uint16_t component_idx, uint16
+ 		if (target_obj_idx == pstate.object_idx) {
+ 			shieldblink = (uint8_t)shield_side;
+ 			timers[TIMER_SHIELD_FLASH] += 59;
++#ifdef TIE_MODERN
++			if (TieFlightTweaks_XvtShields())
++				collide_xvtbalanceshields(craftptr, shield_side);
++#endif
+ 		}
+ 	} else {
+ 		/* Step 4: shield overflow. */
+@@ -1235,6 +1474,10 @@ char collide_damagecraft(uint16_t target_obj_idx, uint16_t component_idx, uint16
+ 
+ 		damage -= (&craftptr->forward_shield)[shield_side];
+ 		(&craftptr->forward_shield)[shield_side] = 0;
++#ifdef TIE_MODERN
++		if (target_obj_idx == pstate.object_idx && TieFlightTweaks_XvtShields())
++			collide_xvtbalanceshields(craftptr, shield_side);
++#endif
+ 
+ 		if (damage) {
+ 			if ((atk_species != 141 && atk_species != 142) || target_obj_idx == pstate.object_idx) {
+@@ -1569,8 +1812,15 @@ char collide_damagecraft(uint16_t target_obj_idx, uint16_t component_idx, uint16
+ 				spin = -spin;
+ 			objects[target_obj_idx].spin_rate = spin;
+ 			if (heading_kick) {
++#ifdef TIE_MODERN
++				/* Halve the signed kick. The original unsigned halving turned a negative (left wing) kick into a
++				 * ~174 degree flip, sending the wreck back into the pursuing player. */
++				objects[target_obj_idx].heading =
++					(uint16_t)objects[target_obj_idx].heading - (int16_t)heading_kick / 2;
++#else
+ 				objects[target_obj_idx].heading =
+ 					(uint16_t)objects[target_obj_idx].heading - heading_kick / 2;
++#endif
+ 				objects[target_obj_idx].orient_dirty = 1;
+ 				objects[target_obj_idx].move_dirty = 1;
+ 			}
+diff --git a/src/tie/collide.h b/src/tie/collide.h
+index 395f520..e6174b9 100644
+--- a/src/tie/collide.h
++++ b/src/tie/collide.h
+@@ -144,6 +144,12 @@ void collide_laserhitcraft(uint16_t projectile_obj_idx, uint16_t target_obj_idx,
+ char collide_damagecraft(uint16_t target_obj_idx, uint16_t component_idx, uint16_t attacker_obj_idx,
+ 						 uint16_t shield_side);
+ 
++#ifdef TIE_MODERN
++/* flight.xvt_engine_wash: the strongest wash on the player in the latest update (XvT engineWashStrength, up to
++ * 64), or 0; *source_ship_idx gets the washing craft's species. */
++int collide_enginewashsound(uint16_t* source_ship_idx);
++#endif
++
+ /*
+  * Convert FlightObject obj_idx into a generic explosion: sets
+  * ship_idx=variant (127/128 craft chunk, -125 missile fizz), genus=13,
+diff --git a/src/tie/create.c b/src/tie/create.c
+index e0061aa..10689f3 100644
+--- a/src/tie/create.c
++++ b/src/tie/create.c
+@@ -42,6 +42,9 @@
+ #include "tie_runtime/runtime/exports.h"
+ #include "tie_runtime/runtime/profile.h"
+ #include "tie_runtime/storage/storage.h"
++#ifdef TIE_MODERN
++#include "tie_runtime/hooks/flight_tweaks.h"
++#endif
+ 
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -1222,6 +1225,13 @@ uint16_t create_createcraft(void) {
+ 			craftptr->forward_shield *= 2;
+ 			craftptr->rear_shield *= 2;
+ 		}
++#ifdef TIE_MODERN
++		/* flight.start_overshield: launch with both banks at the recharge ceiling, as in XvT. */
++		if (TieFlightTweaks_StartOvershield()) {
++			craftptr->forward_shield *= 2;
++			craftptr->rear_shield *= 2;
++		}
++#endif
+ 	} else {
+ 		craftptr->rear_shield = 0;
+ 		craftptr->is_player_craft = 0;
+diff --git a/src/tie/fsfx.c b/src/tie/fsfx.c
+index f52f2c2..0d31a97 100644
+--- a/src/tie/fsfx.c
++++ b/src/tie/fsfx.c
+@@ -15,6 +15,9 @@
+ #include "tie/trig2.h"
+ #include "tie_runtime/audio/config.h"
+ #include "tie_runtime/audio/flight_sound_bank.h"
++#ifdef TIE_MODERN
++#include "tie_runtime/audio/xvt_sounds.h"
++#endif
+ #include "tie_runtime/diagnostics/diagnostics.h"
+ #include "tie_runtime/display/classic_display.h"
+ #include "tie_runtime/display/classic_framebuffer.h"
+@@ -275,6 +278,7 @@ void fsfx_freesfx(void) {
+ 			soundhandles[i] = NULL;
+ 		}
+ 	}
++	TieXvtSounds_Free();
+ 	memset(soundnames, 0, sizeof soundnames);
+ #else
+ 	int i;
+@@ -327,6 +331,7 @@ int16_t fsfx_loadsfx(const char* filename) {
+ 
+ 	snprintf(doe_path, sizeof(doe_path), "%sSFXDOE.LFD", resourcedir);
+ 	total += TieFlightSound_LoadBank(doe_path, 107, layout.mission_voice_base, 0);
++	TieXvtSounds_Load();
+ 
+ 	return (int16_t)total;
+ #else
+diff --git a/src/tie/fsfx.h b/src/tie/fsfx.h
+index c843dcf..81b154c 100644
+--- a/src/tie/fsfx.h
++++ b/src/tie/fsfx.h
+@@ -151,7 +151,15 @@ int16_t fsfx_calcvolume(uint16_t src_obj, uint16_t sound_id);
+ int16_t fsfx_calcpan(uint16_t src_obj, int16_t* volume_ptr);
+ 
+ /* FSFX-owned handle table and voice queue state. */
++#ifdef TIE_MODERN
++/* Modern addition: XvT control sounds and engine wash loops (tie_runtime/audio/xvt_sounds.c) after the
++ * TIE98 table. */
++#define FSFX_XVT_FIRST_ID 131
++#define FSFX_XVT_SOUND_COUNT 9
++#define FSFX_NUM_SOUND_HANDLES (FSFX_XVT_FIRST_ID + FSFX_XVT_SOUND_COUNT)
++#else
+ #define FSFX_NUM_SOUND_HANDLES 131
++#endif
+ #define FSFX_TIE95_SOUND_TABLE_COUNT 128
+ #define FSFX_TIE98_SOUND_TABLE_COUNT 131
+ #define FSFX_TIE95_MISSION_VOICE_BASE 109
+diff --git a/src/tie/laser.c b/src/tie/laser.c
+index 96f603f..5884029 100644
+--- a/src/tie/laser.c
++++ b/src/tie/laser.c
+@@ -281,9 +281,23 @@ void laser_weaponsfire(void) {
+ 				}
+ 			}
+ 
++#ifdef TIE_MODERN
++			/* flight.xvt_recharge: XvT doubles the Y-Wing's shield recharge and gives TIE fighters and bombers 3
++			 * cannon charge per power step instead of 2 (OpenXvT laser_weaponsfire). */
++			int16_t shield_step = 20;
++			int16_t laser_step = 2;
++			if (TieFlightTweaks_XvtRecharge()) {
++				if (objects[i].ship_idx == 2)
++					shield_step *= 2;
++				if (objects[i].ship_idx == 5 || objects[i].ship_idx == 7)
++					laser_step = 3;
++			}
++#else
++			enum { shield_step = 20, laser_step = 2 };
++#endif
+ 			/* Shield regen (if the subsystem bit is set). */
+ 			if (craftptr->status_flags & 1) {
+-				int16_t delta = (int16_t)(20 * (craftptr->shield_power - 2));
++				int16_t delta = (int16_t)(shield_step * (craftptr->shield_power - 2));
+ 				if (delta) {
+ 					if (!craftptr->is_player_craft) {
+ 						laser_chargeshields(i, 0, delta);
+@@ -312,7 +326,7 @@ void laser_weaponsfire(void) {
+ 					step = (int16_t)(craftptr->laser_power - 2);
+ 					if (!craftptr->slam_active)
+ 						step -= 4;
+-					step *= 2;
++					step *= laser_step;
+ 
+ 					craftptr->weapon_slots[k].charge += step;
+ 					if (step < 0 && (int8_t)craftptr->weapon_slots[k].charge < 0)
+@@ -408,6 +422,12 @@ void laser_weaponsfire(void) {
+ 
+ 		/* Turrets (weapon_slots[k].type == 2). */
+ 		for (k = 0; k < craftptr->weapon_group_cnt; ++k) {
++#ifdef TIE_MODERN
++			/* The AI sweep (pai.c) skips dying craft (flight_flag 3/4), so paifight never clears their turret
++			 * targets and wrecks kept shooting at their last target. */
++			if (craftptr->flight_flag == 3 || craftptr->flight_flag == 4)
++				break;
++#endif
+ 			if (craftptr->weapon_slots[k].type == 2 && craftptr->weapon_slots[k].target_obj != 0xFFFF)
+ 				starship_firelasergunner(n, k, craftptr->weapon_slots[k].target_obj);
+ 		}
+@@ -491,6 +511,44 @@ bool laser_playerbankslinked(void) {
+ void laser_setplayerbankslinked(bool linked) { s_player_banks_linked = linked; }
+ #endif
+ 
++#ifdef TIE_MODERN
++int laser_playerlauncherwarheads(uint16_t group) {
++	const CraftData* cp = pstate.player_craft;
++	uint16_t slot;
++	int total = 0;
++
++	if (group >= cp->missile_group_cnt)
++		return 0;
++	for (slot = spec_data[cp->species_idx].missile_start[group]; slot <= spec_data[cp->species_idx].missile_end[group];
++		 ++slot)
++		if (cp->weapon_slots[slot].type)
++			total += cp->weapon_slots[slot].ammo;
++	return total;
++}
++
++void laser_aimplayerlauncher(uint16_t group) {
++	CraftData* cp = pstate.player_craft;
++	uint16_t first;
++	int left;
++	int right;
++
++	if (group >= cp->missile_group_cnt || group >= 2)
++		return;
++	first = spec_data[cp->species_idx].missile_start[group];
++	if (first >= spec_data[cp->species_idx].missile_end[group] || (cp->missile_armed[group] & 0x7F) == 3)
++		return;
++	left = cp->weapon_slots[first].type ? cp->weapon_slots[first].ammo : 0;
++	right = cp->weapon_slots[first + 1].type ? cp->weapon_slots[first + 1].ammo : 0;
++	if (left == right)
++		return;
++	/* Bit 7 fires the second rack next (laser_firerocketsystem). */
++	if (right > left)
++		cp->missile_armed[group] |= 0x80u;
++	else
++		cp->missile_armed[group] &= 0x7Fu;
++}
++#endif
++
+ /* Fires one player cannon bank if its cooldown allows; force_linked fires every cannon in it. */
+ static void laser_fireplayerbank(uint16_t bank, bool force_linked) {
+ 	int16_t cd;
+@@ -557,6 +615,19 @@ void laser_fireplayerweapon(void) {
+ 			if (pstate.player_craft->status_flags & 8) {
+ 				laser_firerocketsystem(pstate.object_idx, pstate.player_weapon_group);
+ 				pstate.player_craft->missile_state[pstate.player_weapon_group] += frameticks;
++#ifdef TIE_MODERN
++				/* XvT (laser.c, after laser_firerocketsystem): the last warhead gone, back to the cannons, held
++				 * off for half a second so the trigger still down does not fire them at once. */
++				if (TieFlightTweaks_SkipEmptyWarheads() && pstate.player_craft->laser_group_cnt &&
++					laser_playerlauncherwarheads(pstate.player_weapon_group) <= 0) {
++					uint16_t g;
++
++					pstate.player_weapon_mode = 0;
++					pstate.player_weapon_group = 0;
++					for (g = 0; g < pstate.player_craft->laser_group_cnt; ++g)
++						pstate.player_craft->laser_cooldown[g] = 118;
++				}
++#endif
+ 			} else {
+ 				argtable[1] = 25;
+ 				argtable[0] = 31;
+diff --git a/src/tie/laser.h b/src/tie/laser.h
+index 42c4218..a85a382 100644
+--- a/src/tie/laser.h
++++ b/src/tie/laser.h
+@@ -173,6 +173,10 @@ void laser_fireplayerweapon(void);
+ bool laser_canlinkcannonbanks(const CraftData* craft);
+ bool laser_playerbankslinked(void);
+ void laser_setplayerbankslinked(bool linked);
++/* flight.skip_empty_warheads: warheads left in the player's launcher group (all of its racks). */
++int laser_playerlauncherwarheads(uint16_t group);
++/* Points a single-fire launcher at its fuller rack, so an uneven pair never tries the empty one. */
++void laser_aimplayerlauncher(uint16_t group);
+ #endif
+ 
+ /*
+diff --git a/src/tie/tie.c b/src/tie/tie.c
+index 6baece7..15a6e2a 100644
+--- a/src/tie/tie.c
++++ b/src/tie/tie.c
+@@ -3,6 +3,9 @@
+ #include "tie/tie.h"
+ #include "tie_runtime/audio/imuse_api.h"
+ #ifdef TIE_MODERN
++#include "tie_runtime/audio/xvt_sounds.h"
++#endif
++#ifdef TIE_MODERN
+ #include "tie_runtime/runtime/flight_requests.h"
+ #include "tie_runtime/runtime/flight_task.h"
+ #include "tie_runtime/runtime/inflight_info_task.h"
+@@ -2105,6 +2108,9 @@ void tie_doframe(void) {
+ 		fsfx_checktieflyby();
+ 		if (TIE_FLIGHT_TIE98)
+ 			fsfx_UpdatePlayerEngineSound();
++#ifdef TIE_MODERN
++		TieXvtSounds_UpdateEngineWash();
++#endif
+ 	}
+ #if defined(TIE98) || defined(TIE_MODERN)
+ 	if (TIE_FLIGHT_TIE98 && rendered) {
+diff --git a/src/tie/user.c b/src/tie/user.c
+index ed06b98..4b653a3 100644
+--- a/src/tie/user.c
++++ b/src/tie/user.c
+@@ -92,6 +92,8 @@
+ #include "tie_runtime/timing/flight_timing.h"
+ 
+ #ifdef TIE_MODERN
++#include "tie_runtime/audio/xvt_sounds.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include <landru/task.h>
+ #endif
+ #include <imuse/hilevel.h>
+@@ -103,6 +105,48 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* audio.xvt_control_sounds plays XvT's sound for the key; otherwise (or in the classic build) TIE's acknowledge
++ * beep. */
++#ifdef TIE_MODERN
++#define USER_CONTROL_SOUND(xvt)                                                                                 \
++	do {                                                                                                        \
++		if (!TieXvtSounds_PlayControl(xvt))                                                                     \
++			fsfx_triggersfx(0x21u, 0xFFFF);                                                                     \
++	} while (0)
++/* XvT plays its click where TIE stays silent (a transfer with nothing to move, a damaged system). */
++#define USER_XVT_ONLY_SOUND(xvt) ((void)TieXvtSounds_PlayControl(xvt))
++static uint16_t user_nextattacker(void);
++
++/* flight.xvt_turning, XvT's player turn rate (OpenXvT player.c): the throttle setting t maps to 1/3 + 2t
++ * below 1/3 throttle and to 1 - (t - 1/3)/2 above it, so turns are tightest at 1/3 throttle (TIE's own
++ * rate), 2/3 as tight at full throttle and 1/3 when stopped or with the engines out. Each step of combined
++ * cannon + shield recharge below neutral adds 0xC00/0x10000 (about 5%); each step above takes it away. */
++static uint16_t user_xvtturngain(uint16_t gain) {
++	enum { PEAK = 0x5555, POWER_NEUTRAL = 4, POWER_STEP = 0xC00 };
++	const CraftData* cp = pstate.player_craft;
++	int32_t throttle;
++	int32_t scale;
++	int32_t redirect;
++	int32_t result;
++
++	if (!TieFlightTweaks_XvtTurning() || !cp)
++		return gain;
++	throttle = (cp->status_flags & 0x40) ? (int32_t)cp->throttle_speed + 1 : 0;
++	scale = throttle < PEAK ? 2 * throttle + PEAK : 0x10000 - (throttle - PEAK) / 2;
++	if (cp->subsystem_active & 1)
++		redirect = cp->shield_power + cp->laser_power;
++	else
++		redirect = 2 * cp->laser_power;
++	scale += (int32_t)(((int64_t)scale * POWER_STEP * (POWER_NEUTRAL - redirect)) >> 16);
++	result = (int32_t)(((int64_t)gain * scale) >> 16);
++	/* The turn command is carried in int16 smoothing state. */
++	return (uint16_t)(result > 0x7FFF ? 0x7FFF : result);
++}
++#else
++#define USER_CONTROL_SOUND(xvt) fsfx_triggersfx(0x21u, 0xFFFF)
++#define USER_XVT_ONLY_SOUND(xvt) ((void)0)
++#endif
++
+ /* ================================================================== *
+  *                        MODULE DATA TABLES                           *
+  * ================================================================== */
+@@ -993,13 +1037,13 @@ void user_inputforplane(void) {
+ 				pstate.player_craft->throttle_speed = nxt;
+ 				if (cur > nxt)
+ 					pstate.player_craft->throttle_speed = 0xFFFF;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				break;
+ 			}
+ 			/* ']': throttle 2/3. */
+ 			case KEY_RBRACKET:
+ 				pstate.player_craft->throttle_speed = (uint16_t)(int16_t)-21846;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				argtable[0] = 83;
+ 				msg_messageprintf(MSG_THROTTLE_SET);
+ 				break;
+@@ -1010,27 +1054,27 @@ void user_inputforplane(void) {
+ 				pstate.player_craft->throttle_speed = nxt;
+ 				if (cur < nxt)
+ 					pstate.player_craft->throttle_speed = 0;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				break;
+ 			}
+ 			/* '[': throttle 1/3. */
+ 			case KEY_LBRACKET:
+ 				pstate.player_craft->throttle_speed = 21845;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				argtable[0] = 82;
+ 				msg_messageprintf(MSG_THROTTLE_SET);
+ 				break;
+ 			/* '\\': throttle off. */
+ 			case KEY_BACKSLASH:
+ 				pstate.player_craft->throttle_speed = 0;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				argtable[0] = 81;
+ 				msg_messageprintf(MSG_THROTTLE_SET);
+ 				break;
+ 			/* Throttle full. */
+ 			case KEY_BACKSPACE:
+ 				pstate.player_craft->throttle_speed = 0xFFFF;
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				argtable[0] = 84;
+ 				msg_messageprintf(MSG_THROTTLE_SET);
+ 				break;
+@@ -1042,6 +1086,7 @@ void user_inputforplane(void) {
+ 
+ 				if (pstate.target_obj_idx == 0xFFFF)
+ 					break;
++				USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
+ 				if (pstate.target_obj_idx >= 0x3800) {
+ 					pstate.player_craft->throttle_speed = 0;
+ 					break;
+@@ -1121,16 +1166,44 @@ void user_inputforplane(void) {
+ 						pstate.player_weapon_mode = 0;
+ 					pstate.player_weapon_group = 0;
+ 				}
++#ifdef TIE_MODERN
++				/* XvT: launchers with nothing left are passed over; with every launcher empty, back to the
++				 * cannons. Single fire is aimed at the launcher's fuller side. */
++				if (pstate.player_weapon_mode && TieFlightTweaks_SkipEmptyWarheads()) {
++					while (pstate.player_weapon_group < pstate.player_craft->missile_group_cnt &&
++						   laser_playerlauncherwarheads(pstate.player_weapon_group) <= 0)
++						++pstate.player_weapon_group;
++					if (pstate.player_weapon_group >= pstate.player_craft->missile_group_cnt) {
++						if (pstate.player_craft->laser_group_cnt)
++							pstate.player_weapon_mode = 0;
++						pstate.player_weapon_group = 0;
++					}
++					if (pstate.player_weapon_mode)
++						laser_aimplayerlauncher(pstate.player_weapon_group);
++				}
++				TieXvtControlSound tone;
++#endif
+ 
+ 				argtable[1] = 25;
+ 				if (!pstate.player_weapon_mode) {
+ 					if (pstate.player_craft->status_flags & 0x10) {
+ 						msg = (uint16_t)(pstate.player_weapon_group + 3);
++#ifdef TIE_MODERN
++						/* XvT: a lower tone for the first cannon bank than the second. */
++						tone = pstate.player_weapon_group ? TIE_XVT_CONTROL_SETTING_LOW
++														  : TIE_XVT_CONTROL_SETTING_VERY_LOW;
++#endif
+ 					} else {
+ 						argtable[0] = (uint16_t)(pstate.player_weapon_group + 29);
+ 						msg = MSG_SYSTEM_STATUS;
++#ifdef TIE_MODERN
++						tone = TIE_XVT_CONTROL_SETTING_OFF;
++#endif
+ 					}
+ 				} else if (pstate.player_craft->status_flags & 8) {
++#ifdef TIE_MODERN
++					tone = TIE_XVT_CONTROL_SETTING_MEDIUM;
++#endif
+ 					switch ((uint16_t)pstate.player_craft->warhead_type[pstate.player_weapon_group]) {
+ 						case 0x8F:
+ 							warhead_msg = 8;
+@@ -1159,9 +1232,12 @@ void user_inputforplane(void) {
+ 				} else {
+ 					argtable[0] = 31;
+ 					msg = MSG_SYSTEM_STATUS;
++#ifdef TIE_MODERN
++					tone = TIE_XVT_CONTROL_SETTING_OFF;
++#endif
+ 				}
+ 				msg_messageprintf(msg);
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(tone);
+ 				break;
+ 			}
+ 			/* 'x': cycle the laser linking or toggle the missile firing mode. */
+@@ -1179,7 +1255,7 @@ void user_inputforplane(void) {
+ 					pstate.player_craft->laser_first_slot[pstate.player_weapon_group] =
+ 						spec_data[pstate.player_spec_num].laser_start[pstate.player_weapon_group];
+ 					msg_messageprintf(MSG_CANNON_SINGLE);
+-					fsfx_triggersfx(0x21u, 0xFFFF);
++					USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 					break;
+ 				}
+ 				if (!pstate.player_weapon_mode && laser_canlinkcannonbanks(pstate.player_craft) &&
+@@ -1191,7 +1267,7 @@ void user_inputforplane(void) {
+ 					pstate.player_craft->laser_owner_player[pstate.player_weapon_group] = 3;
+ 					msg_messagetext(MSG_CANNON_LINKED,
+ 									has_ions ? "Lasers and ion cannons [fire linked" : "All cannons [fire linked");
+-					fsfx_triggersfx(0x21u, 0xFFFF);
++					USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 					break;
+ 				}
+ #endif
+@@ -1211,6 +1287,10 @@ void user_inputforplane(void) {
+ 					}
+ 				} else {
+ 					pstate.player_craft->missile_armed[pstate.player_weapon_group] ^= 2u;
++#ifdef TIE_MODERN
++					if (TieFlightTweaks_SkipEmptyWarheads())
++						laser_aimplayerlauncher(pstate.player_weapon_group);
++#endif
+ 					switch ((uint16_t)pstate.player_craft->warhead_type[pstate.player_weapon_group]) {
+ 						case 0x8F:
+ 							warhead_msg = 8;
+@@ -1238,7 +1318,7 @@ void user_inputforplane(void) {
+ 					msg_messageprintf(
+ 						((pstate.player_craft->missile_armed[pstate.player_weapon_group] & 0x7F) >> 1) + 6);
+ 				}
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 				break;
+ 			}
+ 			/* F9: cannon-rate cycle. */
+@@ -1258,7 +1338,8 @@ void user_inputforplane(void) {
+ 					msg = MSG_SYSTEM_STATUS;
+ 				}
+ 				msg_messageprintf(msg);
+-				fsfx_triggersfx(0x21u, 0xFFFF);
++				/* XvT: one tone per setting, from all-to-engines up. */
++				USER_CONTROL_SOUND(TIE_XVT_CONTROL_SETTING_OFF + pstate.player_craft->laser_power);
+ 				break;
+ 			}
+ 			/* Transfer shields -> cannon (also Shift+F9, synthesized from the
+@@ -1314,8 +1395,10 @@ void user_inputforplane(void) {
+ 
+ 					/* Each pip recharges one cannon by one unit, cycling through them. */
+ 					pips = total / step;
+-					if (!pips)
++					if (!pips) {
++						USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
+ 						break;
++					}
+ 					k = 0;
+ 					i = 0;
+ 					while (pips > 0 && i < 100) {
+@@ -1327,7 +1410,7 @@ void user_inputforplane(void) {
+ 							k = 0;
+ 						++i;
+ 					}
+-					fsfx_triggersfx(0x21u, 0xFFFF);
++					USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 					msg_messageprintf(MSG_XFER_SHIELDS_TO_CANNON);
+ 				} else {
+ 					argtable[0] = 35;
+@@ -1373,11 +1456,12 @@ void user_inputforplane(void) {
+ 						}
+ 						argtable[0] = (uint16_t)(pstate.player_craft->is_player_craft + 14);
+ 						msg_messageprintf(MSG_SHIELDS_SET);
+-						fsfx_triggersfx(0x21u, 0xFFFF);
++						USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 					} else {
+ 						argtable[1] = 25;
+ 						argtable[0] = 35;
+ 						msg_messageprintf(MSG_SYSTEM_STATUS);
++						USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
+ 					}
+ 				} else {
+ 					argtable[0] = 35;
+@@ -1394,11 +1478,12 @@ void user_inputforplane(void) {
+ 							pstate.player_craft->shield_power = 0;
+ 						argtable[0] = (uint16_t)(pstate.player_craft->shield_power + 19);
+ 						msg_messageprintf(MSG_SHIELD_RATE);
+-						fsfx_triggersfx(0x21u, 0xFFFF);
++						USER_CONTROL_SOUND(TIE_XVT_CONTROL_SETTING_OFF + pstate.player_craft->shield_power);
+ 					} else {
+ 						argtable[1] = 25;
+ 						argtable[0] = 35;
+ 						msg_messageprintf(MSG_SYSTEM_STATUS);
++						USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
+ 					}
+ 				} else {
+ 					argtable[0] = 35;
+@@ -1444,8 +1529,10 @@ void user_inputforplane(void) {
+ 							cycles = need;
+ 							step = 8;
+ 						}
+-						if (!cycles)
++						if (!cycles) {
++							USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
+ 							break;
++						}
+ 						k = 0;
+ 						i = 0;
+ 						while (cycles > 0 && i < 100) {
+@@ -1465,7 +1552,7 @@ void user_inputforplane(void) {
+ 								k = 0;
+ 							++i;
+ 						}
+-						fsfx_triggersfx(0x21u, 0xFFFF);
++						USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
+ 						msg_messageprintf(MSG_XFER_CANNON_TO_SHIELDS);
+ 					} else {
+ 						argtable[0] = 35;
+@@ -1478,6 +1565,75 @@ void user_inputforplane(void) {
+ 				}
+ 				break;
+ 			}
++#ifdef TIE_MODERN
++			/* Shift+': XvT's all cannon energy to shields (OpenXvT flight.c FLIGHT_KEY_QUOTES). Drains the cannons
++			 * one charge at a time, round robin, until the shields are full or the cannons are empty. A bank
++			 * still short takes the whole step once the other is full. Full is TIE's recharge ceiling, as for ';
++			 * with the shields set fully forward or aft only that bank fills, as TIE's ' does. */
++			case KEY_DQUOTE: {
++				CraftData* cp = pstate.player_craft;
++
++				if (!(cp->subsystem_active & 1)) {
++					argtable[0] = 35;
++					msg_messageprintf(MSG_NO_SUCH_SYSTEM);
++					break;
++				}
++				if (!(cp->status_flags & 1)) {
++					argtable[0] = 35;
++					argtable[1] = 25;
++					msg_messageprintf(MSG_SYSTEM_STATUS);
++					USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
++					break;
++				}
++				{
++					int16_t cap = (int16_t)(2 * spec_data[pstate.player_spec_num].shield_points);
++					int16_t step = pstate.player_spec_num == spec_getspecnum(0xCu) ? 32 : 8;
++					bool fill_front = cp->is_player_craft != 2;
++					bool fill_rear = cp->is_player_craft != 0;
++					bool transferred = false;
++					int remaining = 0;
++					uint16_t k;
++
++					if (!mission.difficulty)
++						cap *= 2;
++					for (k = 0; k < cp->weapon_group_cnt; ++k)
++						if (cp->weapon_slots[k].type && cp->weapon_slots[k].type != 2 &&
++							(int8_t)cp->weapon_slots[k].charge > 0)
++							remaining += (int8_t)cp->weapon_slots[k].charge;
++					for (k = 0; remaining > 0 && cp->weapon_group_cnt;) {
++						bool front_short = fill_front && cp->forward_shield < cap;
++						bool rear_short = fill_rear && cp->rear_shield < cap;
++
++						if (!front_short && !rear_short)
++							break;
++						if (cp->weapon_slots[k].type && cp->weapon_slots[k].type != 2 &&
++							(int8_t)cp->weapon_slots[k].charge > 0) {
++							int16_t each = front_short && rear_short ? (int16_t)(step / 2) : step;
++
++							--cp->weapon_slots[k].charge;
++							--remaining;
++							if (front_short)
++								cp->forward_shield = (int16_t)(cp->forward_shield + each < cap
++																   ? cp->forward_shield + each
++																   : cap);
++							if (rear_short)
++								cp->rear_shield =
++									(int16_t)(cp->rear_shield + each < cap ? cp->rear_shield + each : cap);
++							transferred = true;
++						}
++						if (++k >= cp->weapon_group_cnt)
++							k = 0;
++					}
++					if (transferred) {
++						USER_CONTROL_SOUND(TIE_XVT_CONTROL_CONFIRM);
++						msg_messagetext(MSG_XFER_CANNON_TO_SHIELDS, "Transferring all cannon energy to [shields");
++					} else {
++						USER_XVT_ONLY_SOUND(TIE_XVT_CONTROL_CLICK);
++					}
++				}
++				break;
++			}
++#endif
+ 			/* 'b': beam on/off. */
+ 			case KEY_b: {
+ 				if (pstate.player_craft->subsystem_active & 0x100) {
+@@ -1643,7 +1799,11 @@ void user_inputforplane(void) {
+ 			}
+ 			/* 'e': target my closest attacker. */
+ 			case KEY_e: {
++#ifdef TIE_MODERN
++				uint16_t a = user_nextattacker();
++#else
+ 				uint16_t a = user_findclosestattacker(pstate.object_idx);
++#endif
+ 				user_setnewtarget(a);
+ 				break;
+ 			}
+@@ -2142,6 +2302,9 @@ void user_inputforplane(void) {
+ 				int16_t roll;
+ 
+ 				roll_pct >>= 1;
++#ifdef TIE_MODERN
++				roll_pct = user_xvtturngain(roll_pct);
++#endif
+ 
+ 				roll = (int16_t)math2_ABoverC32(
+ 					(int16_t)((((uint16_t)inputkey == KEY_LEFT_ARROW ? 0xD000 : 0x3000) * roll_pct) >> 15),
+@@ -2236,10 +2399,10 @@ void user_inputforplane(void) {
+ 			 * on every pitch-down input. PORT: TieAxisInputHook_Scale scales signed
+ 			 * unless flight.fix_axis_input_bias is disabled. */
+ 			x_input = TieAxisInputHook_Scale(
+-				(uint16_t)(math2_percentage(pstate.player_craft->roll_rate_cache, 0x3000u) >> 1),
++				user_xvtturngain((uint16_t)(math2_percentage(pstate.player_craft->roll_rate_cache, 0x3000u) >> 1)),
+ 				inputdeltax);
+ 			y_input = TieAxisInputHook_Scale(
+-				(uint16_t)(math2_percentage(pstate.player_craft->pitch_rate_cache, 0x1000u) >> 1),
++				user_xvtturngain((uint16_t)(math2_percentage(pstate.player_craft->pitch_rate_cache, 0x1000u) >> 1)),
+ 				inputdeltay);
+ #ifdef TIE_MODERN
+ 			/* PORT: analog roll input from the second-stick axis. Uses
+@@ -2247,7 +2410,7 @@ void user_inputforplane(void) {
+ 			 * stick produces the same per-tick rotation the held-button roll mode
+ 			 * produces. */
+ 			roll_input = TieAxisInputHook_Scale(
+-				(uint16_t)(math2_percentage(pstate.player_craft->roll_rate_cache, 0x3000u) >> 1),
++				user_xvtturngain((uint16_t)(math2_percentage(pstate.player_craft->roll_rate_cache, 0x3000u) >> 1)),
+ 				inputdeltaroll);
+ #endif
+ 			if ((pstate.player_craft->status_flags & 0x20) == 0) {
+@@ -3486,6 +3649,38 @@ uint16_t user_findclosestattacker(uint16_t obj_idx) {
+ 	return best_idx;
+ }
+ 
++#ifdef TIE_MODERN
++/* An attacker as user_findclosestattacker counts one: a live craft whose AI target is obj_idx, in an attack
++ * mode (12 or 23). */
++static bool user_isattackerof(uint16_t idx, uint16_t obj_idx) {
++	CraftData* cp;
++	int mode;
++
++	if (idx >= NUM_ACTIVE_CRAFT_SLOTS || idx == obj_idx || !objects[idx].ship_idx)
++		return false;
++	cp = objects[idx].craft_ptr;
++	mode = cp->mode_byte;
++	return (uint16_t)cp->ai_target_ref == obj_idx && cp->status_flags && (mode == 12 || mode == 23) &&
++		   (!cp->flight_flag || cp->flight_flag == 6);
++}
++
++/* E, cycling as XvT's does (OpenXvT flight.c FLIGHT_KEY_E): when the current target is attacking the player,
++ * the next attacker after it in slot order, wrapping; otherwise TIE's nearest attacker. */
++static uint16_t user_nextattacker(void) {
++	uint16_t current = pstate.target_obj_idx;
++	uint16_t step;
++
++	if (!user_isattackerof(current, pstate.object_idx))
++		return user_findclosestattacker(pstate.object_idx);
++	for (step = 1; step < NUM_ACTIVE_CRAFT_SLOTS; ++step) {
++		uint16_t idx = (uint16_t)((current + step) % NUM_ACTIVE_CRAFT_SLOTS);
++		if (user_isattackerof(idx, pstate.object_idx))
++			return idx;
++	}
++	return current;
++}
++#endif
++
+ /*
+  * user_isrescued -- eject-pod rescue test. Binary 0x5F3B0.
+  * Mission-header byte +8 (mission.win_type) bit 0 forces rescue. Otherwise
+diff --git a/src/tie/user.h b/src/tie/user.h
+index 5474b2f..f7b87d4 100644
+--- a/src/tie/user.h
++++ b/src/tie/user.h
+@@ -42,6 +42,7 @@ typedef enum {
+ 	KEY_ENTER = 13,
+ 	KEY_ESCAPE = 27,
+ 	KEY_SPACE = 32,
++	KEY_DQUOTE = 34,     /* Shift+' (not in TIE Fighter: XvT's all cannon energy to shields) */
+ 	KEY_APOSTROPHE = 39, /* ' */
+ 	KEY_ASTERISK = 42,   /* * */
+ 	KEY_PLUS = 43,
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index 96997fc..7856e6c 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -189,6 +189,8 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieFlightTweaks_SetAiIonLink(app_config.requested.ai_ion_link);
+ 		TieFlightTweaks_SetXvtThrottle(app_config.requested.xvt_throttle);
+ 		TieFlightTweaks_SetXvtHud(app_config.requested.xvt_hud);
++		for (int option = 0; option < TIE_XVT_OPTION_COUNT; ++option)
++			TieFlightTweaks_SetXvtOption(option, app_config.requested.xvt_options[option]);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index 511582b..c3cebfd 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -183,7 +183,9 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+ 				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
+-				  "laser_convergence", "xvt_lasers", "ai_ion_link", "xvt_throttle", "xvt_hud", "models");
++				  "laser_convergence", "xvt_lasers", "ai_ion_link", "xvt_throttle", "xvt_hud", "xvt_shields",
++				  "xvt_turning", "xvt_engine_wash", "start_overshield", "xvt_recharge", "skip_empty_warheads",
++				  "xvt_control_sounds", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -544,6 +546,12 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 		!TieAppConfig_ReadBool(document, "flight.xvt_throttle", &out->xvt_throttle, error, capacity) ||
+ 		!TieAppConfig_ReadBool(document, "flight.xvt_hud", &out->xvt_hud, error, capacity))
+ 		return false;
++	for (int option = 0; option < TIE_XVT_OPTION_COUNT; ++option) {
++		char path[64];
++		snprintf(path, sizeof path, "flight.%s", TieFlightTweaks_XvtOptionKey(option));
++		if (!TieAppConfig_ReadBool(document, path, &out->xvt_options[option], error, capacity))
++			return false;
++	}
+ 	const char* ai_ion_link = AeronConfigFile_GetString(document, "flight.ai_ion_link", NULL);
+ 	if (!ai_ion_link)
+ 		return TieAppConfig_ConfigError(error, capacity, "missing flight.ai_ion_link");
+@@ -795,6 +803,7 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.xvt_throttle = config->xvt_throttle,
+ 		.xvt_hud = config->xvt_hud,
+ 	};
++	memcpy(out->xvt_options, config->xvt_options, sizeof out->xvt_options);
+ }
+ 
+ void TieAppConfig_GetLiveAudioOptions(const TieAppConfig* config, TieAppLiveAudioOptions* out) {
+@@ -867,6 +876,14 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		AeronConfigFile_Destroy(candidate);
+ 		return TieAppConfig_LogAeronError(&aeron_error, error, capacity);
+ 	}
++	for (int option = 0; option < TIE_XVT_OPTION_COUNT; ++option) {
++		char path[64];
++		snprintf(path, sizeof path, "flight.%s", TieFlightTweaks_XvtOptionKey(option));
++		if (!AeronConfigFile_SetBool(candidate, path, options->xvt_options[option], &aeron_error)) {
++			AeronConfigFile_Destroy(candidate);
++			return TieAppConfig_LogAeronError(&aeron_error, error, capacity);
++		}
++	}
+ 	if (!TieAppConfig_ReplaceUserCandidate(state, candidate, error, capacity)) {
+ 		AeronConfigFile_Destroy(candidate);
+ 		return false;
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index 24507cd..f6ea893 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -15,6 +15,7 @@
+ #include "tie_runtime/display/classic_display.h"
+ #include "tie_runtime/display/classic_framebuffer.h"
+ #include "tie_runtime/flight_assets/model_types.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/input/controller_mapping.h"
+ #include "tie_runtime/input/input.h"
+ #include "tie_runtime/input/keyboard_mapping.h"
+@@ -55,6 +56,7 @@ typedef struct TieAppLiveFlightOptions {
+ 	int ai_ion_link; /* TIE_AI_ION_LINK_* */
+ 	bool xvt_throttle;
+ 	bool xvt_hud;
++	bool xvt_options[TIE_XVT_OPTION_COUNT]; /* TIE_XVT_OPTION_*, flight.<TieFlightTweaks_XvtOptionKey> */
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -102,6 +104,7 @@ typedef struct TieAppConfig {
+ 	int ai_ion_link;
+ 	bool xvt_throttle;
+ 	bool xvt_hud;
++	bool xvt_options[TIE_XVT_OPTION_COUNT];
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index d695de5..c06a1c5 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -34,7 +34,8 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->widescreen_hud == right->widescreen_hud &&
+ 		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers &&
+ 		   left->ai_ion_link == right->ai_ion_link && left->xvt_throttle == right->xvt_throttle &&
+-		   left->xvt_hud == right->xvt_hud;
++		   left->xvt_hud == right->xvt_hud &&
++		   memcmp(left->xvt_options, right->xvt_options, sizeof left->xvt_options) == 0;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+@@ -46,6 +47,8 @@ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* opt
+ 	options->xvt_lasers = options->xvt_lasers != 0;
+ 	options->xvt_throttle = options->xvt_throttle != 0;
+ 	options->xvt_hud = options->xvt_hud != 0;
++	for (int option = 0; option < TIE_XVT_OPTION_COUNT; ++option)
++		options->xvt_options[option] = options->xvt_options[option] != 0;
+ }
+ 
+ bool TieFlightOptions_Configure(const TieAppLiveFlightOptions* requested, TieFlightOptionsApplyFn apply,
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index 810a4d4..3f0b187 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -186,6 +186,8 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 	TieFlightTweaks_SetAiIonLink(requested->ai_ion_link);
+ 	TieFlightTweaks_SetXvtThrottle(requested->xvt_throttle);
+ 	TieFlightTweaks_SetXvtHud(requested->xvt_hud);
++	for (int option = 0; option < TIE_XVT_OPTION_COUNT; ++option)
++		TieFlightTweaks_SetXvtOption(option, requested->xvt_options[option]);
+ 	return true;
+ }
+ 
+@@ -813,6 +815,29 @@ static void TieSettings_GamePage(AeronUiContext* ui) {
+ 	AeronUi_Help(ui, ion_link == TIE_AI_ION_LINK_OFF
+ 						 ? "Original: AI craft fire lasers, and ion cannons only on disable orders."
+ 						 : "AI Gunboats, Defenders, Y-Wings, B-Wings etc. fire ions with lasers (ions only to disable).");
++	static const struct {
++		int option;
++		const char* label;
++		const char* help;
++	} xvt_rows[] = {
++		{ TIE_XVT_OPTION_SHIELDS, "Shield Hits", "XvT: a hit draws energy from the other shield, then shields balance." },
++		{ TIE_XVT_OPTION_TURNING, "Turning", "XvT: tightest turns at 1/3 throttle; power settings change the rate." },
++		{ TIE_XVT_OPTION_ENGINE_WASH, "Engine Wash", "XvT: damage and sound behind capital ship engines." },
++		{ TIE_XVT_OPTION_START_OVERSHIELD, "Shields at Launch", "XvT: start each mission with double shields." },
++		{ TIE_XVT_OPTION_RECHARGE, "Recharge Rates", "XvT: faster T/F and T/B laser, and Y-Wing shield, recharge." },
++		{ TIE_XVT_OPTION_SKIP_EMPTY_WARHEADS, "Empty Warhead Launchers",
++		  "XvT: W skips empty launchers; back to lasers after the last warhead." },
++	};
++	static const char* const xvt_styles[] = { "TIE Fighter", "X-Wing vs TIE Fighter" };
++	for (size_t row = 0; row < sizeof xvt_rows / sizeof xvt_rows[0]; ++row) {
++		int style = tweaks.xvt_options[xvt_rows[row].option];
++		if (AeronUi_Selector(ui, xvt_rows[row].label, &style, xvt_styles, 2)) {
++			tweaks.xvt_options[xvt_rows[row].option] = style != 0;
++			TieSettings_SetFlightTweaks(&tweaks);
++		}
++		if (style)
++			AeronUi_Help(ui, xvt_rows[row].help);
++	}
+ }
+ 
+ /* Follows OpenXW's mouse page with TIE's button behavior. */
+@@ -968,6 +993,14 @@ static void TieSettings_AudioPage(AeronUiContext* ui) {
+ 		if (!TieFlightOptions_Set(&flight, error, sizeof error))
+ 			TieSettings_SettingsReportError(error);
+ 	}
++	int control_sounds = flight.xvt_options[TIE_XVT_OPTION_CONTROL_SOUNDS];
++	if (AeronUi_Toggle(ui, "XvT Power and Throttle Sounds", &control_sounds)) {
++		char error[512];
++		flight.xvt_options[TIE_XVT_OPTION_CONTROL_SOUNDS] = control_sounds != 0;
++		if (!TieFlightOptions_Set(&flight, error, sizeof error))
++			TieSettings_SettingsReportError(error);
++	}
++	AeronUi_Help(ui, "X-Wing vs TIE Fighter's tones and clicks for power, throttle and weapon keys. Next mission.");
+ 	AeronUi_Spacer(ui, 8.0f);
+ 	AeronUi_Header(ui, "Sound Blaster");
+ 	int sb16 = launch.sb16_filter_enabled;
+diff --git a/src/tie_runtime/audio/xvt_sounds.c b/src/tie_runtime/audio/xvt_sounds.c
+new file mode 100644
+index 0000000..9bd9e8f
+--- /dev/null
++++ b/src/tie_runtime/audio/xvt_sounds.c
+@@ -0,0 +1,195 @@
++#include "tie_runtime/audio/xvt_sounds.h"
++#include "tie/collide.h"
++#include "tie/fsfx.h"
++#include "tie/option.h"
++#include "tie/tie.h"
++#include "tie_runtime/audio/imuse_session.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
++
++#include <aeron/aeron.h>
++#include <aeron/log.h>
++#include <aeron/vfs.h>
++#include <imuse/commands.h>
++#include <imuse/groups.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++	XVT_WASH_FIRST_ID = FSFX_XVT_FIRST_ID + TIE_XVT_CONTROL_COUNT,
++	XVT_WASH_COUNT = 2,
++	XVT_SOUND_PRIORITY = 126,
++};
++
++/* OpenXvT sounds 42-48 (SFXBLAST.LST from ID 4) and their g_fsfxBaseVolumeBySfxSlot volumes. */
++static const char* const s_control_files[TIE_XVT_CONTROL_COUNT] = {
++	"xvt_control_sounds/BEEP-01.WAV",  "xvt_control_sounds/SMCLICK1.WAV", "xvt_control_sounds/SET_OFF2.WAV",
++	"xvt_control_sounds/SET_VLO3.WAV", "xvt_control_sounds/SET_LO2.WAV",  "xvt_control_sounds/SET_MED2.WAV",
++	"xvt_control_sounds/SET_HI2.WAV"
++};
++static const uint8_t s_control_volumes[TIE_XVT_CONTROL_COUNT] = { 127, 95, 56, 56, 56, 56, 56 };
++/* OpenXvT sounds 78 (star destroyers) and 79 (other ships). */
++static const char* const s_wash_files[XVT_WASH_COUNT] = { "xvt_engine_wash/sd-lp-1.wav",
++														  "xvt_engine_wash/cal-flyb.wav" };
++
++_Static_assert(TIE_XVT_CONTROL_COUNT + XVT_WASH_COUNT == FSFX_XVT_SOUND_COUNT, "XvT sound slots");
++
++static uint32_t Le32(const uint8_t* p) {
++	return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static uint16_t Le16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++/* Converts an 8-bit mono PCM WAV into a VOC file (type 1 blocks, unsigned 8-bit, plus a terminator), which
++ * imuse_start_sound recognises by its "Creative Voice File" header. NULL on any format it does not handle. */
++static void* TieXvtSounds_WavToVoc(const uint8_t* wav, size_t size) {
++	const uint8_t* samples = NULL;
++	uint32_t sample_bytes = 0;
++	uint32_t rate = 0;
++	bool format = false;
++	size_t at;
++
++	if (size < 12 || memcmp(wav, "RIFF", 4) || memcmp(wav + 8, "WAVE", 4))
++		return NULL;
++	for (at = 12; at + 8 <= size;) {
++		uint32_t chunk = Le32(wav + at + 4);
++		if (chunk > size - at - 8)
++			return NULL;
++		if (!memcmp(wav + at, "fmt ", 4) && chunk >= 16) {
++			const uint8_t* f = wav + at + 8;
++			format = Le16(f) == 1 && Le16(f + 2) == 1 && Le16(f + 14) == 8;
++			rate = Le32(f + 4);
++		} else if (!memcmp(wav + at, "data", 4)) {
++			samples = wav + at + 8;
++			sample_bytes = chunk;
++		}
++		at += 8 + chunk + (chunk & 1);
++	}
++	if (!format || !samples || !sample_bytes || rate < 4000 || rate > 48000)
++		return NULL;
++
++	enum { BLOCK = 0xFFF0 };
++	static const uint8_t header[26] = { 'C', 'r', 'e', 'a', 't', 'i', 'v', 'e', ' ', 'V', 'o', 'i', 'c',
++										'e', ' ', 'F', 'i', 'l', 'e', 0x1A, 0x1A, 0x00, 0x0A, 0x01, 0x29, 0x11 };
++	uint32_t blocks = (sample_bytes + BLOCK - 1) / BLOCK;
++	uint8_t* voc = malloc(sizeof header + sample_bytes + blocks * 6 + 1);
++	uint8_t* out = voc;
++	int divisor = 256 - (int)((1000000 + rate / 2) / rate);
++	uint32_t done;
++
++	if (!voc)
++		return NULL;
++	memcpy(out, header, sizeof header);
++	out += sizeof header;
++	if (divisor < 0)
++		divisor = 0;
++	for (done = 0; done < sample_bytes;) {
++		uint32_t n = sample_bytes - done < BLOCK ? sample_bytes - done : BLOCK;
++		uint32_t length = n + 2;
++		*out++ = 1;
++		*out++ = (uint8_t)length;
++		*out++ = (uint8_t)(length >> 8);
++		*out++ = (uint8_t)(length >> 16);
++		*out++ = (uint8_t)divisor;
++		*out++ = 0; /* 8-bit unsigned PCM */
++		memcpy(out, samples + done, n);
++		out += n;
++		done += n;
++	}
++	*out = 0;
++	return voc;
++}
++
++static void* TieXvtSounds_LoadWav(const char* path) {
++	uint8_t* data = NULL;
++	size_t size = 0;
++	void* voc = NULL;
++
++	if (AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1u << 20, &data, &size))
++		voc = TieXvtSounds_WavToVoc(data, size);
++	free(data);
++	if (!voc)
++		Aeron_LogWarn("tie.audio", "XvT sound %s is missing or unsupported; keeping TIE's", path);
++	return voc;
++}
++
++void TieXvtSounds_Free(void) {
++	uint16_t i;
++
++	for (i = 0; i < FSFX_XVT_SOUND_COUNT; ++i) {
++		uint16_t id = (uint16_t)(FSFX_XVT_FIRST_ID + i);
++		if (im) {
++			imuse_stop_sound(im, id);
++			imuse_forget_sound(im, id);
++		}
++		free(soundhandles[id]);
++		soundhandles[id] = NULL;
++	}
++}
++
++void TieXvtSounds_Load(void) {
++	uint16_t i;
++
++	TieXvtSounds_Free();
++	if (TieFlightTweaks_XvtControlSounds())
++		for (i = 0; i < TIE_XVT_CONTROL_COUNT; ++i)
++			soundhandles[FSFX_XVT_FIRST_ID + i] = TieXvtSounds_LoadWav(s_control_files[i]);
++	if (TieFlightTweaks_XvtEngineWash())
++		for (i = 0; i < XVT_WASH_COUNT; ++i)
++			soundhandles[XVT_WASH_FIRST_ID + i] = TieXvtSounds_LoadWav(s_wash_files[i]);
++}
++
++bool TieXvtSounds_PlayControl(TieXvtControlSound sound) {
++	intptr_t id = FSFX_XVT_FIRST_ID + sound;
++
++	if ((unsigned)sound >= TIE_XVT_CONTROL_COUNT || !TieFlightTweaks_XvtControlSounds() || !soundhandles[id])
++		return false;
++	if (!im || !sfxenabled || !inflight_sound_vol)
++		return true;
++	if (imuse_get_param(im, id, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)
++		imuse_stop_sound(im, id);
++	if (imuse_start_sound(im, id, XVT_SOUND_PRIORITY))
++		return true;
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_GROUP, IMUSE_GROUP_SFX);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_PRIORITY, XVT_SOUND_PRIORITY);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_PAN, 64);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_VOL, s_control_volumes[sound]);
++	return true;
++}
++
++void TieXvtSounds_UpdateEngineWash(void) {
++	int playing = -1;
++	int volume = 0;
++	int strength = 0;
++	uint16_t source_type = 0;
++	int i;
++
++	if (!im)
++		return;
++	if (sfxenabled && inflight_sound_vol && !mapflag)
++		strength = collide_enginewashsound(&source_type);
++	if (strength > 0) {
++		/* OpenXvT fsfx_UpdateFlightSfx: the star destroyer loop for the Interdictor, Victory, Imperial and Super
++		 * Star Destroyers, the other loop for everything else. */
++		playing = source_type >= 51 && source_type <= 54 ? 0 : 1;
++		if (!soundhandles[XVT_WASH_FIRST_ID + playing])
++			playing = -1;
++		/* XvT: 4 * exterior volume * strength / 10. As in OpenXW, audible from the wash's edge and full from a
++		 * quarter strength. The SFX group volume applies the player's setting. */
++		volume = 40 + strength * 6;
++		if (volume > 127)
++			volume = 127;
++	}
++	for (i = 0; i < XVT_WASH_COUNT; ++i)
++		if (i != playing && imuse_get_param(im, XVT_WASH_FIRST_ID + i, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)
++			imuse_stop_sound(im, XVT_WASH_FIRST_ID + i);
++	if (playing < 0)
++		return;
++	intptr_t id = XVT_WASH_FIRST_ID + playing;
++	if (!(imuse_get_param(im, id, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)) {
++		if (imuse_start_wave(im, id, XVT_SOUND_PRIORITY, IMUSE_WAVE_START_LOOP))
++			return;
++		imuse_set_param(im, id, IMUSE_PARAM_SOUND_GROUP, IMUSE_GROUP_SFX);
++		imuse_set_param(im, id, IMUSE_PARAM_SOUND_PAN, 64);
++	}
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_VOL, volume);
++}
+diff --git a/src/tie_runtime/audio/xvt_sounds.h b/src/tie_runtime/audio/xvt_sounds.h
+new file mode 100644
+index 0000000..acd9a65
+--- /dev/null
++++ b/src/tie_runtime/audio/xvt_sounds.h
+@@ -0,0 +1,34 @@
++#ifndef TIE_RUNTIME_AUDIO_XVT_SOUNDS_H
++#define TIE_RUNTIME_AUDIO_XVT_SOUNDS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* X-Wing vs TIE Fighter flight sounds, read from WAVs that the packaging script copies out of an XvT
++ * installation into RESOURCE xvt_control_sounds/ and xvt_engine_wash/. They are converted to VOC and kept in
++ * FSFX soundhandles past the TIE98 table (FSFX_XVT_FIRST_ID), where gamesnd_GetSoundAddr serves them to iMUSE.
++ *
++ * flight.xvt_control_sounds: OpenXvT flight.c's key sounds. The confirm beep for energy transfers and firing
++ * modes, the small click for throttle keys and refused transfers, and one tone per recharge setting.
++ * flight.xvt_engine_wash: OpenXvT fsfx_UpdateFlightSfx's engine wash loop. */
++typedef enum TieXvtControlSound {
++	TIE_XVT_CONTROL_CONFIRM,     /* XvT 42, beep-01 */
++	TIE_XVT_CONTROL_CLICK,       /* XvT 43, smclick1 */
++	TIE_XVT_CONTROL_SETTING_OFF, /* XvT 44-48: recharge rate 0 (all to engines) to 4 */
++	TIE_XVT_CONTROL_SETTING_VERY_LOW,
++	TIE_XVT_CONTROL_SETTING_LOW,
++	TIE_XVT_CONTROL_SETTING_MEDIUM,
++	TIE_XVT_CONTROL_SETTING_HIGH,
++	TIE_XVT_CONTROL_COUNT
++} TieXvtControlSound;
++
++/* fsfx_loadsfx calls Load after the flight bank; fsfx_freesfx calls Free. */
++void TieXvtSounds_Load(void);
++void TieXvtSounds_Free(void);
++/* Plays an XvT control sound. False when the option is off or the sound is missing, so the caller can play
++ * TIE's own sound instead; true (even if muted) otherwise. */
++bool TieXvtSounds_PlayControl(TieXvtControlSound sound);
++/* Per frame, with the player engine sound: starts, adjusts or stops the engine wash loop. */
++void TieXvtSounds_UpdateEngineWash(void);
++
++#endif
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+index 57d5468..8d56a0f 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.c
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -36,4 +36,23 @@ void TieFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
+ 
+ bool TieFlightTweaks_XvtHud(void) { return s_xvt_hud; }
+ 
+-void TieFlightTweaks_SetXvtHud(bool enabled) { s_xvt_hud = enabled; }
+\ No newline at end of file
++void TieFlightTweaks_SetXvtHud(bool enabled) { s_xvt_hud = enabled; }
++
++static bool s_xvt_options[TIE_XVT_OPTION_COUNT] = { true, true, true, true, true, true, true };
++
++const char* TieFlightTweaks_XvtOptionKey(int option) {
++	static const char* const keys[TIE_XVT_OPTION_COUNT] = {
++		"xvt_shields",	  "xvt_turning",		 "xvt_engine_wash",	   "start_overshield",
++		"xvt_recharge", "skip_empty_warheads", "xvt_control_sounds",
++	};
++	return option >= 0 && option < TIE_XVT_OPTION_COUNT ? keys[option] : "";
++}
++
++bool TieFlightTweaks_XvtOption(int option) {
++	return option >= 0 && option < TIE_XVT_OPTION_COUNT && s_xvt_options[option];
++}
++
++void TieFlightTweaks_SetXvtOption(int option, bool enabled) {
++	if (option >= 0 && option < TIE_XVT_OPTION_COUNT)
++		s_xvt_options[option] = enabled;
++}
+\ No newline at end of file
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+index 8ad16fb..099f273 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.h
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -40,5 +40,34 @@ void TieFlightTweaks_SetXvtThrottle(bool enabled);
+  * strip and time-compression indicator. */
+ bool TieFlightTweaks_XvtHud(void);
+ void TieFlightTweaks_SetXvtHud(bool enabled);
++/* More X-Wing vs TIE Fighter behaviour, each its own flight.* key:
++ * xvt_shields: a hit moves half the difference from the stronger bank to the weaker hit bank (player).
++ * xvt_turning: the player's turn rate follows XvT's throttle and power curve.
++ * xvt_engine_wash: damage and sound behind working capital ship and freighter engines.
++ * start_overshield: the player launches with both banks at the recharge ceiling.
++ * xvt_recharge: T/F and T/B cannons recharge 3 per step instead of 2, Y-Wing shields twice as fast.
++ * skip_empty_warheads: W skips empty launchers; the last warhead fired switches to the cannons.
++ * xvt_control_sounds: XvT's tones and clicks for power, throttle and weapon keys. */
++enum {
++	TIE_XVT_OPTION_SHIELDS,
++	TIE_XVT_OPTION_TURNING,
++	TIE_XVT_OPTION_ENGINE_WASH,
++	TIE_XVT_OPTION_START_OVERSHIELD,
++	TIE_XVT_OPTION_RECHARGE,
++	TIE_XVT_OPTION_SKIP_EMPTY_WARHEADS,
++	TIE_XVT_OPTION_CONTROL_SOUNDS,
++	TIE_XVT_OPTION_COUNT
++};
++/* The option's key under flight: in config.yaml ("xvt_shields" ...). */
++const char* TieFlightTweaks_XvtOptionKey(int option);
++bool TieFlightTweaks_XvtOption(int option);
++void TieFlightTweaks_SetXvtOption(int option, bool enabled);
++#define TieFlightTweaks_XvtShields() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_SHIELDS)
++#define TieFlightTweaks_XvtTurning() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_TURNING)
++#define TieFlightTweaks_XvtEngineWash() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_ENGINE_WASH)
++#define TieFlightTweaks_StartOvershield() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_START_OVERSHIELD)
++#define TieFlightTweaks_XvtRecharge() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_RECHARGE)
++#define TieFlightTweaks_SkipEmptyWarheads() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_SKIP_EMPTY_WARHEADS)
++#define TieFlightTweaks_XvtControlSounds() TieFlightTweaks_XvtOption(TIE_XVT_OPTION_CONTROL_SOUNDS)
+ 
+ #endif
+diff --git a/src/tie_runtime/input/actions.c b/src/tie_runtime/input/actions.c
+index aa922e4..2d660ac 100644
+--- a/src/tie_runtime/input/actions.c
++++ b/src/tie_runtime/input/actions.c
+@@ -286,6 +286,10 @@ static const TieInputActionDef g_action_defs[TIE_INPUT_ACTION_COUNT] = {
+ 	[TIE_INPUT_ACTION_INFO_ENEMY_CRAFT] = { "info_enemy_craft", "Enemy Craft List (XvT)",
+ 											TIE_INPUT_ACTION_CATEGORY_INFORMATION,
+ 											TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, 'F' },
++	[TIE_INPUT_ACTION_XFER_ALL_CANNON_TO_SHIELDS] = { "xfer_all_cannon_to_shields",
++													  "All Cannon Energy to Shields (XvT)",
++													  TIE_INPUT_ACTION_CATEGORY_WEAPONS,
++													  TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, '"' },
+ 
+ };
+ 
+diff --git a/src/tie_runtime/input/actions.h b/src/tie_runtime/input/actions.h
+index 3a84352..f73170b 100644
+--- a/src/tie_runtime/input/actions.h
++++ b/src/tie_runtime/input/actions.h
+@@ -118,6 +118,8 @@ typedef enum TieInputAction {
+ 	/* Not in TIE Fighter: XvT's craft lists (flight.xvt_hud). */
+ 	TIE_INPUT_ACTION_INFO_FRIENDLY_CRAFT, /* F */
+ 	TIE_INPUT_ACTION_INFO_ENEMY_CRAFT,    /* Shift+F */
++	/* Not in TIE Fighter: XvT's all cannon energy to shields. */
++	TIE_INPUT_ACTION_XFER_ALL_CANNON_TO_SHIELDS, /* Shift+' */
+ 
+ 	TIE_INPUT_ACTION_COUNT
+ } TieInputAction;

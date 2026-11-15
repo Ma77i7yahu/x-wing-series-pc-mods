@@ -1,0 +1,152 @@
+From 50ec471f62de51e0320f4f7c5f5cc0fb6ddb32aa Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 11:36:16 +1100
+Subject: [PATCH 13/18] I targets the nearest incoming warhead as in XvT;
+ component tracking moves to Alt+I
+
+---
+ resources/config.yaml           |  2 ++
+ src/tie/user.c                  | 50 +++++++++++++++++++++++++++++++++
+ src/tie/user.h                  |  1 +
+ src/tie_runtime/input/actions.c |  5 +++-
+ src/tie_runtime/input/actions.h |  2 ++
+ 5 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index a504f2a..84f02ba 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -224,6 +224,8 @@ input:
+     cycle_shield_recharge_rate:
+       - {key: "F10"}
+     toggle_component_tracking:
++      - {key: "I", modifiers: [alt]}
++    target_incoming_warhead:
+       - {key: "I"}
+     target_component_next:
+       - {key: ","}
+diff --git a/src/tie/user.c b/src/tie/user.c
+index 4b653a3..59a2f01 100644
+--- a/src/tie/user.c
++++ b/src/tie/user.c
+@@ -116,6 +116,7 @@
+ /* XvT plays its click where TIE stays silent (a transfer with nothing to move, a damaged system). */
+ #define USER_XVT_ONLY_SOUND(xvt) ((void)TieXvtSounds_PlayControl(xvt))
+ static uint16_t user_nextattacker(void);
++static uint16_t user_findincomingwarhead(void);
+ 
+ /* flight.xvt_turning, XvT's player turn rate (OpenXvT player.c): the throttle setting t maps to 1/3 + 2t
+  * below 1/3 throttle and to 1 - (t - 1/3)/2 above it, so turns are tightest at 1/3 throttle (TIE's own
+@@ -1875,8 +1876,25 @@ void user_inputforplane(void) {
+ 				}
+ 				break;
+ 			}
++#ifdef TIE_MODERN
++			/* 'i': XvT's nearest warhead homing on the player, else on a friendly craft. */
++			case KEY_i: {
++				uint16_t warhead = user_findincomingwarhead();
++
++				if (warhead == 0xFFFF)
++					break;
++				user_setnewtarget(warhead);
++				/* Targeting the announced warhead answers its "Key to Target?" prompt, as Space does. */
++				if (pstate.space_confirm_action == 1 && warhead == (uint16_t)pstate.msg_arg_obj_idx)
++					pstate.space_confirm_action = 0;
++				break;
++			}
++			/* Alt+I (TIE's I): component tracking toggle. */
++			case KEY_ALT_I: {
++#else
+ 			/* 'i': radar toggle. */
+ 			case KEY_i: {
++#endif
+ 				pstate.radar_enable ^= 1u;
+ 				argtable[0] = (uint16_t)(pstate.radar_enable + 86);
+ 				msg_messageprintf(MSG_CMD_TRACK_TOGGLE);
+@@ -3664,6 +3682,38 @@ static bool user_isattackerof(uint16_t idx, uint16_t obj_idx) {
+ 		   (!cp->flight_flag || cp->flight_flag == 6);
+ }
+ 
++/* I, as XvT's (OpenXvT player.c): the nearest warhead homing on the player, else the nearest homing on a
++ * craft of the player's side. Laser bolts share the projectile slots; only warhead species count. */
++static uint16_t user_findincomingwarhead(void) {
++	uint16_t player = pstate.object_idx;
++	uint16_t nearest = 0xFFFF;
++	uint32_t nearest_dist = 0xFFFFFFFFu;
++	int pass;
++	uint16_t obj;
++
++	for (pass = 0; pass < 2 && nearest == 0xFFFF; ++pass) {
++		for (obj = NUM_CRAFTS; obj < WARHEAD_SLOT_END; ++obj) {
++			uint16_t species = objects[obj].ship_idx;
++			uint16_t target;
++
++			if (!species || (unsigned int)(species - WEAPON_SPECIES_BASE) >= WARHEAD_TYPE_COUNT ||
++				!projectile_is_warhead_type[species - WEAPON_SPECIES_BASE])
++				continue;
++			target = warheads[obj - NUM_CRAFTS].target_obj;
++			if (pass == 0 ? target != player
++						  : target == player || target >= NUM_CRAFTS || !objects[target].ship_idx ||
++								objects[target].side != objects[player].side)
++				continue;
++			pai_distancebetween(player, obj);
++			if ((uint32_t)trig2_polardistance < nearest_dist) {
++				nearest = obj;
++				nearest_dist = (uint32_t)trig2_polardistance;
++			}
++		}
++	}
++	return nearest;
++}
++
+ /* E, cycling as XvT's does (OpenXvT flight.c FLIGHT_KEY_E): when the current target is attacking the player,
+  * the next attacker after it in slot order, wrapping; otherwise TIE's nearest attacker. */
+ static uint16_t user_nextattacker(void) {
+diff --git a/src/tie/user.h b/src/tie/user.h
+index f7b87d4..419f725 100644
+--- a/src/tie/user.h
++++ b/src/tie/user.h
+@@ -120,6 +120,7 @@ typedef enum {
+ 	KEY_z = 122,
+ 	KEY_ALT_E = 146, /* scan 0x12 | 0x80 */
+ 	KEY_ALT_T = 148,
++	KEY_ALT_I = 151, /* modern: component tracking, moved from I */
+ 	KEY_ALT_O = 152,
+ 	KEY_ALT_P = 153,
+ 	KEY_ALT_S = 159,
+diff --git a/src/tie_runtime/input/actions.c b/src/tie_runtime/input/actions.c
+index 2d660ac..9113309 100644
+--- a/src/tie_runtime/input/actions.c
++++ b/src/tie_runtime/input/actions.c
+@@ -176,7 +176,7 @@ static const TieInputActionDef g_action_defs[TIE_INPUT_ACTION_COUNT] = {
+ 
+ 	[TIE_INPUT_ACTION_TOGGLE_COMPONENT_TRACKING] = { "toggle_component_tracking", "Toggle Component Tracking",
+ 													 TIE_INPUT_ACTION_CATEGORY_TARGETING,
+-													 TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, 'i' },
++													 TIE_INPUT_ACTION_KIND_KEYPRESS_SCAN, 0x17 /* Alt+I, moved from I */ },
+ 	[TIE_INPUT_ACTION_TARGET_COMPONENT_NEXT] = { "target_component_next", "Next Target Component",
+ 												 TIE_INPUT_ACTION_CATEGORY_TARGETING,
+ 												 TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, ',' },
+@@ -290,6 +290,9 @@ static const TieInputActionDef g_action_defs[TIE_INPUT_ACTION_COUNT] = {
+ 													  "All Cannon Energy to Shields (XvT)",
+ 													  TIE_INPUT_ACTION_CATEGORY_WEAPONS,
+ 													  TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, '"' },
++	[TIE_INPUT_ACTION_TARGET_INCOMING_WARHEAD] = { "target_incoming_warhead", "Incoming Warhead (XvT)",
++												   TIE_INPUT_ACTION_CATEGORY_TARGETING,
++												   TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, 'i' },
+ 
+ };
+ 
+diff --git a/src/tie_runtime/input/actions.h b/src/tie_runtime/input/actions.h
+index f73170b..27262b3 100644
+--- a/src/tie_runtime/input/actions.h
++++ b/src/tie_runtime/input/actions.h
+@@ -120,6 +120,8 @@ typedef enum TieInputAction {
+ 	TIE_INPUT_ACTION_INFO_ENEMY_CRAFT,    /* Shift+F */
+ 	/* Not in TIE Fighter: XvT's all cannon energy to shields. */
+ 	TIE_INPUT_ACTION_XFER_ALL_CANNON_TO_SHIELDS, /* Shift+' */
++	/* Not in TIE Fighter: XvT's incoming warhead target. */
++	TIE_INPUT_ACTION_TARGET_INCOMING_WARHEAD, /* I */
+ 
+ 	TIE_INPUT_ACTION_COUNT
+ } TieInputAction;

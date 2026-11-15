@@ -1,0 +1,200 @@
+From 6f88d6784fae5aec59f1946fbc0122a8a666fe19 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Tue, 10 Nov 2026 23:03:53 +1100
+Subject: [PATCH 54/59] game.xvt_components: XvT's CMD marker on the targeted
+ component
+
+As XvT's Hud_DrawComponentMarkerBox: a 4-pixel box over the targeted
+component of a non-starfighter target on the CMD's 3D model, at
+ModelMesh_GetComponentFocus's point (the descriptor's target point for grouped
+meshes, else the centre). The readout captures the point's world offset from
+the target; the targeting-computer camera projects it into its texture; the
+CMD draws the box there in the yellow it names the component in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xw_remaster/hud_readout.c            | 11 +++++++++
+ src/xw_remaster/target_view.c            | 29 ++++++++++++++++++++++++
+ src/xw_remaster/target_view.h            |  2 ++
+ src/xw_runtime/runtime/xvt_components.c  | 18 +++++++++++++++
+ src/xw_runtime/runtime/xvt_components.h  |  4 ++++
+ src/xw_runtime/snapshot/render_readout.c | 10 +++++++-
+ src/xw_runtime/snapshot/render_types.h   |  3 +++
+ 7 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index d1731c0..4da5ed2 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -185,6 +185,17 @@ static void TargetModel(const XwHudDraw* d, const Pen* pen, const XwSnapRect* bo
+ 									 .blend = AERON_BLIT2D_BLEND_PMA,
+ 									 .filter = AERON_BLIT2D_FILTER_LINEAR };
+ 	AeronDrawList_AddSprite(d->list, &sprite);
++	/* game.xvt_components: XvT's CMD marks the targeted component with a 4-pixel box (Hud 0x442B..,
++	 * Hud_DrawComponentMarkerBox), in the colour it names the component in. */
++	float u, v;
++	if (XwTargetView_Marker(&u, &v)) {
++		float cx = (sprite.dst_x - pen->ox + u * w) / pen->sx, cy = (sprite.dst_y - pen->oy + v * h) / pen->sy;
++		float x = floorf(cx) - 2, y = floorf(cy) - 2;
++		Fill(pen, x, y, 4, 1, 0xC0A030 /* XVT_YELLOW */, 1);
++		Fill(pen, x, y + 3, 4, 1, 0xC0A030 /* XVT_YELLOW */, 1);
++		Fill(pen, x, y + 1, 1, 2, 0xC0A030 /* XVT_YELLOW */, 1);
++		Fill(pen, x + 3, y + 1, 1, 2, 0xC0A030 /* XVT_YELLOW */, 1);
++	}
+ }
+ 
+ static unsigned FontHeight(const XwHudImage* font) {
+diff --git a/src/xw_remaster/target_view.c b/src/xw_remaster/target_view.c
+index 2367be8..6a83e8b 100644
+--- a/src/xw_remaster/target_view.c
++++ b/src/xw_remaster/target_view.c
+@@ -18,6 +18,9 @@ static AeronScene3D* scene;
+ static AeronSceneMeshTable table;
+ static AeronTexture* texture;
+ static bool prepared;
++/* game.xvt_components: the targeted component's place in the texture (0..1), as XvT's CMD marks it. */
++static bool marker_valid;
++static float marker_u, marker_v;
+ 
+ static bool Ensure(void) {
+ 	if (scene)
+@@ -48,6 +51,7 @@ static void Normalize(float v[3]) {
+ 
+ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 	texture = NULL;
++	marker_valid = false;
+ 	if (!s || s->flight_version != 98 || !s->world_valid || !s->readout.target_valid)
+ 		return true;
+ 	const XwSnapObject* object = FindTarget(s);
+@@ -127,6 +131,23 @@ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 		return true;
+ 	for (unsigned i = 0; i < 3; ++i)
+ 		camera.pos[i] = centre[i] - forward[i] * distance;
++	if (s->readout.component_marker_valid) {
++		/* The model sits at the origin, so the marker is its offset from the target in scene axes. */
++		int32_t world[3];
++		float p[3];
++		for (unsigned i = 0; i < 3; ++i)
++			world[i] = (int32_t)((uint32_t)object->world_pos[i] + (uint32_t)s->readout.component_marker_offset[i]);
++		XwRenderMath_Local(object->world_pos, world, p);
++		float rel[3] = { p[0] - camera.pos[0], p[1] - camera.pos[1], p[2] - camera.pos[2] };
++		float x = rows[0] * rel[0] + rows[1] * rel[1] + rows[2] * rel[2];
++		float y = rows[3] * rel[0] + rows[4] * rel[1] + rows[5] * rel[2];
++		float z = rows[6] * rel[0] + rows[7] * rel[1] + rows[8] * rel[2];
++		if (z > camera.near_z) {
++			marker_u = 0.5f + 0.5f * x / (z * tanf(h_half));
++			marker_v = 0.5f + 0.5f * y / (z * tanf(v_half));
++			marker_valid = marker_u >= 0 && marker_u <= 1 && marker_v >= 0 && marker_v <= 1;
++		}
++	}
+ 
+ 	if (!AeronScene_Begin(scene, &camera) || !AeronScene_SetMeshSampler(scene, XwRemasterConfig_MeshSampler()))
+ 		return false;
+@@ -164,6 +185,14 @@ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 	return true;
+ }
+ 
++bool XwTargetView_Marker(float* u, float* v) {
++	if (!texture || !marker_valid)
++		return false;
++	*u = marker_u;
++	*v = marker_v;
++	return true;
++}
++
+ AeronTexture* XwTargetView_Texture(float* aspect) {
+ 	if (aspect)
+ 		*aspect = (float)TARGET_VIEW_W / TARGET_VIEW_H;
+diff --git a/src/xw_remaster/target_view.h b/src/xw_remaster/target_view.h
+index 12ac01c..50b88a6 100644
+--- a/src/xw_remaster/target_view.h
++++ b/src/xw_remaster/target_view.h
+@@ -8,5 +8,7 @@
+ bool XwTargetView_Render(const XwRenderSnapshot* snapshot);
+ /* The last rendered target image, or NULL when there is none this frame. */
+ AeronTexture* XwTargetView_Texture(float* aspect);
++/* game.xvt_components: where the targeted component is in the texture (0..1 each way). */
++bool XwTargetView_Marker(float* u, float* v);
+ void XwTargetView_Shutdown(void);
+ #endif
+diff --git a/src/xw_runtime/runtime/xvt_components.c b/src/xw_runtime/runtime/xvt_components.c
+index c1f201f..4ecba61 100644
+--- a/src/xw_runtime/runtime/xvt_components.c
++++ b/src/xw_runtime/runtime/xvt_components.c
+@@ -140,6 +140,24 @@ static bool Intact(const CraftData* craft, int objectType, int mesh) {
+ 	return craft->componentState[mesh] == 0 && craft->componentHp[mesh] != 0 && Selectable(objectType, mesh);
+ }
+ 
++bool XwXvtComponents_FocusOffset(uint16_t objectRef, uint16_t meshIndex, int32_t out[3]) {
++	if (meshIndex == XW_XVT_COMPONENT_NONE || !IsCraft(objectRef))
++		return false;
++	int objectType = g_objectTable[objectRef].objectType;
++	const MeshDescriptor* descriptor = Descriptor(objectType, meshIndex);
++	if (!descriptor)
++		return false;
++	/* MeshDescriptor +0x3C (after targetId) is XvT's target point. */
++	float target[3];
++	memcpy(target, descriptor->gap38 + 4, sizeof target);
++	const float* point = TargetGroup(objectType, meshIndex) != 0 ? target : &descriptor->center.x;
++	pai_RotateLocalVectorToWorldScratch(&g_objectTable[objectRef], (int)point[0], (int)point[2], -(int)point[1]);
++	out[0] = g_rotatedX;
++	out[1] = g_rotatedY;
++	out[2] = g_rotatedZ;
++	return true;
++}
++
+ void XwXvtComponents_DistanceTo(uint16_t fromRef, uint16_t toRef, uint16_t meshIndex) {
+ 	int toX, toY, toZ;
+ 	create_getworldposition(toRef, 0);
+diff --git a/src/xw_runtime/runtime/xvt_components.h b/src/xw_runtime/runtime/xvt_components.h
+index 67d4554..c65319b 100644
+--- a/src/xw_runtime/runtime/xvt_components.h
++++ b/src/xw_runtime/runtime/xvt_components.h
+@@ -44,6 +44,10 @@ void XwXvtComponents_Cycle(int direction);
+ /* XvT's component name ("Lasr Tur", "Shld Gen"...). */
+ const char* XwXvtComponents_Name(int objectType, uint16_t meshIndex);
+ 
++/* XvT's CMD marker point (ModelMesh_GetComponentFocus: the descriptor's target point for grouped meshes,
++ * else the centre), rotated into world axes relative to the craft's position. */
++bool XwXvtComponents_FocusOffset(uint16_t objectRef, uint16_t meshIndex, int32_t out[3]);
++
+ /* pai_distancebetween to the centre of toRef's mesh (trig2 polar globals). */
+ void XwXvtComponents_DistanceTo(uint16_t fromRef, uint16_t toRef, uint16_t meshIndex);
+ 
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 400330c..ee903cd 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -274,9 +274,17 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 	r->capital = genus == XW_GENUS_STARSHIP || genus == XW_GENUS_FREIGHTER;
+ 	if (r->capital && ref == g_playerFlightState.currentTargetObjectIdx) {
+ 		uint16_t component = XwXvtComponents_Selected();
+-		if (component != XW_XVT_COMPONENT_NONE)
++		if (component != XW_XVT_COMPONENT_NONE) {
+ 			CopyText(r->target_component, sizeof r->target_component,
+ 					 XwXvtComponents_Name(g_objectTable[ref].objectType, component));
++			/* pai_RotateLocalVectorToWorldScratch writes g_rotated*; keep the caller's values. */
++			int rx = g_rotatedX, ry = g_rotatedY, rz = g_rotatedZ;
++			r->component_marker_valid =
++				XwXvtComponents_FocusOffset(ref, component, r->component_marker_offset) ? 1 : 0;
++			g_rotatedX = rx;
++			g_rotatedY = ry;
++			g_rotatedZ = rz;
++		}
+ 	}
+ 	if (craft->aiCurrentPlanId < USER_AI_STATUS_COUNT) {
+ 		unsigned message = g_aiPlanStatusMessageIds[craft->aiCurrentPlanId];
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index fd24a25..304ca81 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -252,6 +252,9 @@ typedef struct XwSnapReadout {
+ 	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
+ 	char target_order_word[16]; /* XvT's one-word form of target_orders ("Attacking"). */
+ 	char target_component[16];  /* game.xvt_components: the targeted component ("Shld Gen"), or "". */
++	/* XvT's CMD marker on the targeted component: its world offset from the target's position. */
++	uint8_t component_marker_valid;
++	int32_t component_marker_offset[3];
+ 	/* view_target (Z): XvT's threat display. The destination is the target's current AI aim (waypoint or
+ 	 * craft); time_remaining_s is -1 when unknown (stationary). */
+ 	uint8_t threat_view, destination_valid;

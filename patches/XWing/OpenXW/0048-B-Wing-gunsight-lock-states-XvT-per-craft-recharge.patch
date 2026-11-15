@@ -1,0 +1,211 @@
+From 84a86140d69ac5498b5433127df01f7754417db4 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 07:22:30 +1100
+Subject: [PATCH 48/59] B-Wing gunsight lock states; XvT per-craft recharge
+
+- hud_instruments.c: the B-Wing gunsight (91x68, the same as XvT's) was past
+  the 4000 px overlay cut-off, so with the XvT cockpit its lit and lock
+  states never drew. The gunsight element is now exempt.
+- game.xvt_recharge (Game page Recharge Rates): the base rates already match
+  XvT (20 shield / 2 laser per power step per second, same caps and shield
+  strengths). XvT also doubles the Y-Wing's shield recharge and gives TIE
+  fighters and bombers 3 laser charge per step.
+---
+ resources/config.yaml                    |  3 +++
+ src/xw/flight/object/laser.c             | 18 ++++++++++++++++--
+ src/xw_app/settings/game_page.c          |  2 ++
+ src/xw_remaster/hud_instruments.c        |  9 +++++----
+ src/xw_remaster/xvt_cockpit.h            |  2 ++
+ src/xw_runtime/config/flight_tweaks.c    |  5 +++++
+ src/xw_runtime/config/flight_tweaks.h    |  5 +++++
+ src/xw_runtime/config/preference_apply.c |  1 +
+ src/xw_runtime/config/settings.c         |  1 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ 10 files changed, 41 insertions(+), 7 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index bd3d67e..c438339 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -277,6 +277,9 @@ game:
+   # Player shields as in X-Wing vs TIE Fighter: after a hit, the hit bank draws
+   # energy from the other until they are even, and the shield setting returns to even.
+   xvt_shields: true
++  # Recharge as in X-Wing vs TIE Fighter: the Y-Wing's shields recharge twice as fast,
++  # and TIE fighters and bombers recharge their lasers half again as fast. Base rates match.
++  xvt_recharge: true
+   # Player turn rate as in X-Wing vs TIE Fighter: tightest at 1/3 throttle (stock
+   # X-Wing rate), 2/3 of that at full throttle and 1/3 when stopped.
+   xvt_turning: true
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index 0deb268..178ef1d 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -143,9 +143,23 @@ void laser_weaponsfire(void) {
+ 					craft = g_curCraft;
+ 				}
+ 			}
++#ifdef XW_MODERN
++			/* game.xvt_recharge: XvT doubles the Y-Wing's shield recharge and gives TIE fighters and bombers 3
++			 * laser charge per power step instead of 2 (OpenXvT laser_weaponsfire). */
++			int shieldRechargeStep = LASER_SHIELD_RECHARGE_STEP, laserRechargeStep = LASER_CHARGE_RECHARGE_STEP;
++			if (XwFlightTweaks_XvtRecharge()) {
++				int canonicalType = XwFlightTypes_CanonicalType(powerObject->objectType);
++				if (canonicalType == XW_OBJ_Y_WING)
++					shieldRechargeStep *= 2;
++				if (canonicalType == XW_OBJ_TIE_FIGHTER || canonicalType == XW_OBJ_TIE_BOMBER)
++					laserRechargeStep = 3;
++			}
++#else
++			enum { shieldRechargeStep = LASER_SHIELD_RECHARGE_STEP, laserRechargeStep = LASER_CHARGE_RECHARGE_STEP };
++#endif
+ 			if (craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_SHIELDS) {
+ 				int16_t shieldEnergyDelta =
+-					(int16_t)(LASER_SHIELD_RECHARGE_STEP * (craft->shieldRedirect - LASER_RECHARGE_NEUTRAL));
++					(int16_t)(shieldRechargeStep * (craft->shieldRedirect - LASER_RECHARGE_NEUTRAL));
+ 				if (shieldEnergyDelta != 0) {
+ 					uint8_t mode = craft->shieldDistribMode;
+ 					if (mode == LASER_SHIELD_DISTRIBUTE_FRONT)
+@@ -165,7 +179,7 @@ void laser_weaponsfire(void) {
+ 				for (laserSlotIndex = 0; laserSlotIndex < craft->laserSlotCount; ++laserSlotIndex) {
+ 					if (craft->weaponSlots[laserSlotIndex].firingGate == 0) {
+ 						unsigned int chargeSlotIndex = laserSlotIndex;
+-						int16_t laserChargeDelta = (int16_t)(LASER_CHARGE_RECHARGE_STEP *
++						int16_t laserChargeDelta = (int16_t)(laserRechargeStep *
+ 															 (craft->laserRedirect - LASER_RECHARGE_NEUTRAL));
+ 						craft->weaponSlots[chargeSlotIndex].laserCharge += laserChargeDelta;
+ 						craft = g_curCraft;
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index df4775f..9d60aa4 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -104,6 +104,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 2);
+ 	AeronUi_Selector(ui, "Acceleration and Braking", &draft->xvt_throttle,
+ 					 (const char* const[]) { "X-Wing", "XvT" }, 2);
++	AeronUi_Selector(ui, "Recharge Rates", &draft->xvt_recharge,
++					 (const char* const[]) { "X-Wing", "XvT (Y-Wing Shields, TIE Lasers)" }, 2);
+ 	AeronUi_Selector(ui, "Shield Hits", &draft->xvt_shields,
+ 					 (const char* const[]) { "X-Wing", "XvT (Self-Balancing)" }, 2);
+ 	AeronUi_Selector(ui, "Shields at Launch", &draft->start_overshield,
+diff --git a/src/xw_remaster/hud_instruments.c b/src/xw_remaster/hud_instruments.c
+index 34d8fe0..f36a430 100644
+--- a/src/xw_remaster/hud_instruments.c
++++ b/src/xw_remaster/hud_instruments.c
+@@ -2,7 +2,7 @@
+ #include "xw_remaster/xvt_cockpit.h"
+ #include <math.h>
+ 
+-static bool Part(const XwHudDraw* d, unsigned index, int x, int y, unsigned key, bool mirror) {
++static bool Part(const XwHudDraw* d, unsigned index, int x, int y, unsigned key, bool mirror, bool gunsight) {
+ 	if (index >= XW_SNAP_PANEL_SPRITES)
+ 		return false;
+ 	XwCockpitPart part = d->definition->parts[index];
+@@ -10,7 +10,8 @@ static bool Part(const XwHudDraw* d, unsigned index, int x, int y, unsigned key,
+ 	const XwHudImage* image = XwHudAssets_Image(image_key);
+ 	if (!image)
+ 		return false;
+-	if (d->xvt && image->bitmap.width * image->bitmap.height > XW_XVT_COCKPIT_OVERLAY_PIXELS)
++	/* The B-Wing's gunsight (91x68, as XvT's) is past the cut-off but is no overlay. */
++	if (d->xvt && !gunsight && image->bitmap.width * image->bitmap.height > XW_XVT_COCKPIT_OVERLAY_PIXELS)
+ 		return true;
+ 	XwSnapRect rect = { mirror ? x - image->bitmap.width + 1 : x, y, image->bitmap.width,
+ 						image->bitmap.height };
+@@ -73,13 +74,13 @@ bool XwHudDraw_Instruments(const XwHudDraw* d) {
+ 			e.y += dy;
+ 		}
+ 		if (w->kind == XW_SNAP_WIDGET_SPRITE) {
+-			if (!Part(d, e.sprite + w->value, e.x, e.y, e.selector, false))
++			if (!Part(d, e.sprite + w->value, e.x, e.y, e.selector, false, i == XW_XVT_COCKPIT_GUNSIGHT))
+ 				return false;
+ 		} else if (w->kind == XW_SNAP_WIDGET_GAUGE || w->kind == XW_SNAP_WIDGET_LASER) {
+ 			for (unsigned j = 0; j < w->segments; ++j) {
+ 				unsigned state = j < w->value ? w->filled_state : w->empty_state;
+ 				if (!Part(d, e.sprite + state, e.x + j * w->step_x, e.y - j * w->step_y, 253,
+-						  w->kind == XW_SNAP_WIDGET_LASER && e.selector != 0))
++						  w->kind == XW_SNAP_WIDGET_LASER && e.selector != 0, false))
+ 					return false;
+ 			}
+ 		} else if (w->kind == XW_SNAP_WIDGET_THROTTLE)
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index dff7a80..ac9b790 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -19,6 +19,8 @@ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* draw, unsigned index, const Xw
+ void XwXvtCockpit_DrawThreats(const XwHudDraw* draw);
+ /* Instrument sprites larger than this many pixels are X-Wing's damage overlays, which do not fit XvT art. */
+ enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 4000 }; /* The gunsight (74x45) is smaller; the overlays are larger. */
++/* X-Wing's gunsight element, exempt from that cut-off: the B-Wing's is 91x68. */
++enum { XW_XVT_COCKPIT_GUNSIGHT = 37 };
+ /* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).
+  * `plain` drops the pane's fills and text backgrounds. */
+ bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int* dx, int* dy, bool* plain);
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 57ef4d3..c6c2cf7 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -17,6 +17,11 @@ static bool s_ion_disable_only = true;
+ static bool s_short_messages = true;
+ static bool s_xvt_damage_display = true;
+ static bool s_skip_empty_warheads = true;
++static bool s_xvt_recharge = true;
++
++bool XwFlightTweaks_XvtRecharge(void) { return s_xvt_recharge; }
++
++void XwFlightTweaks_SetXvtRecharge(bool enabled) { s_xvt_recharge = enabled; }
+ 
+ bool XwFlightTweaks_SkipEmptyWarheads(void) { return s_skip_empty_warheads; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index ee07cdb..7c37f34 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -86,6 +86,11 @@ void XwFlightTweaks_SetXvtDamageDisplay(bool enabled);
+  * them at once). */
+ bool XwFlightTweaks_SkipEmptyWarheads(void);
+ void XwFlightTweaks_SetSkipEmptyWarheads(bool enabled);
++/* game.xvt_recharge: X-Wing vs TIE Fighter's per-craft recharge (OpenXvT laser_weaponsfire). The base rates
++ * already match (20 shield / 2 laser per second per power step); XvT doubles the Y-Wing's shield recharge
++ * and gives TIE fighters and bombers 3 laser charge per step instead of 2. */
++bool XwFlightTweaks_XvtRecharge(void);
++void XwFlightTweaks_SetXvtRecharge(bool enabled);
+ 
+ /* Cannon bolt speed, lifetime and launch distance ahead of the gun for projectile property index `index`
+  * (0-5 are laser and ion cannons), with xvt_lasers applied: XvT's own values (speed 2000/1800 lasers,
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index c2d4a55..47aef60 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -43,6 +43,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
+ 	XwFlightTweaks_SetXvtDamageDisplay(settings->xvt_damage_display != 0);
+ 	XwFlightTweaks_SetSkipEmptyWarheads(settings->skip_empty_warheads != 0);
++	XwFlightTweaks_SetXvtRecharge(settings->xvt_recharge != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 29097b6..7c571fe 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -120,6 +120,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.short_messages", short_messages),
+ 	SETTING_BOOL("game.xvt_damage_display", xvt_damage_display),
+ 	SETTING_BOOL("game.skip_empty_warheads", skip_empty_warheads),
++	SETTING_BOOL("game.xvt_recharge", xvt_recharge),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index dd8b5a8..9c1047c 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -40,7 +40,7 @@ typedef struct XwSettings {
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+-	int short_messages, xvt_damage_display, xvt_control_sounds, skip_empty_warheads;
++	int short_messages, xvt_damage_display, xvt_control_sounds, skip_empty_warheads, xvt_recharge;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;

@@ -1,0 +1,27 @@
+From 62faac6b4a592fba7d1ea06827fc702e49c51e31 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 12:10:18 +1100
+Subject: [PATCH 10/59] Messages show once: an interrupted event message is no
+ longer re-queued
+
+---
+ src/xw/flight/hud/msg.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/xw/flight/hud/msg.c b/src/xw/flight/hud/msg.c
+index 1de276c..aad6709 100644
+--- a/src/xw/flight/hud/msg.c
++++ b/src/xw/flight/hud/msg.c
+@@ -355,7 +355,12 @@ void msg_messageprintf(XwFlightMessageId messageId) {
+ 					g_messageDynamicStringCursor = 0;
+ 					return;
+ 				}
++#ifdef XW_MODERN
++				/* The original re-queued the interrupted message and showed it again from the start; each
++				 * message now shows once. */
++#else
+ 				msg_movecurrentmessageinqueue();
++#endif
+ 				break;
+ 			case XW_MSG_PANE_LONG:
+ 				if (message.paneType == XW_MSG_PANE_DEFAULT)

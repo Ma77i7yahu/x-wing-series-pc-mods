@@ -1,0 +1,53 @@
+From 22dae21d1e06d5297e7aa1b426c8a01fe233f780 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Tue, 10 Nov 2026 06:57:34 +1100
+Subject: [PATCH 50/59] Craft list: shield and hull percentages no longer stop
+ at 127
+
+The F list's rows kept SHD/HULL in signed bytes clamped to 127. Shields
+charge to twice nominal (200%, as XvT shows it), so the player's own row,
+and any craft with charged shields, sat at 127 until the shields fell
+below that. The row fields are now 16-bit and unclamped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xw_runtime/snapshot/render_readout.c | 4 ++--
+ src/xw_runtime/snapshot/render_types.h   | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 9cdb473..c780a3a 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -429,8 +429,8 @@ static void CaptureCraftList(XwSnapCraftList* list) {
+ 		ListName(index, row->name, sizeof row->name);
+ 		row->relation = Relation(index);
+ 		int shield = ShieldPercent(craft), hull = HullPercent(craft);
+-		row->shield_pct = (int8_t)(shield > 127 ? 127 : shield);
+-		row->hull_pct = (int8_t)(hull > 127 ? 127 : hull);
++		row->shield_pct = (int16_t)shield;
++		row->hull_pct = (int16_t)hull;
+ 		uint16_t target = index == g_playerFlightState.objectIndex ? g_playerFlightState.currentTargetObjectIdx
+ 																	: craft->aiTargetRef;
+ 		if (target < XW_OBJECT_COUNT && LiveObject(target)) {
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 0e66fb3..264a99e 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -203,14 +203,14 @@ typedef struct XwSnapTargetBox {
+ } XwSnapTargetBox;
+ 
+ /* XvT's F / Shift+F craft lists (Mfd_DrawCraftListPage): the rows from `top` that fit the list box. Strings
+- * are mixed case; percentages are -1 when not applicable. Byte-sized fields only, so there is no padding. */
++ * are mixed case; percentages are -1 when not applicable. Laid out so there is no padding (16-bit fields at even offsets). */
+ enum { XW_SNAP_CRAFT_LIST_ROWS = 8 };
+ 
+ typedef struct XwSnapCraftListRow {
+ 	char name[12];    /* Flight group name and craft number, as XvT's 9 characters. */
+ 	char target[20];  /* The craft's target ("None"). */
+ 	char status[10];  /* Enemy list: the mission goal still to do ("Destroy", "Inspect"...), or "". */
+-	int8_t shield_pct, hull_pct;
++	int16_t shield_pct, hull_pct; /* Shields run to 200% when charged past nominal, as in XvT. */
+ 	uint8_t relation, target_relation; /* 0 friendly, 1 hostile, 2 other. */
+ } XwSnapCraftListRow;
+ 

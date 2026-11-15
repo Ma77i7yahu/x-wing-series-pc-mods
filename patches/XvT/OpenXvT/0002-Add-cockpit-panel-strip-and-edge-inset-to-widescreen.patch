@@ -1,0 +1,298 @@
+From d5eafaea73ef1d2505faa4abf23cddbe3e70b43f Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:03:45 +1100
+Subject: [PATCH 02/25] Add cockpit panel strip and edge inset to widescreen
+ HUD
+
+---
+ src/xvt_remaster/hud_draw.h                   |  3 +
+ src/xvt_remaster/hud_instruments.c            | 87 +++++++++++++++++++
+ src/xvt_remaster/hud_instruments.h            |  4 +
+ src/xvt_remaster/hud_panes.c                  |  5 +-
+ src/xvt_remaster/hud_renderer.c               | 23 ++++-
+ .../snapshot/cockpit_instruments.c            | 35 ++++++++
+ src/xvt_runtime/snapshot/cockpit_state.h      | 10 +++
+ 7 files changed, 162 insertions(+), 5 deletions(-)
+
+diff --git a/src/xvt_remaster/hud_draw.h b/src/xvt_remaster/hud_draw.h
+index f1017e2..d34b4ba 100644
+--- a/src/xvt_remaster/hud_draw.h
++++ b/src/xvt_remaster/hud_draw.h
+@@ -12,6 +12,9 @@ typedef struct XvtHudDraw {
+ 	/* Widescreen HUD: left and right zone elements move outward by this many
+ 	 * output pixels. Zero for layouts drawn as one centered frame. */
+ 	float spread;
++	/* Message panes that start above this source row move down by
++	 * message_shift, making room for the cockpit panel strip. */
++	int message_top, message_shift;
+ 	int width, height;
+ } XvtHudDraw;
+ 
+diff --git a/src/xvt_remaster/hud_instruments.c b/src/xvt_remaster/hud_instruments.c
+index f98dd83..50e3805 100644
+--- a/src/xvt_remaster/hud_instruments.c
++++ b/src/xvt_remaster/hud_instruments.c
+@@ -1,6 +1,8 @@
+ #include "xvt_remaster/hud_instruments.h"
++#include "xvt_remaster/hud_text.h"
+ #include "xvt_remaster/ui_draw.h"
+ #include <math.h>
++#include <stdio.h>
+ 
+ static void DrawIndicator(const XvtHudDraw* draw, XvtHudSpriteRole role,
+ 						  const XvtCockpitIndicator* indicator) {
+@@ -170,6 +172,91 @@ void XvtHudInstruments_DrawWorldMarkers(const XvtHudDraw* draw, const XvtSnapTar
+ 	}
+ }
+ 
++enum {
++	PANEL_TOP = 3,
++	PANEL_HEIGHT = 13,
++	PANEL_LEFT = 226, /* 640-wide source units; scaled for other layouts */
++	PANEL_WIDTH = 188,
++	PANEL_BOX = 44,
++	PANEL_GAP = 4,
++	PANEL_SEGMENT = 4
++};
++
++static int PanelText(const XvtHudDraw* draw, XvtSnapRect box, const char* text) {
++	XvtCockpitTextField field = { 0 };
++	field.caption.visible = 1;
++	field.caption.font_tier = 2;
++	field.caption.foreground = 0x4E;
++	field.caption.background = 0;
++	field.caption.alignment = XVT_COCKPIT_ALIGN_CENTER;
++	field.caption.phase = XVT_COCKPIT_AFTER_CRT;
++	snprintf(field.caption.text, sizeof field.caption.text, "%s", text);
++	field.bounds = (XvtSnapRect) { box.x + 1, box.y + 2, box.width - 2, box.height - 3 };
++	field.x = (int16_t)field.bounds.x;
++	field.y = (int16_t)field.bounds.y;
++	/* Draw glyphs only; the box outline is the background. */
++	field.keyed = 1;
++	field.color_key_argb = draw->state->palette_argb[0];
++	return XvtHudText_DrawField(draw, &field);
++}
++
++int XvtHudInstruments_DrawPanel(const XvtHudDraw* draw) {
++	const XvtCockpitPanelReadouts* panel = &draw->state->weapons.panel;
++	if (!panel->visible)
++		return 1;
++	/* Laid out in 640-wide units and scaled to the layout's source width. */
++	float unit = draw->layout->source_width / 640.0f;
++#define U(value) ((int)((value) * unit + .5f))
++	const uint32_t frame = 0xFFB01010, dim = 0xFF183018;
++	const uint32_t bands[3] = { dim, 0xFF30D040, 0xFFE0F070 };
++	int top = U(PANEL_TOP), height = U(PANEL_HEIGHT);
++	int left = (draw->layout->source_width - U(PANEL_WIDTH)) / 2;
++	XvtSnapRect counter = { left, top, U(PANEL_BOX), height };
++	XvtSnapRect clock = { left + U(PANEL_WIDTH) - U(PANEL_BOX), top, U(PANEL_BOX), height };
++	XvtSnapRect lasers = { counter.x + counter.width + U(PANEL_GAP), top,
++						   clock.x - U(PANEL_GAP) - (counter.x + counter.width + U(PANEL_GAP)), height };
++	char text[16];
++	if (panel->countermeasures_visible) {
++		XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, counter, panel->chaff_active ? 0xFFFFFFFF : frame);
++		snprintf(text, sizeof text, "CM %u", panel->countermeasures);
++		if (!PanelText(draw, counter, text))
++			return 0;
++	}
++	XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, clock, frame);
++	snprintf(text, sizeof text, "%u:%02u", panel->clock_minutes, panel->clock_seconds);
++	if (!PanelText(draw, clock, text))
++		return 0;
++	if (panel->lasers_visible && panel->slot_count) {
++		XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, lasers, frame);
++		/* Left-bank slots fill the left column, right-bank slots the right. */
++		unsigned rows[2] = { 0, 0 };
++		for (unsigned slot = 0; slot < panel->slot_count; ++slot)
++			++rows[panel->bank[slot] ? 1 : 0];
++		int column_width = (lasers.width - U(6)) / 2, segment = column_width / 10;
++		if (segment < 2)
++			segment = 2;
++		unsigned row[2] = { 0, 0 };
++		for (unsigned slot = 0; slot < panel->slot_count; ++slot) {
++			unsigned side = panel->bank[slot] ? 1 : 0, count = rows[side] ? rows[side] : 1;
++			int pitch = (height - U(4)) / (int)count;
++			int bar = pitch > 2 ? pitch - 1 : 1;
++			int x = lasers.x + U(2) + (int)side * (column_width + U(2));
++			int y = top + U(2) + (int)row[side]++ * pitch;
++			for (int index = 0; index < 10; ++index)
++				XvtHudDraw_Fill(draw, XVT_COCKPIT_AFTER_CRT,
++								(XvtSnapRect) { x + index * segment, y, segment - 1, bar },
++								bands[index < panel->segments[slot] ? panel->band[slot] : 0]);
++		}
++	}
++#undef U
++	return 1;
++}
++
++int XvtHudInstruments_PanelBottom(const XvtHudDraw* draw) {
++	float unit = draw->layout->source_width / 640.0f;
++	return (int)((PANEL_TOP + PANEL_HEIGHT + 2) * unit + .5f);
++}
++
+ void XvtHudInstruments_DrawCrtMarker(const XvtHudDraw* draw) {
+ 	const XvtSnapPreview* crt = &draw->state->crt;
+ 	XvtRenderView view;
+diff --git a/src/xvt_remaster/hud_instruments.h b/src/xvt_remaster/hud_instruments.h
+index 3cda7c3..804d113 100644
+--- a/src/xvt_remaster/hud_instruments.h
++++ b/src/xvt_remaster/hud_instruments.h
+@@ -9,4 +9,8 @@ void XvtHudInstruments_DrawWorldMarkers(const XvtHudDraw* draw, const XvtSnapTar
+ 										unsigned count, const XvtRenderView* view);
+ void XvtHudInstruments_DrawCrtMarker(const XvtHudDraw* draw);
+ void XvtHudInstruments_DrawMouseStick(const XvtHudDraw* draw, const XvtRenderView* view);
++/* Widescreen cockpit-off strip: countermeasures, laser charge and mission clock. */
++int XvtHudInstruments_DrawPanel(const XvtHudDraw* draw);
++/* First source row below the strip. */
++int XvtHudInstruments_PanelBottom(const XvtHudDraw* draw);
+ #endif
+diff --git a/src/xvt_remaster/hud_panes.c b/src/xvt_remaster/hud_panes.c
+index 53f77b9..3782266 100644
+--- a/src/xvt_remaster/hud_panes.c
++++ b/src/xvt_remaster/hud_panes.c
+@@ -130,8 +130,11 @@ int XvtHudPanes_DrawMessages(const XvtHudDraw* draw) {
+ 		return 0;
+ 	for (unsigned pane = 0; pane < XVT_COCKPIT_MESSAGE_COUNT; ++pane) {
+ 		const XvtCockpitMessage* message = &draw->state->messages.panes[pane];
++		XvtSnapRect placement = message->placement;
++		if (placement.y < draw->message_top)
++			placement.y += draw->message_shift;
+ 		if (message->visible && !DrawOverlayGlyphs(draw, message->first_glyph, message->glyph_count,
+-												   message->placement, XVT_COCKPIT_AFTER_CRT))
++												   placement, XVT_COCKPIT_AFTER_CRT))
+ 			return 0;
+ 		if (pane == XVT_COCKPIT_MESSAGE_READY) {
+ 			for (unsigned field = XVT_COCKPIT_TEXT_NETWORK_PING; field <= XVT_COCKPIT_TEXT_NETWORK_LAG;
+diff --git a/src/xvt_remaster/hud_renderer.c b/src/xvt_remaster/hud_renderer.c
+index 1962b2b..41e98fe 100644
+--- a/src/xvt_remaster/hud_renderer.c
++++ b/src/xvt_remaster/hud_renderer.c
+@@ -78,13 +78,22 @@ static HudPreparationKey MakePreparationKey(const XvtCockpitState* state, const
+ 
+ /* Spread the HUD to the screen edges only where the world fills the whole
+  * screen: the cockpit-off and full-screen views outside the map. */
+-static float SpreadFor(const XvtCockpitState* state, const XvtRenderView* view, float margin) {
++static float SpreadFor(const XvtCockpitState* state, const XvtRenderView* view, const XvtHudDraw* draw) {
+ 	const XvtRenderSnapshot* snapshot = XvtRenderSnapshot_Current();
+ 	if (!view || !XvtRemasterConfig_Effective()->hud_widescreen || !snapshot || snapshot->camera.map_mode ||
+ 		state->view.mirrored ||
+ 		(state->view.hud_state != HUD_VIEW_HUD_ONLY && state->view.hud_state != HUD_VIEW_FULL_SCREEN))
+ 		return 0;
+-	return margin > 0 ? margin : 0;
++	/* Keep an inset of 8 units (640-wide) so edge gauges and labels stay visible. */
++	float inset = 8.0f * draw->layout->source_width / 640.0f * draw->scale;
++	float spread = draw->offset_x - inset;
++	return spread > 0 ? spread : 0;
++}
++
++static int PanelEnabled(const XvtCockpitState* state, const XvtRenderView* view) {
++	const XvtRenderSnapshot* snapshot = XvtRenderSnapshot_Current();
++	return view && XvtRemasterConfig_Effective()->hud_widescreen && snapshot && !snapshot->camera.map_mode &&
++		   state->view.hud_state == HUD_VIEW_HUD_ONLY && state->weapons.panel.visible;
+ }
+ 
+ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state, uint64_t world_generation,
+@@ -118,7 +127,12 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 						.width = width,
+ 						.height = height };
+ 	XvtHudLayout_Fit(draw.layout, width, height, &draw.scale, &draw.offset_x, &draw.offset_y);
+-	draw.spread = SpreadFor(state, view, draw.offset_x);
++	draw.spread = SpreadFor(state, view, &draw);
++	int panel = PanelEnabled(state, view);
++	if (panel) {
++		draw.message_top = XvtHudInstruments_PanelBottom(&draw);
++		draw.message_shift = draw.message_top;
++	}
+ 	int crt_visible = state->crt.valid && crt_color;
+ 	XvtHudDraw display = XvtHudDraw_ForRect(&draw, state->crt.destination);
+ 	if (!XvtCrt_PrepareView(&state->crt, &state->definition.layout, crt_visible ? crt_color : NULL, width,
+@@ -143,7 +157,8 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 	if (crt_visible)
+ 		XvtHudInstruments_DrawCrtMarker(&draw);
+ 	XvtHudInstruments_DrawMouseStick(&draw, view);
+-	if (!XvtHudPanes_DrawReadouts(&draw, XVT_COCKPIT_AFTER_CRT) || !XvtHudPanes_DrawMessages(&draw) ||
++	if ((panel && !XvtHudInstruments_DrawPanel(&draw)) || !XvtHudPanes_DrawReadouts(&draw, XVT_COCKPIT_AFTER_CRT) ||
++		!XvtHudPanes_DrawMessages(&draw) ||
+ 		!XvtHudPanes_DrawPages(&draw) || !XvtHudPanes_DrawOverlays(&draw) ||
+ 		!AeronDrawList_Prepare(g_before, cmd) || !AeronDrawList_Prepare(g_after, cmd))
+ 		goto failed;
+diff --git a/src/xvt_runtime/snapshot/cockpit_instruments.c b/src/xvt_runtime/snapshot/cockpit_instruments.c
+index cdec85a..8e2f681 100644
+--- a/src/xvt_runtime/snapshot/cockpit_instruments.c
++++ b/src/xvt_runtime/snapshot/cockpit_instruments.c
+@@ -389,6 +389,39 @@ static void BuildCockpitWarnings(XvtCockpitState* state, const CraftData* craft,
+ 	}
+ }
+ 
++static void BuildPanelReadouts(XvtCockpitState* state, const CraftData* craft) {
++	XvtCockpitPanelReadouts* panel = &state->weapons.panel;
++	const ModelDef* model = &g_modelDefs[craft->modelIndex];
++	unsigned count = craft->laserSlotCount > XVT_HUD_WEAPON_SLOTS ? XVT_HUD_WEAPON_SLOTS : craft->laserSlotCount;
++	int cannons = (craft->workingSubsystems & CRAFT_SUBSYSTEM_FLAG_CANNONS) != 0;
++	panel->visible = 1;
++	panel->slot_count = (uint8_t)count;
++	panel->lasers_visible = (craft->damageStats.activeHudFeatureMask & XVT_COCKPIT_FEATURE_LASER_CHARGE) != 0;
++	/* Same charge banding as the forward cockpit's laser charge bars. */
++	for (unsigned index = 0; index < count; ++index) {
++		int charge = craft->weaponSlots[index].laserCharge;
++		panel->bank[index] = index > model->laserGroupLastSlot[0];
++		if (charge > 0 && cannons) {
++			++charge;
++			panel->band[index] = charge <= 64 ? 1 : 2;
++			if (charge > 64)
++				charge -= 64;
++			panel->segments[index] = (uint8_t)(charge / 6 > 10 ? 10 : charge / 6);
++		}
++	}
++	/* The forward layout positions the counter only on craft that carry them. */
++	panel->countermeasures_visible =
++		g_hudElementLayouts[HUD_COCKPIT_INSTRUMENT_BASE_INDEX + 48].x +
++			g_hudElementLayouts[HUD_COCKPIT_INSTRUMENT_BASE_INDEX + 48].y !=
++		0;
++	panel->countermeasures = craft->cmAmmoCount;
++	panel->chaff_active = (uint8_t)craft->chaffActiveTimer != 0;
++	int countdown =
++		g_flightMissionState.provingGroundsModeActive != 0 || g_flightMissionState.missionTimeLimitMinutes != 0;
++	panel->clock_minutes = (uint8_t)(countdown ? g_missionCountdownClock.minutes : g_missionElapsedClock.minutes);
++	panel->clock_seconds = (uint8_t)(countdown ? g_missionCountdownClock.seconds : g_missionElapsedClock.seconds);
++}
++
+ void XvtCockpitInstruments_Build(XvtCockpitState* state) {
+ 	memset(&state->systems, 0, sizeof state->systems);
+ 	memset(&state->weapons, 0, sizeof state->weapons);
+@@ -426,6 +459,8 @@ void XvtCockpitInstruments_Build(XvtCockpitState* state) {
+ 		BuildBeamState(state, craft);
+ 		BuildPowerState(state, craft, compact);
+ 		BuildBasicReadouts(state, craft);
++		if (hud_only)
++			BuildPanelReadouts(state, craft);
+ 		state->radar = g_resolved.radar;
+ 		int radar_visible = (systems->hud_features & XVT_COCKPIT_FEATURE_FORE_RADAR) &&
+ 							(systems->hud_features & XVT_COCKPIT_FEATURE_AFT_RADAR);
+diff --git a/src/xvt_runtime/snapshot/cockpit_state.h b/src/xvt_runtime/snapshot/cockpit_state.h
+index 2114cb9..150e36f 100644
+--- a/src/xvt_runtime/snapshot/cockpit_state.h
++++ b/src/xvt_runtime/snapshot/cockpit_state.h
+@@ -284,12 +284,22 @@ typedef struct XvtCockpitWarheadBank {
+ 	uint8_t visible, selected;
+ } XvtCockpitWarheadBank;
+ 
++/* Cockpit-panel readouts the original HUD-only view omits, supplied for the
++ * widescreen HUD: per-slot laser charge, countermeasures and mission clock. */
++typedef struct XvtCockpitPanelReadouts {
++	uint8_t visible, slot_count, lasers_visible, countermeasures_visible, chaff_active;
++	uint8_t segments[XVT_HUD_WEAPON_SLOTS], band[XVT_HUD_WEAPON_SLOTS], bank[XVT_HUD_WEAPON_SLOTS];
++	uint16_t countermeasures;
++	uint8_t clock_minutes, clock_seconds;
++} XvtCockpitPanelReadouts;
++
+ typedef struct XvtCockpitWeapons {
+ 	uint8_t slot_count, selected_bank;
+ 	XvtCockpitWeaponSlot slots[XVT_HUD_WEAPON_SLOTS];
+ 	XvtCockpitWarheadBank warheads[2];
+ 	XvtCockpitLauncher launchers[4];
+ 	XvtCockpitIndicator lock_indicator;
++	XvtCockpitPanelReadouts panel;
+ } XvtCockpitWeapons;
+ 
+ typedef struct XvtCockpitTarget {

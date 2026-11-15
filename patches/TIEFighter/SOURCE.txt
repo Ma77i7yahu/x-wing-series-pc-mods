@@ -1,0 +1,23 @@
+﻿Source code for the modified OpenTIE in TIEFighterModInstaller.exe (OpenTIE v0.0.7 + 18 changes, c740e34).
+
+OpenTIE is free software (https://github.com/elyosh/OpenTIE); these changes are released under the same terms
+(GNU GPL version 3, see licenses\ in the installed folder).
+
+To rebuild: clone https://github.com/elyosh/OpenTIE, check out commit 8b24fb9ea9a06fd5f5dc9a675d6287fd71ef1c11
+(with its submodules), then apply the patches in OpenTIE\ in order:
+    git am OpenTIE/*.patch
+
+The aeron submodule also changed: apply the patches in aeron\ inside aeron/ (upstream submodule commit 6187f38bb417ebbf1fcfc775eb67a5d4b34e6689).
+
+The installer patches the official OpenTIE v0.0.7 Windows release
+(https://github.com/elyosh/OpenTIE/releases/tag/v0.0.7, opentie-0.0.7-windows-x86_64-release.zip,
+SHA-256 1943eeb5192b70d032c1298386862ad159f2e2643071fb4b998a72bd93e1138f), so the exe is built to run on that release's own DLLs. It was built
+with MSYS2 (MINGW64, GCC 16) using the scripts in build\:
+    build_ffmpeg.sh   FFmpeg 8.0.1 headers and import libraries, configured as upstream's
+                      packaging/windows/Dockerfile (the DLLs themselves come from the release)
+    mkimplib.sh       import libraries for the release's libspeexdsp.dll (and libcurl.dll)
+    speexdsp.pc       pkg-config file pointing SpeexDSP at that import library
+    build_rel.sh      configures and builds with libstdc++/libgcc/winpthread linked statically, strips
+                      the exe and runs checkimports.sh against the release folder
+Shaders and every other file are the release's own. The X-Wing vs TIE Fighter files the
+installer copies come from your own XvT install and are not part of the source.

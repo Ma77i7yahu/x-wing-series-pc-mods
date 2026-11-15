@@ -1,0 +1,369 @@
+From 4bbb6f2ce5287560cd3bb20152593dafcd228891 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 22:27:01 +1100
+Subject: [PATCH 35/59] XvT engine wash sound
+
+OpenXvT fsfx_UpdateFlightSfx: while the player is in engine wash, loop
+sd-lp-1.wav (Interdictor, Victory and Imperial Star Destroyers) or
+cal-flyb.wav (other ships), louder with the wash strength. collide.c keeps
+XvT's strongest-source/strength per wash update; engine_wash_sound.c plays
+the two WAVs (resources/xvt_engine_wash, copied from XvT by package_xw.sh)
+as iMUSE sound IDs 400-401, served by Dos94_gamesnd_GetSoundAddr outside
+X-Wing's bank slots. WAV-to-VOC loading is shared with the weapon sounds.
+---
+ CMakeLists.txt                           |  1 +
+ src/xw/audio/fsfx.c                      |  2 +
+ src/xw/flight/object/collide.c           | 26 ++++++-
+ src/xw/flight/object/collide.h           |  6 ++
+ src/xw_dos94/audio/fsfx.c                |  2 +
+ src/xw_dos94/audio/gamesnd.c             |  4 +-
+ src/xw_runtime/audio/engine_wash_sound.c | 87 ++++++++++++++++++++++++
+ src/xw_runtime/audio/engine_wash_sound.h | 20 ++++++
+ src/xw_runtime/audio/weapon_sounds.c     | 16 +++--
+ src/xw_runtime/audio/weapon_sounds.h     |  3 +
+ src/xw_runtime/runtime/flight_dispatch.c |  2 +
+ 11 files changed, 162 insertions(+), 7 deletions(-)
+ create mode 100644 src/xw_runtime/audio/engine_wash_sound.c
+ create mode 100644 src/xw_runtime/audio/engine_wash_sound.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7282701..3d74e04 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -209,6 +209,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/audio/output.c
+     src/xw_runtime/audio/flight_music.c
+     src/xw_runtime/audio/media_device.c
++    src/xw_runtime/audio/engine_wash_sound.c
+     src/xw_runtime/audio/player_engine.c
+     src/xw_runtime/audio/weapon_sounds.c
+     src/xw_dos94/audio/fsfx.c
+diff --git a/src/xw/audio/fsfx.c b/src/xw/audio/fsfx.c
+index e92e82b..1da90a8 100644
+--- a/src/xw/audio/fsfx.c
++++ b/src/xw/audio/fsfx.c
+@@ -3,6 +3,7 @@
+ #ifdef XW_MODERN
+ #include "xw_dos94/audio/fsfx.h"
+ #include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/player_engine.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+@@ -488,6 +489,7 @@ int16_t fsfx_speakeravailable(void) {
+ void fsfx_UpdatePlayerEngineLoop(void) {
+ #ifdef XW_MODERN
+ 	XwPlayerEngine_Update();
++	XwEngineWashSound_Update();
+ #else
+ 	int soundId;
+ 	int baseFrequency;
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index 7801979..f19d567 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -134,6 +134,10 @@ enum {
+ static int16_t s_washDamageOverride = -1;
+ static uint32_t s_washLastBucket = UINT32_MAX, s_washLastMessageTick;
+ static uint8_t s_washWasActive;
++/* XvT's engineWashSourceObjIdx/engineWashStrength: the strongest wash of the last update, for the sound. */
++static uint16_t s_washSource = XW_OBJECT_SLOT_UNAVAILABLE;
++static int s_washStrength;
++static uint32_t s_washStateTick;
+ 
+ static uint32_t collide_missionticks(void) {
+ 	uint32_t seconds = ((uint32_t)g_missionElapsedClock.hours * 60 + g_missionElapsedClock.minutes) * 60 +
+@@ -213,6 +217,10 @@ static int collide_enginewash(uint16_t sourceIndex) {
+ 					 COLLIDE_WASH_PERCENT;
+ 		if (damage > COLLIDE_WASH_MAX_DAMAGE)
+ 			damage = COLLIDE_WASH_MAX_DAMAGE;
++		if (damage > s_washStrength) {
++			s_washStrength = damage;
++			s_washSource = sourceIndex;
++		}
+ 		/* As XvT: with the shields down the wash only scorches the hull. */
+ 		if (g_playerFlightState.craft->shieldEnergy[XW_SHIELD_FRONT] +
+ 				g_playerFlightState.craft->shieldEnergy[XW_SHIELD_REAR] ==
+@@ -240,13 +248,18 @@ static int collide_enginewash(uint16_t sourceIndex) {
+ /* Every 29 mission ticks, as XvT, from the mission clock so replays repeat it exactly. */
+ static void collide_updateenginewash(void) {
+ 	if (!XwFlightTweaks_XvtEngineWash() || XwFlightTypes_Dos() || g_flightInvulnerabilityEnabled != 0 ||
+-		g_hyperspaceflag != 0 || g_playerFlightState.craft->objectKind != XW_CRAFT_OBJECT_KIND_0)
++		g_hyperspaceflag != 0 || g_playerFlightState.craft->objectKind != XW_CRAFT_OBJECT_KIND_0) {
++		s_washStrength = 0;
+ 		return;
++	}
+ 	uint32_t now = collide_missionticks();
+ 	uint32_t bucket = now / COLLIDE_WASH_UPDATE_TICKS;
+ 	if (bucket == s_washLastBucket)
+ 		return;
+ 	s_washLastBucket = bucket;
++	s_washStrength = 0;
++	s_washSource = XW_OBJECT_SLOT_UNAVAILABLE;
++	s_washStateTick = now;
+ 	int washed = 0;
+ 	for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
+ 		ObjectRecord* source = &g_objectTable[index];
+@@ -269,6 +282,17 @@ static void collide_updateenginewash(void) {
+ 	}
+ 	s_washWasActive = (uint8_t)washed;
+ }
++
++int collide_enginewashsound(uint16_t* sourceObjectType) {
++	uint32_t now = collide_missionticks();
++	/* A stale update (collisions not running: hyperspace, mission end) means no wash. */
++	if (s_washStrength <= 0 || s_washSource >= XW_CRAFT_OBJECT_COUNT || now < s_washStateTick ||
++		now - s_washStateTick > 2 * COLLIDE_WASH_UPDATE_TICKS ||
++		g_objectTable[s_washSource].objectType == XW_OBJ_NONE)
++		return 0;
++	*sourceObjectType = g_objectTable[s_washSource].objectType;
++	return s_washStrength;
++}
+ #endif
+ 
+ // FUNCTION: XW 0x402E10
+diff --git a/src/xw/flight/object/collide.h b/src/xw/flight/object/collide.h
+index ddd6205..d52d435 100644
+--- a/src/xw/flight/object/collide.h
++++ b/src/xw/flight/object/collide.h
+@@ -140,6 +140,12 @@ void collide_laserhitcraft(uint16_t projectileObjIdx, uint16_t craftObjIdx, int1
+ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_t sourceObjOrMissionPointRef,
+ 							uint16_t shieldSide);
+ 
++#ifdef XW_MODERN
++/* game.xvt_engine_wash: the strongest wash on the player in the latest update (XvT engineWashStrength, up to
++ * 64), or 0; *sourceObjectType gets the washing craft's object type. */
++int collide_enginewashsound(uint16_t* sourceObjectType);
++#endif
++
+ /* 0x405190 */
+ void collide_makeobjectexplosion(uint16_t objectIndex, uint8_t explosionObjectType);
+ 
+diff --git a/src/xw_dos94/audio/fsfx.c b/src/xw_dos94/audio/fsfx.c
+index 95fa701..b8b6cf8 100644
+--- a/src/xw_dos94/audio/fsfx.c
++++ b/src/xw_dos94/audio/fsfx.c
+@@ -8,6 +8,7 @@
+ #include "xw/util/memory.h"
+ #include "xw_dos94/audio/hilevel.h"
+ #include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/weapon_sounds.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+@@ -92,6 +93,7 @@ uint16_t Dos94_fsfx_loadsfx(const char* path) {
+ 	}
+ 	g_fsfxLoaded = 1;
+ 	XwWeaponSounds_Apply();
++	XwEngineWashSound_Load();
+ 	return (uint16_t)loaded;
+ failed: {
+ 	char error[256];
+diff --git a/src/xw_dos94/audio/gamesnd.c b/src/xw_dos94/audio/gamesnd.c
+index 939b4e6..0d97972 100644
+--- a/src/xw_dos94/audio/gamesnd.c
++++ b/src/xw_dos94/audio/gamesnd.c
+@@ -3,6 +3,7 @@
+ #include "xw/landru_config.h"
+ #include "xw/util/memory.h"
+ #include "xw_dos94/audio/fmusic.h"
++#include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/imuse_host.h"
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/audio/midi_backend.h"
+@@ -59,7 +60,8 @@ void* Dos94_gamesnd_GetSoundAddr(intptr_t soundId) {
+ 			return Dos94_fmusic_GetPagedSound((uint16_t)(soundId - 500));
+ 		if (soundId >= FSFX_FIRST_PLAYABLE_SLOT && soundId < FSFX_SOUND_HANDLE_COUNT)
+ 			return Memory_LockHandle(g_fsfxLoadedSoundHandles[soundId]);
+-		return NULL;
++		/* Modern addition: XvT's engine wash loops. */
++		return XwEngineWashSound_Data(soundId);
+ 	}
+ 	if (g_gameSoundMode != 1 || !soundId || soundId == -1)
+ 		return NULL;
+diff --git a/src/xw_runtime/audio/engine_wash_sound.c b/src/xw_runtime/audio/engine_wash_sound.c
+new file mode 100644
+index 0000000..335a12b
+--- /dev/null
++++ b/src/xw_runtime/audio/engine_wash_sound.c
+@@ -0,0 +1,87 @@
++#include "xw_runtime/audio/engine_wash_sound.h"
++#include "xw/audio/fsfx.h"
++#include "xw/flight/object/collide.h"
++#include "xw/flight/object/object.h"
++#include "xw/flight/player/user.h"
++#include "xw/frontend/shell_preferences.h"
++#include "xw/util/memory.h"
++#include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/weapon_sounds.h"
++#include "xw_runtime/config/flight_tweaks.h"
++#include "xw_runtime/runtime/flight_types.h"
++#include <aeron/log.h>
++
++/* OpenXvT sounds 78 and 79 (SFXBLAST.LST from ID 4). */
++static const char* const g_washFiles[XW_ENGINE_WASH_SOUND_COUNT] = { "xvt_engine_wash/sd-lp-1.wav",
++																	 "xvt_engine_wash/cal-flyb.wav" };
++static uint16_t g_washHandles[XW_ENGINE_WASH_SOUND_COUNT];
++
++void XwEngineWashSound_Free(void) {
++	for (unsigned i = 0; i < XW_ENGINE_WASH_SOUND_COUNT; ++i) {
++		if (g_dos94Imuse) {
++			imuse_stop_sound(g_dos94Imuse, XW_ENGINE_WASH_SOUND_FIRST_ID + i);
++			imuse_forget_sound(g_dos94Imuse, XW_ENGINE_WASH_SOUND_FIRST_ID + i);
++		}
++		if (g_washHandles[i])
++			Memory_FreeHandle(g_washHandles[i]);
++		g_washHandles[i] = 0;
++	}
++}
++
++void XwEngineWashSound_Load(void) {
++	XwEngineWashSound_Free();
++	if (!XwFlightTweaks_XvtEngineWash())
++		return;
++	for (unsigned i = 0; i < XW_ENGINE_WASH_SOUND_COUNT; ++i) {
++		g_washHandles[i] = XwWeaponSounds_LoadWav(g_washFiles[i]);
++		if (!g_washHandles[i])
++			Aeron_LogWarn("xw.audio", "XvT engine wash sound %s is missing or unsupported", g_washFiles[i]);
++	}
++}
++
++void* XwEngineWashSound_Data(intptr_t soundId) {
++	intptr_t index = soundId - XW_ENGINE_WASH_SOUND_FIRST_ID;
++	if (index < 0 || index >= XW_ENGINE_WASH_SOUND_COUNT || !g_washHandles[index])
++		return NULL;
++	return Memory_LockHandle(g_washHandles[index]);
++}
++
++void XwEngineWashSound_Update(void) {
++	imuse_t* im = g_dos94Imuse;
++	if (!im)
++		return;
++	int playing = -1;
++	int volume = 0;
++	uint16_t sourceType = 0;
++	int strength = 0;
++	if (ShellPreferences_GetSfxEnabled() && g_flightSfxEnabled && g_flightSfxVolume &&
++		!g_playerEngineLoopSuppressed)
++		strength = collide_enginewashsound(&sourceType);
++	if (strength > 0) {
++		uint8_t type = XwFlightTypes_CanonicalType(sourceType);
++		playing = type == XW_OBJ_INTERDICTOR || type == XW_OBJ_MODEL_VSD || type == XW_OBJ_IMPERIAL_STAR_DESTROYER
++					  ? 0
++					  : 1;
++		if (!g_washHandles[playing])
++			playing = -1;
++		/* XvT: 4 * exterior volume * strength / 10, capped at 127; full volume from about half strength. */
++		volume = strength * 127 / 32;
++		if (volume > 127)
++			volume = 127;
++		volume = volume * g_flightSfxVolume / 16;
++		if (volume > 127)
++			volume = 127;
++	}
++	for (int i = 0; i < XW_ENGINE_WASH_SOUND_COUNT; ++i)
++		if (i != playing && imuse_get_param(im, XW_ENGINE_WASH_SOUND_FIRST_ID + i, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)
++			imuse_stop_sound(im, XW_ENGINE_WASH_SOUND_FIRST_ID + i);
++	if (playing < 0)
++		return;
++	intptr_t id = XW_ENGINE_WASH_SOUND_FIRST_ID + playing;
++	if (!(imuse_get_param(im, id, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)) {
++		if (imuse_start_wave(im, id, 127, IMUSE_WAVE_START_LOOP))
++			return;
++		imuse_set_param(im, id, IMUSE_PARAM_SOUND_GROUP, IMUSE_GROUP_SFX);
++	}
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_VOL, volume);
++}
+diff --git a/src/xw_runtime/audio/engine_wash_sound.h b/src/xw_runtime/audio/engine_wash_sound.h
+new file mode 100644
+index 0000000..bffe402
+--- /dev/null
++++ b/src/xw_runtime/audio/engine_wash_sound.h
+@@ -0,0 +1,20 @@
++#ifndef XW_RUNTIME_AUDIO_ENGINE_WASH_SOUND_H
++#define XW_RUNTIME_AUDIO_ENGINE_WASH_SOUND_H
++
++#include <stdint.h>
++
++/* game.xvt_engine_wash: X-Wing vs TIE Fighter's engine wash loops (OpenXvT fsfx_UpdateFlightSfx), read from
++ * RESOURCE xvt_engine_wash/ (copied from an XvT installation at packaging time). Star destroyers and the
++ * Interdictor rumble with sd-lp-1, everything else with cal-flyb; louder the stronger the wash. The two waves
++ * play under their own iMUSE sound IDs, outside X-Wing's bank slots and paged music. */
++enum { XW_ENGINE_WASH_SOUND_FIRST_ID = 400, XW_ENGINE_WASH_SOUND_COUNT = 2 };
++
++/* Call after the flight sound bank loads; XwEngineWashSound_Free when it is released. */
++void XwEngineWashSound_Load(void);
++void XwEngineWashSound_Free(void);
++/* Dos94_gamesnd_GetSoundAddr: the VOC data for one of the wash sound IDs, or NULL. */
++void* XwEngineWashSound_Data(intptr_t soundId);
++/* Once per frame, beside the player engine loop. */
++void XwEngineWashSound_Update(void);
++
++#endif
+diff --git a/src/xw_runtime/audio/weapon_sounds.c b/src/xw_runtime/audio/weapon_sounds.c
+index c71d502..0effd9d 100644
+--- a/src/xw_runtime/audio/weapon_sounds.c
++++ b/src/xw_runtime/audio/weapon_sounds.c
+@@ -77,6 +77,16 @@ static uint16_t WavToVoc(const uint8_t* wav, size_t size) {
+ 	return handle;
+ }
+ 
++uint16_t XwWeaponSounds_LoadWav(const char* path) {
++	uint8_t* data = NULL;
++	size_t size = 0;
++	uint16_t handle = 0;
++	if (AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 20, &data, &size))
++		handle = WavToVoc(data, size);
++	free(data);
++	return handle;
++}
++
+ void XwWeaponSounds_Apply(void) {
+ 	if (!XwConfig_Settings()->xvt_weapon_sounds)
+ 		return;
+@@ -84,11 +94,7 @@ void XwWeaponSounds_Apply(void) {
+ 	for (unsigned i = 0; i < 6; ++i) {
+ 		char path[64];
+ 		snprintf(path, sizeof path, "xvt_weapon_sounds/%s.WAV", g_xvtCannonSounds[i]);
+-		uint8_t* data = NULL;
+-		size_t size = 0;
+-		if (AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 20, &data, &size))
+-			handles[i] = WavToVoc(data, size);
+-		free(data);
++		handles[i] = XwWeaponSounds_LoadWav(path);
+ 		if (!handles[i]) {
+ 			Aeron_LogWarn("xw.audio", "XvT weapon sound %s is missing or unsupported; keeping X-Wing's", path);
+ 			for (unsigned j = 0; j < i; ++j)
+diff --git a/src/xw_runtime/audio/weapon_sounds.h b/src/xw_runtime/audio/weapon_sounds.h
+index 0a84609..614f35f 100644
+--- a/src/xw_runtime/audio/weapon_sounds.h
++++ b/src/xw_runtime/audio/weapon_sounds.h
+@@ -9,5 +9,8 @@
+  * copied from an XvT installation at packaging time). Call after the flight sound bank loads. */
+ /* X-Wing's charged shots (projectile 144/148) keep their heavier slot, so they get XvT's heavier sounds. */
+ void XwWeaponSounds_Apply(void);
++/* Reads RESOURCE <path>, an 8-bit mono PCM WAV, into a new memory handle holding a Creative VOC that iMUSE
++ * plays. Returns 0 when the file is missing or in another format. */
++uint16_t XwWeaponSounds_LoadWav(const char* path);
+ 
+ #endif
+diff --git a/src/xw_runtime/runtime/flight_dispatch.c b/src/xw_runtime/runtime/flight_dispatch.c
+index c81e239..aa6787c 100644
+--- a/src/xw_runtime/runtime/flight_dispatch.c
++++ b/src/xw_runtime/runtime/flight_dispatch.c
+@@ -17,6 +17,7 @@
+ #include "xw_dos94/flight/special_world.h"
+ #include "xw_dos94/render/display.h"
+ #include "xw_dos94/render/world.h"
++#include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/runtime/flight_mode.h"
+ #include "xw_runtime/runtime/flight_types.h"
+@@ -39,6 +40,7 @@ void XwFlightMode_UnloadSounds(void) {
+ 			Memory_FreeHandle(g_fsfxLoadedSoundHandles[i]);
+ 		g_fsfxLoadedSoundHandles[i] = 0;
+ 	}
++	XwEngineWashSound_Free();
+ 	g_fsfxLoaded = 0;
+ 	g_fsfxVoiceQueueCount = 0;
+ 	g_fsfxCurrentVoiceSfxSlot = FSFX_NO_VOICE_SLOT;

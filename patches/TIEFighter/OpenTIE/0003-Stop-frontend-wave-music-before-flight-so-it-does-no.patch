@@ -1,0 +1,26 @@
+From d62d71b57536bb3b63008e0e7fae1113910fd667 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Fri, 9 Oct 2026 21:49:17 +1100
+Subject: [PATCH 03/18] Stop frontend wave music before flight so it does not
+ loop under CD music
+
+---
+ src/tie/shell.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/tie/shell.c b/src/tie/shell.c
+index 277ef7b..cdc09ef 100644
+--- a/src/tie/shell.c
++++ b/src/tie/shell.c
+@@ -182,6 +182,11 @@ int32_t shell_Shell(int32_t scene, int32_t script) {
+ 				}
+ 			}
+ 			continuation->owns_tie98_music = owns_music;
++			/* The frontend score (e.g. the combat chamber's fightpod.wav) streams
++			 * through a looping buffer that only the frontend refills; stop it
++			 * before flight so it does not loop under the in-flight CD music. */
++			if (flight_scene && TieMusicPolicy_UsesTie98())
++				FrontendWaveStream_Shutdown();
+ 			if (flight_scene) {
+ 				TieDiagnostics_Log(TIE_LOG_INFO, "[SHELL] scene %d\n", cur_scene);
+ 				shellext_Open_Landru_Scene(cur_scene);

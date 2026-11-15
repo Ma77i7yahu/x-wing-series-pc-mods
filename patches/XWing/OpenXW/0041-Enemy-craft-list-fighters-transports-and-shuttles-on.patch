@@ -1,0 +1,28 @@
+From 84ea8cfc834acd3df25f4c475d6dc871aa08fd38 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 23:35:46 +1100
+Subject: [PATCH 41/59] Enemy craft list: fighters, transports and shuttles
+ only
+
+---
+ src/xw_runtime/snapshot/render_readout.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index d0ad247..cad25de 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -391,8 +391,12 @@ static void CaptureCraftList(XwSnapCraftList* list) {
+ 	uint16_t rows[XW_CRAFT_OBJECT_COUNT];
+ 	unsigned count = 0;
+ 	if (mode == USER_CRAFT_LIST_ENEMY) {
++		/* Only the craft a pilot fights: fighters, transports and shuttles. Freighters, containers, tugs
++		 * and starships stay off it. */
+ 		for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index)
+-			if (ListedCraft(index) && Relation(index) == 1)
++			if (ListedCraft(index) && Relation(index) == 1 &&
++				(g_objectTable[index].genusId == XW_GENUS_STARFIGHTER ||
++				 g_objectTable[index].genusId == XW_GENUS_TRANSPORT))
+ 				rows[count++] = index;
+ 	} else {
+ 		/* The player's own flight group first, then the other friendly ones in mission order. */

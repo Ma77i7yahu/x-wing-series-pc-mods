@@ -1,0 +1,43 @@
+From 8d1170cacdf1cae092284f6143a689a7ee7edfd9 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Fri, 9 Oct 2026 21:21:27 +1100
+Subject: [PATCH] Add Aeron_ClearWindowAspectRatio
+
+---
+ include/aeron/aeron.h | 2 ++
+ src/window.c          | 9 +++++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/include/aeron/aeron.h b/include/aeron/aeron.h
+index c986a77..6cb3be2 100644
+--- a/include/aeron/aeron.h
++++ b/include/aeron/aeron.h
+@@ -95,6 +95,8 @@ int Aeron_GetWindowSize(int* width, int* height);
+ /* Constrains ordinary window resizing to one width:height ratio. Fixed-size
+  * states such as fullscreen defer the constraint until they are left. */
+ int Aeron_SetWindowAspectRatio(int aspect_width, int aspect_height);
++/* Removes the aspect constraint so the window may take any shape. */
++void Aeron_ClearWindowAspectRatio(void);
+ /* Adjusts an ordinary window to the requested aspect while keeping it inside
+  * the current display's usable bounds. Fixed-size states are left unchanged. */
+ int Aeron_ResizeWindowToAspect(int aspect_width, int aspect_height);
+diff --git a/src/window.c b/src/window.c
+index 502d375..ede1873 100644
+--- a/src/window.c
++++ b/src/window.c
+@@ -176,6 +176,15 @@ int Aeron_SetWindowAspectRatio(int aspect_width, int aspect_height) {
+ 	return Aeron_ApplyWindowAspectRatio();
+ }
+ 
++void Aeron_ClearWindowAspectRatio(void) {
++	g_aeron.window_aspect_width   = 0;
++	g_aeron.window_aspect_height  = 0;
++	g_aeron.window_aspect_pending = 0;
++	if (g_aeron.window && !SDL_SetWindowAspectRatio(g_aeron.window, 0.0f, 0.0f)) {
++		Aeron_LogWarn("aeron", "SDL_SetWindowAspectRatio failed: %s", SDL_GetError());
++	}
++}
++
+ void Aeron_ApplyPendingWindowAspectRatio(void) {
+ 	if (g_aeron.window_aspect_pending) {
+ 		Aeron_ApplyWindowAspectRatio();

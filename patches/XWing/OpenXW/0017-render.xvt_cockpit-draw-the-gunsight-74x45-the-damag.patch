@@ -1,0 +1,23 @@
+From c1bbacaf08e72f49f26adc33404e22113783cb2f Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 17:28:16 +1100
+Subject: [PATCH 17/59] render.xvt_cockpit: draw the gunsight (74x45); the
+ damage overlay size cut-off was hiding its green in-range state
+
+---
+ src/xw_remaster/xvt_cockpit.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index 794eb5f..656f310 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -16,7 +16,7 @@ bool XwXvtCockpit_Element(const XwHudDraw* draw, unsigned index, int* dx, int* d
+  * X-Wing's art. */
+ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* draw, unsigned index, const XwSnapWidget* widget);
+ /* Instrument sprites larger than this many pixels are X-Wing's damage overlays, which do not fit XvT art. */
+-enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 3000 };
++enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 4000 }; /* The gunsight (74x45) is smaller; the overlays are larger. */
+ /* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).
+  * `plain` drops the pane's fills and text backgrounds. */
+ bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int* dx, int* dy, bool* plain);

@@ -1,0 +1,290 @@
+From a6ab6a91fb95504aec2b2e4d02ada3318440e79e Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 17:12:00 +1100
+Subject: [PATCH 15/59] render.xvt_cockpit: shields and hull drawn with XvT's
+ own panel sprites (<panel>.pnl), colored by level as Hud_DrawShieldStrength2D
+ does; packaging copies the BoP .pnl files
+
+---
+ src/xw_remaster/hud_instruments.c |   2 +
+ src/xw_remaster/xvt_cockpit.c     | 213 +++++++++++++++++++++++++++++-
+ src/xw_remaster/xvt_cockpit.h     |   3 +
+ 3 files changed, 216 insertions(+), 2 deletions(-)
+
+diff --git a/src/xw_remaster/hud_instruments.c b/src/xw_remaster/hud_instruments.c
+index 75ef3e4..34d8fe0 100644
+--- a/src/xw_remaster/hud_instruments.c
++++ b/src/xw_remaster/hud_instruments.c
+@@ -64,6 +64,8 @@ bool XwHudDraw_Instruments(const XwHudDraw* d) {
+ 		if (!w->visible)
+ 			continue;
+ 		if (d->xvt) {
++			if (XwXvtCockpit_DrawInstrument(d, i, w))
++				continue;
+ 			int dx, dy;
+ 			if (!XwXvtCockpit_Element(d, i, &dx, &dy))
+ 				continue;
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 71996fa..93c7849 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -58,12 +58,13 @@ typedef struct Descriptor {
+ } Descriptor;
+ 
+ typedef struct Element {
+-	int16_t x, y, selector, color;
++	int16_t x, y, selector, color, width; /* width: clip width, or the fade base of a shield sprite. */
+ } Element;
+ 
+ typedef struct Craft {
+ 	char name[8]; /* "xwing", "ywing", "awing", "bwing". */
+ 	bool loaded;
++	char panel[10]; /* Panel sprite file: XWINGP and so on. */
+ 	Descriptor views[DESCRIPTORS];
+ 	Element elements[ELEMENTS];
+ } Craft;
+@@ -132,7 +133,11 @@ static bool LoadCraft(const char* name) {
+ 	for (unsigned i = 0; i < ELEMENTS; ++i) {
+ 		const uint8_t* p = bytes + DESCRIPTORS * DESCRIPTOR_BYTES + i * ELEMENT_BYTES;
+ 		g_craft.elements[i] = (Element) { (int16_t)U16(p), (int16_t)U16(p + 2), (int16_t)U16(p + 4),
+-										  (int16_t)U16(p + 6) };
++										  (int16_t)U16(p + 6), (int16_t)U16(p + 8) };
++	}
++	if (size >= DESCRIPTORS * DESCRIPTOR_BYTES + ELEMENTS * ELEMENT_BYTES + 9) {
++		memcpy(g_craft.panel, bytes + DESCRIPTORS * DESCRIPTOR_BYTES + ELEMENTS * ELEMENT_BYTES, 9);
++		g_craft.panel[9] = 0;
+ 	}
+ 	free(bytes);
+ 	snprintf(g_craft.name, sizeof g_craft.name, "%s", name);
+@@ -643,6 +648,209 @@ void XwXvtCockpit_PaneText(const XwRenderSnapshot* s, unsigned pane, char* out,
+ 	out[n] = 0;
+ }
+ 
++/* ---- XvT's own panel sprites (<panel>.pnl), for instruments whose X-Wing art is coarser ---- */
++
++enum { SPRITE_CACHE = 96, PLAIN = 255, PNL_MAX_RECORDS = 400 };
++
++typedef struct Sprite {
++	uint16_t frame, width, height;
++	uint8_t key, level;
++	AeronTexture* texture;
++} Sprite;
++
++/* Hud_DrawShieldStrength2D's colors by shield level: 0 empty, 1-9 charge, 10 hit flash. */
++static const uint8_t kShieldColors[11] = { 0x2c, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3a, 0x3c, 0x3d, 0x3e, 0x2e };
++
++static Sprite g_sprites[SPRITE_CACHE];
++static unsigned g_sprite_count;
++static uint32_t g_sprite_palette_hash;
++static uint8_t* g_panel_bytes;
++static AeronPnlList g_panel;
++static char g_panel_for[24];
++static uint32_t g_cockpit_colors[64];
++static bool g_cockpit_colors_valid;
++
++static void ReleaseSprites(void) {
++	for (unsigned i = 0; i < g_sprite_count; ++i)
++		Aeron_DestroyTexture(g_sprites[i].texture);
++	memset(g_sprites, 0, sizeof g_sprites);
++	g_sprite_count = 0;
++}
++
++static void ReleasePanel(void) {
++	ReleaseSprites();
++	AeronPnl_Free(&g_panel);
++	free(g_panel_bytes);
++	g_panel_bytes = NULL;
++	g_panel_for[0] = 0;
++	g_cockpit_colors_valid = false;
++}
++
++/* The panel sprites and the forward cockpit's 64 colors, which the sprites draw with. */
++static bool LoadPanel(void) {
++	char id[24];
++	snprintf(id, sizeof id, "%s/%s", g_craft.name, g_craft.panel);
++	if (!strcmp(g_panel_for, id))
++		return g_panel.count > 0;
++	ReleasePanel();
++	snprintf(g_panel_for, sizeof g_panel_for, "%s", id);
++	char path[64];
++	snprintf(path, sizeof path, "xvt_cockpit/%s.pnl", g_craft.panel);
++	for (char* c = path; *c; ++c)
++		*c = (char)tolower((unsigned char)*c);
++	size_t size = 0;
++	if (!g_craft.panel[0] ||
++		!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 22, &g_panel_bytes, &size)) {
++		Aeron_LogWarn("xw.hud", "XvT panel sprites %s are missing", path);
++		return false;
++	}
++	/* Trailing padding fails a parse past the last record; keep the longest list that parses. */
++	unsigned count = 1;
++	AeronPnlList probe = { 0 };
++	while (count < PNL_MAX_RECORDS && AeronPnl_Parse(g_panel_bytes, size, count + 1, &probe, NULL)) {
++		AeronPnl_Free(&probe);
++		++count;
++	}
++	if (!AeronPnl_Parse(g_panel_bytes, size, count, &g_panel, NULL))
++		return false;
++	snprintf(path, sizeof path, "xvt_cockpit/%s.lfd", g_craft.views[0].lfd);
++	for (char* c = path; *c; ++c)
++		*c = (char)tolower((unsigned char)*c);
++	uint8_t* bytes = NULL;
++	AeronLfd lfd = { 0 };
++	if (AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 22, &bytes, &size) &&
++		AeronLfd_Parse(bytes, size, &lfd, NULL)) {
++		const AeronLfdEntry* pltt = AeronLfd_Find(&lfd, AERON_LFD_FOURCC('P', 'L', 'T', 'T'));
++		if (pltt && pltt->size >= 2 && pltt->data[0] == 0 && pltt->data[1] >= 63 && pltt->size >= 2 + 64 * 3) {
++			for (unsigned i = 0; i < 64; ++i) {
++				uint32_t argb = 0xff000000u;
++				for (unsigned c = 0; c < 3; ++c) {
++					unsigned v = pltt->data[2 + i * 3 + c] >> 2;
++					argb |= (uint32_t)((v << 2) | (v >> 4)) << (16 - 8 * c);
++				}
++				g_cockpit_colors[i] = argb;
++			}
++			g_cockpit_colors_valid = true;
++		}
++	}
++	AeronLfd_Free(&lfd);
++	free(bytes);
++	return g_cockpit_colors_valid;
++}
++
++/* Sprite `frame`, with `key` transparent. At a shield level, XvT's faded blit moves the sprite's color ramp
++ * (starting at index `fade`) to the level's color; level 0 draws it in the empty color. */
++static const Sprite* GetSprite(unsigned frame, unsigned key, unsigned level, int fade, const uint32_t flight[256]) {
++	uint32_t colors[256];
++	memcpy(colors, flight, sizeof colors);
++	memcpy(colors, g_cockpit_colors, sizeof g_cockpit_colors);
++	uint32_t hash = Hash(colors);
++	if (hash != g_sprite_palette_hash) {
++		ReleaseSprites();
++		g_sprite_palette_hash = hash;
++	}
++	for (unsigned i = 0; i < g_sprite_count; ++i)
++		if (g_sprites[i].frame == frame && g_sprites[i].key == key && g_sprites[i].level == level)
++			return g_sprites[i].texture ? &g_sprites[i] : NULL;
++	if (frame >= g_panel.count)
++		return NULL;
++	if (g_sprite_count == SPRITE_CACHE)
++		ReleaseSprites();
++	Sprite* sprite = &g_sprites[g_sprite_count++];
++	*sprite = (Sprite) { (uint16_t)frame, 0, 0, (uint8_t)key, (uint8_t)level, NULL };
++	AeronIndexedFrame bitmap = { 0 };
++	AeronByteSpan span = g_panel.bitmaps[frame];
++	if (!AeronPnl_DecodeIndexed(span.data, span.size, 0, (int)key, &bitmap, NULL))
++		return NULL;
++	size_t pixels = (size_t)bitmap.width * bitmap.height;
++	uint8_t* rgba = malloc(pixels * 4);
++	if (rgba) {
++		for (size_t i = 0; i < pixels; ++i) {
++			uint32_t argb = 0;
++			if (bitmap.coverage[i]) {
++				unsigned index = bitmap.indices[i];
++				if (level != PLAIN)
++					index = level == 0 ? kShieldColors[0] : (uint8_t)(index - fade + kShieldColors[level]);
++				argb = colors[index & 255];
++			}
++			bool covered = bitmap.coverage[i] != 0;
++			rgba[i * 4 + 0] = covered ? (uint8_t)(argb >> 16) : 0;
++			rgba[i * 4 + 1] = covered ? (uint8_t)(argb >> 8) : 0;
++			rgba[i * 4 + 2] = covered ? (uint8_t)argb : 0;
++			rgba[i * 4 + 3] = covered ? 255 : 0;
++		}
++		AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
++		AeronTexture* texture = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
++										  .width = bitmap.width,
++										  .height = bitmap.height,
++										  .format = AERON_TEXTURE_FORMAT_RGBA8_SRGB,
++										  .usage = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
++										  .debug_name = "xw.xvt_cockpit_part" })
++									: NULL;
++		if (texture && Aeron_UploadTextureDataCmd(cmd, &(AeronTextureUploadDesc) { .texture = texture,
++																				   .width = bitmap.width,
++																				   .height = bitmap.height,
++																				   .raw_data = rgba,
++																				   .raw_size = pixels * 4 }) &&
++			Aeron_SubmitCommandBuffer(cmd)) {
++			sprite->texture = texture;
++			sprite->width = bitmap.width;
++			sprite->height = bitmap.height;
++		} else {
++			if (cmd)
++				Aeron_CancelCommandBuffer(cmd);
++			Aeron_DestroyTexture(texture);
++		}
++		free(rgba);
++	}
++	AeronIndexedFrame_Free(&bitmap);
++	return sprite->texture ? sprite : NULL;
++}
++
++static void DrawSprite(const XwHudDraw* d, const Sprite* sprite, int x, int y) {
++	float shift = d->edge_shift > 0 ? XwHudDraw_PaneShift(d, x, x + sprite->width) : 0;
++	AeronDrawList2DSprite s = { .texture = sprite->texture,
++								.src_u0 = 0,
++								.src_v0 = 0,
++								.src_u1 = 1,
++								.src_v1 = 1,
++								.dst_x = d->offset_x + shift + x * d->layout.scale_x,
++								.dst_y = d->offset_y + y * d->layout.scale_y,
++								.dst_w = sprite->width * d->layout.scale_x,
++								.dst_h = sprite->height * d->layout.scale_y,
++								.tint = { 1, 1, 1, 1 },
++								.blend = AERON_BLIT2D_BLEND_PMA,
++								.filter = AERON_BLIT2D_FILTER_NEAREST };
++	AeronDrawList_AddSprite(d->list, &s);
++}
++
++bool XwXvtCockpit_DrawInstrument(const XwHudDraw* d, unsigned index, const XwSnapWidget* w) {
++	unsigned view = d->snapshot->cockpit.view;
++	bool shield = index >= EL_SHIELD_FIRST && index < EL_SHIELD_FIRST + 4;
++	if ((view != 0 && view != VIEW_HUD) || (!shield && index != EL_HULL) || w->kind != XW_SNAP_WIDGET_SPRITE ||
++		!LoadPanel())
++		return false;
++	/* X-Wing's front, front overcharge, rear, rear overcharge and hull are XvT's 35-38 and 39. */
++	const Element* e = &g_craft.elements[shield ? 35 + (index - EL_SHIELD_FIRST) : XVT_HULL];
++	if (!Placed(e) || e->selector < 0 || (uint16_t)e->color == 0xFFFF)
++		return false;
++	int x = e->x, y = e->y;
++	if (view == VIEW_HUD) {
++		const Element *fwd = &g_craft.elements[XVT_HULL], *hud = &g_craft.elements[HUD_BASE + XVT_HULL];
++		x += hud->x - fwd->x;
++		y += hud->y - fwd->y;
++	}
++	const Sprite* sprite =
++		shield ? GetSprite((unsigned)e->selector, (unsigned)e->color, w->value < 10 ? w->value : 10, e->width,
++						   d->snapshot->cockpit.palette_argb)
++			   : GetSprite((unsigned)e->selector + (w->value < 3 ? w->value : 3), (unsigned)e->color, PLAIN, 0,
++						   d->snapshot->cockpit.palette_argb);
++	if (!sprite)
++		return false;
++	DrawSprite(d, sprite, x, y);
++	return true;
++}
++
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
+ 	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 && !strcmp(g_craft.name, "xwing");
+ }
+@@ -656,6 +864,7 @@ bool XwXvtCockpit_XvtPosition(unsigned index, int* x, int* y) {
+ }
+ 
+ void XwXvtCockpit_Shutdown(void) {
++	ReleasePanel();
+ 	for (unsigned i = 0; i < ART_CACHE; ++i)
+ 		Aeron_DestroyTexture(g_art[i].texture);
+ 	memset(g_art, 0, sizeof g_art);
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+index bcb4d45..794eb5f 100644
+--- a/src/xw_remaster/xvt_cockpit.h
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -12,6 +12,9 @@ bool XwXvtCockpit_Active(const XwRenderSnapshot* snapshot);
+ bool XwXvtCockpit_DrawBase(const XwHudDraw* draw);
+ /* Where X-Wing element `index` draws: classic-pixel offset from its X-Wing position. False hides it. */
+ bool XwXvtCockpit_Element(const XwHudDraw* draw, unsigned index, int* dx, int* dy);
++/* Draws X-Wing widget `index` with XvT's own sprite (shields and hull), as XvT colors it. False leaves it to
++ * X-Wing's art. */
++bool XwXvtCockpit_DrawInstrument(const XwHudDraw* draw, unsigned index, const XwSnapWidget* widget);
+ /* Instrument sprites larger than this many pixels are X-Wing's damage overlays, which do not fit XvT art. */
+ enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 3000 };
+ /* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).

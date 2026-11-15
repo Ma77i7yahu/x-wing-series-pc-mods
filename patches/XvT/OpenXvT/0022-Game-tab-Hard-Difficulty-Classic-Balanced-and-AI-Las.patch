@@ -1,0 +1,108 @@
+From 4281094e2fb0d741c5bb32b6f778fa8066c43479 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 06:31:49 +1100
+Subject: [PATCH 22/25] Game tab: Hard Difficulty (Classic/Balanced) and AI
+ Laser & Ion Linking options
+
+---
+ src/xvt_app/settings/settings.c | 20 +++++++++++++++++
+ src/xvt_runtime/config/config.c | 39 +++++++++++++++++++++++++++++++++
+ src/xvt_runtime/config/config.h |  4 ++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/src/xvt_app/settings/settings.c b/src/xvt_app/settings/settings.c
+index 239d468..577d39e 100644
+--- a/src/xvt_app/settings/settings.c
++++ b/src/xvt_app/settings/settings.c
+@@ -57,6 +57,26 @@ static void XvtSettingsMenu_DrawGame(AeronUiContext* ui, const AeronInputSnapsho
+ 																		 : "Active mission: 31.25 Hz");
+ 	}
+ 	AeronUi_Spacer(ui, 8.0f);
++	AeronUi_Header(ui, "AI");
++	static const char* const hard_ai_labels[] = { "Classic", "Balanced" };
++	int hard_ai = XvtConfig_Settings()->hard_keeps_friendly_skill != 0;
++	if (AeronUi_Selector(ui, "Hard Difficulty", &hard_ai, hard_ai_labels, 2)) {
++		char error[1024];
++		if (!XvtConfig_SetHardKeepsFriendlySkill(hard_ai != 0, error, sizeof error))
++			XvtSettingsMenu_ReportError(error);
++	}
++	AeronUi_Help(ui, hard_ai ? "Tougher enemies; single-player wingmen fly at full skill. Applies to the next mission."
++							 : "Original: tougher enemies and weaker wingmen. Applies to the next mission.");
++	static const char* const ion_link_labels[] = { "Off", "Friendly Only", "All Craft" };
++	int ion_link = XvtConfig_Settings()->ai_ion_link;
++	if (AeronUi_Selector(ui, "AI Laser & Ion Linking", &ion_link, ion_link_labels, 3)) {
++		char error[1024];
++		if (!XvtConfig_SetAiIonLink(ion_link, error, sizeof error))
++			XvtSettingsMenu_ReportError(error);
++	}
++	AeronUi_Help(ui, ion_link == 0 ? "Original: AI craft fire lasers, and ion cannons only on disable orders."
++									: "AI Y-Wings, B-Wings, Gunboats etc. fire ions with lasers (ions only to disable).");
++	AeronUi_Spacer(ui, 8.0f);
+ 	XvtInstallationPage_Draw(ui, input);
+ }
+ 
+diff --git a/src/xvt_runtime/config/config.c b/src/xvt_runtime/config/config.c
+index 2042110..f9151fc 100644
+--- a/src/xvt_runtime/config/config.c
++++ b/src/xvt_runtime/config/config.c
+@@ -497,6 +497,45 @@ bool XvtConfig_SetSkipIntro(bool enabled, char* error, size_t capacity) {
+ 	return success;
+ }
+ 
++bool XvtConfig_SetHardKeepsFriendlySkill(bool enabled, char* error, size_t capacity) {
++	AeronConfigFile* updated = NULL;
++	AeronConfigError detail;
++	if (!g_writable)
++		return XvtConfig_Error(error, capacity, "configuration saving is disabled", NULL);
++	if (!AeronConfigFile_Clone(g_user, &updated, &detail))
++		return XvtSettings_FileError(&detail, error, capacity);
++	bool success = enabled == (XvtConfig_DefaultSettings()->hard_keeps_friendly_skill != 0)
++					   ? AeronConfigFile_Remove(updated, "flight.hard_keeps_friendly_skill", &detail)
++					   : AeronConfigFile_SetBool(updated, "flight.hard_keeps_friendly_skill", enabled, &detail);
++	if (success)
++		success = XvtConfig_UpdateUser(updated, 0, error, capacity);
++	else
++		XvtSettings_FileError(&detail, error, capacity);
++	AeronConfigFile_Destroy(updated);
++	return success;
++}
++
++bool XvtConfig_SetAiIonLink(int mode, char* error, size_t capacity) {
++	static const char* const names[] = { "off", "friendly", "all" };
++	AeronConfigFile* updated = NULL;
++	AeronConfigError detail;
++	if (mode < 0 || mode > 2)
++		return XvtConfig_Error(error, capacity, "unsupported AI ion link mode", NULL);
++	if (!g_writable)
++		return XvtConfig_Error(error, capacity, "configuration saving is disabled", NULL);
++	if (!AeronConfigFile_Clone(g_user, &updated, &detail))
++		return XvtSettings_FileError(&detail, error, capacity);
++	bool success = mode == XvtConfig_DefaultSettings()->ai_ion_link
++					   ? AeronConfigFile_Remove(updated, "flight.ai_ion_link", &detail)
++					   : AeronConfigFile_SetString(updated, "flight.ai_ion_link", names[mode], &detail);
++	if (success)
++		success = XvtConfig_UpdateUser(updated, 0, error, capacity);
++	else
++		XvtSettings_FileError(&detail, error, capacity);
++	AeronConfigFile_Destroy(updated);
++	return success;
++}
++
+ int XvtConfig_Write(const GameConfig* game, char* error, size_t capacity) {
+ 	AeronConfigFile* updated = NULL;
+ 	AeronConfigError detail;
+diff --git a/src/xvt_runtime/config/config.h b/src/xvt_runtime/config/config.h
+index 2a9850f..c5e3706 100644
+--- a/src/xvt_runtime/config/config.h
++++ b/src/xvt_runtime/config/config.h
+@@ -29,6 +29,10 @@ int XvtConfig_SetGameData(const char* path, int save, char* error, size_t capaci
+ bool XvtConfig_SetFlightRate(bool unlocked, char* error, size_t capacity);
+ /* Updates the preference consumed at the next launch; Save persists it. */
+ bool XvtConfig_SetSkipIntro(bool enabled, char* error, size_t capacity);
++/* Consumed at the next mission start; Save persists it. */
++bool XvtConfig_SetHardKeepsFriendlySkill(bool enabled, char* error, size_t capacity);
++/* 0 off, 1 friendly, 2 all; takes effect immediately; Save persists it. */
++bool XvtConfig_SetAiIonLink(int mode, char* error, size_t capacity);
+ int XvtConfig_Apply(GameConfig* game, char* error, size_t capacity);
+ int XvtConfig_Write(const GameConfig* game, char* error, size_t capacity);
+ int XvtConfig_Save(char* error, size_t capacity);

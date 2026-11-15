@@ -1,0 +1,139 @@
+From f87b05bfa71d1f3590c89201917fd73d6698ee8f Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 08:27:14 +1100
+Subject: [PATCH 09/18] XvT HUD fixes: bind F / Shift+F, smaller top message,
+ erase TIE threat bars from the cockpit art
+
+---
+ resources/config.yaml                      |  4 ++
+ src/tie_remaster/flight/cockpit/renderer.c | 43 +++++++++++++++++++---
+ src/tie_runtime/input/actions.c            |  6 +++
+ src/tie_runtime/input/actions.h            |  4 ++
+ 4 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 6a84999..690939c 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -97,6 +97,10 @@ input:
+       - {key: "Up"}
+     info_next_item:
+       - {key: "Down"}
++    info_friendly_craft:
++      - {key: "F"}
++    info_enemy_craft:
++      - {key: "F", modifiers: [shift]}
+     fire_weapon: []
+     target_roll_throttle_modifier: []
+     target_next:
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index c6c1e09..0606196 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -601,6 +601,8 @@ static float s_lower_pivot_y = 0.0f;
+ static float s_lower_stretch_y = 1.0f;
+ /* Top row of the message line with flight.xvt_hud, in 640x480 rows. */
+ #define XVT_MESSAGE_TOP_Y 6
++/* Height of XvT's message text against TIE's message font. */
++#define XVT_MESSAGE_SCALE 0.6f
+ 
+ static float TieCockpitRenderer_LowerMapY(float y) {
+ 	return y <= s_lower_pivot_y ? y : s_lower_pivot_y + (y - s_lower_pivot_y) * s_lower_stretch_y;
+@@ -913,6 +915,22 @@ static void TieCockpitRenderer_ClearOriginalDigitFields(const TieCockpitRenderer
+ 	}
+ }
+ 
++/* flight.xvt_hud: the forward cockpit art paints TIE's three unlit warning
++ * bars (instruments 66-68) on the canopy above the gunsight; XvT's lights
++ * replace them, so that strip of canopy turns see-through. It is read when
++ * the art loads, so switching the option applies from the next cockpit. */
++static void TieCockpitRenderer_EraseTieThreatBars(TieRgbaFrame* base, const TieSnapshot* snap) {
++	const TieHudInstrument* first = &snap->hud.instruments[TIE_HUDI_WARN_INCOMING];
++	const TieHudInstrument* last = &snap->hud.instruments[TIE_HUDI_WARN_IMPACT];
++	if (!TieCockpitCommon_InstrumentActive(first) || !TieCockpitCommon_InstrumentActive(last))
++		return;
++	const int scale = snap->cockpit.classic_w == 640 ? 1 : 2; /* 320 cockpits use half-size bars */
++	const int x0 = first->x - 2, x1 = last->x + 14 / scale, y0 = first->y - 2, y1 = first->y + 8 / scale;
++	for (int y = y0 < 0 ? 0 : y0; y <= y1 && y < (int)base->height; ++y)
++		for (int x = x0 < 0 ? 0 : x0; x <= x1 && x < (int)base->width; ++x)
++			memset(&base->rgba[((size_t)y * base->width + x) * 4], 0, 4);
++}
++
+ static bool TieCockpitRenderer_PrepareOriginalBase(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+ 												   TieCockpitRendererEntry* entry, const TieSnapshot* snap,
+ 												   uint8_t palette[768]) {
+@@ -944,6 +962,8 @@ static bool TieCockpitRenderer_PrepareOriginalBase(TieCockpitRenderer* cg, Aeron
+ 							  palette, &complete_rows, &codec_error))
+ 		goto failed;
+ 	(void)complete_rows;
++	if (TieFlightTweaks_XvtHud() && snap->cockpit.view_idx == 0)
++		TieCockpitRenderer_EraseTieThreatBars(&base, snap);
+ 	static const int threat_digit_fields[] = { TIE_HUDI_THREAT_SHIELD_PCT, TIE_HUDI_THREAT_HULL_PCT };
+ 	TieCockpitRenderer_ClearOriginalDigitFields(cg, &base, snap, palette, 20, COCKPIT_BG_THREAT,
+ 												threat_digit_fields,
+@@ -2482,16 +2502,27 @@ static void TieCockpitRenderer_DrawMessageBar(TieCockpitRenderer* cg, AeronComma
+ 			.space_between_classic = 0.0f,
+ 			.fit = TIE_SCENE2D_TEXT_FIT_FILL,
+ 		};
++		int first = 0;
+ 		if (xvt && snap->hud.msg_bar.present) {
++			/* XvT's message font is about 3/5 the height of TIE's: the body
++			 * draws at that scale from the record's origin, centred. */
++			const float k = XVT_MESSAGE_SCALE;
+ 			const float w = TieScene2dTextRenderer_MeasureFestringClassic(
+ 				cg->text_renderer, TIE_FONT_DOMAIN_COCKPIT, recs[0].font_id, &message_space, recs[0].text);
+-			const float x = ((float)geometry.classic_w - w) * 0.5f;
+-			recs[0].x = (int16_t)(x > 0.0f ? x : 0.0f);
++			const float sx = geometry.text_scale_x * k, sy = geometry.scale_y * k;
++			recs[0].x = 0;
++			recs[0].y = 0;
++			TieScene2dTextRenderer_RecordFestringScaled(
++				cg->text_renderer, cg->record_list, geometry.classic_w, geometry.classic_h, &message_space, recs, 1,
++				snap->palette, ((float)target->target_w - w * sx) * 0.5f, (float)top_y * geometry.scale_y, sx, sy,
++				target->target_w, target->target_h);
++			first = 1;
+ 		}
+-		TieScene2dTextRenderer_RecordFestringScaled(
+-			cg->text_renderer, cg->record_list, geometry.classic_w, geometry.classic_h, &message_space, recs,
+-			n_recs, snap->palette, geometry.text_fit_x, 0.0f, geometry.text_scale_x, geometry.scale_y,
+-			target->target_w, target->target_h);
++		if (n_recs > first)
++			TieScene2dTextRenderer_RecordFestringScaled(
++				cg->text_renderer, cg->record_list, geometry.classic_w, geometry.classic_h, &message_space,
++				recs + first, n_recs - first, snap->palette, geometry.text_fit_x, 0.0f, geometry.text_scale_x,
++				geometry.scale_y, target->target_w, target->target_h);
+ 	}
+ }
+ 
+diff --git a/src/tie_runtime/input/actions.c b/src/tie_runtime/input/actions.c
+index b3fddf7..aa922e4 100644
+--- a/src/tie_runtime/input/actions.c
++++ b/src/tie_runtime/input/actions.c
+@@ -280,6 +280,12 @@ static const TieInputActionDef g_action_defs[TIE_INPUT_ACTION_COUNT] = {
+ 	[TIE_INPUT_ACTION_INFO_NEXT_ITEM] = { "info_next_item", "Next Item / Scroll Down",
+ 										  TIE_INPUT_ACTION_CATEGORY_INFORMATION,
+ 										  TIE_INPUT_ACTION_KIND_KEYPRESS_SCAN, 0x50 },
++	[TIE_INPUT_ACTION_INFO_FRIENDLY_CRAFT] = { "info_friendly_craft", "Friendly Craft List (XvT)",
++											   TIE_INPUT_ACTION_CATEGORY_INFORMATION,
++											   TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, 'f' },
++	[TIE_INPUT_ACTION_INFO_ENEMY_CRAFT] = { "info_enemy_craft", "Enemy Craft List (XvT)",
++											TIE_INPUT_ACTION_CATEGORY_INFORMATION,
++											TIE_INPUT_ACTION_KIND_KEYPRESS_ASCII, 'F' },
+ 
+ };
+ 
+diff --git a/src/tie_runtime/input/actions.h b/src/tie_runtime/input/actions.h
+index bd2becc..3a84352 100644
+--- a/src/tie_runtime/input/actions.h
++++ b/src/tie_runtime/input/actions.h
+@@ -115,6 +115,10 @@ typedef enum TieInputAction {
+ 	TIE_INPUT_ACTION_INFO_PREVIOUS_ITEM, /* Up — previous item / scroll up */
+ 	TIE_INPUT_ACTION_INFO_NEXT_ITEM,     /* Down — next item / scroll down */
+ 
++	/* Not in TIE Fighter: XvT's craft lists (flight.xvt_hud). */
++	TIE_INPUT_ACTION_INFO_FRIENDLY_CRAFT, /* F */
++	TIE_INPUT_ACTION_INFO_ENEMY_CRAFT,    /* Shift+F */
++
+ 	TIE_INPUT_ACTION_COUNT
+ } TieInputAction;
+ 

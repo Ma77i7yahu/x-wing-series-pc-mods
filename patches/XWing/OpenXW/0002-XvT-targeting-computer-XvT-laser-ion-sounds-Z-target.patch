@@ -1,0 +1,1463 @@
+From 2c697eb107e9d447a23279294e975557754688e3 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:12:23 +1100
+Subject: [PATCH 02/59] XvT targeting computer, XvT laser/ion sounds, Z target
+ view
+
+- render.xvt_targeting_computer: the CMD (and a floating copy with the
+  cockpit off) shows XvT's layout: target name, SHD/HULL/SYS, a live 3D
+  model of the target seen along the pilot's line of sight, orders (word
+  wrapped), cargo or order target, and range. X-Wing's own CMD panes and
+  lock cross are hidden while it is on. 1998 flight only.
+- audio.xvt_weapon_sounds: the six cannon bolt sounds come from XvT's WAVs
+  (resources/xvt_weapon_sounds, copied at packaging), converted to VOC;
+  charged fighter shots use the fighter sound, not the turbolaser one.
+- view_target (Z): chase camera on the current target; Z again returns,
+  and the view ends when the target explodes.
+---
+ CMakeLists.txt                           |   4 +
+ resources/config.yaml                    |   9 +
+ src/xw/audio/fsfx.c                      |   9 +-
+ src/xw/flight/object/laser.c             |   2 +-
+ src/xw/flight/object/laser.h             |   4 +-
+ src/xw/flight/player/user.c              |  69 +++++++
+ src/xw/flight/player/user.h              |   2 +
+ src/xw_app/settings/audio_page.c         |   1 +
+ src/xw_app/settings/video_page.c         |   1 +
+ src/xw_dos94/audio/fsfx.c                |   2 +
+ src/xw_remaster/hud_readout.c            | 245 +++++++++++++++++++++++
+ src/xw_remaster/hud_readout.h            |  10 +
+ src/xw_remaster/hud_renderer.c           |  31 ++-
+ src/xw_remaster/lighting.c               |   7 +-
+ src/xw_remaster/lighting.h               |   3 +
+ src/xw_remaster/render_math.c            |   2 +
+ src/xw_remaster/render_math.h            |   2 +
+ src/xw_remaster/target_view.c            | 175 ++++++++++++++++
+ src/xw_remaster/target_view.h            |  12 ++
+ src/xw_remaster/xw_remaster.c            |   9 +
+ src/xw_runtime/audio/weapon_sounds.c     | 109 ++++++++++
+ src/xw_runtime/audio/weapon_sounds.h     |  15 ++
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   4 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   2 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ src/xw_runtime/input/actions.c           |   2 +
+ src/xw_runtime/input/actions.h           |   1 +
+ src/xw_runtime/snapshot/render_capture.c |   2 +
+ src/xw_runtime/snapshot/render_readout.c | 169 ++++++++++++++++
+ src/xw_runtime/snapshot/render_readout.h |   7 +
+ src/xw_runtime/snapshot/render_types.h   |  13 ++
+ 33 files changed, 921 insertions(+), 10 deletions(-)
+ create mode 100644 src/xw_remaster/hud_readout.c
+ create mode 100644 src/xw_remaster/hud_readout.h
+ create mode 100644 src/xw_remaster/target_view.c
+ create mode 100644 src/xw_remaster/target_view.h
+ create mode 100644 src/xw_runtime/audio/weapon_sounds.c
+ create mode 100644 src/xw_runtime/audio/weapon_sounds.h
+ create mode 100644 src/xw_runtime/snapshot/render_readout.c
+ create mode 100644 src/xw_runtime/snapshot/render_readout.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f2f1885..a2c810d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -210,6 +210,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/audio/flight_music.c
+     src/xw_runtime/audio/media_device.c
+     src/xw_runtime/audio/player_engine.c
++    src/xw_runtime/audio/weapon_sounds.c
+     src/xw_dos94/audio/fsfx.c
+     src/xw_dos94/audio/gamesnd.c
+     src/xw_dos94/audio/hilevel.c
+@@ -226,6 +227,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/runtime/presentation.c
+     src/xw_runtime/snapshot/render_snapshot.c
+     src/xw_runtime/snapshot/render_capture.c
++    src/xw_runtime/snapshot/render_readout.c
+     src/xw_runtime/snapshot/render_camera.c
+     src/xw_runtime/snapshot/render_sky.c
+     src/xw_runtime/snapshot/render_world.c
+@@ -921,7 +923,9 @@ set(XW_REMASTER_SOURCES
+     src/xw_remaster/hud_decode.c
+     src/xw_remaster/hud_draw.c
+     src/xw_remaster/hud_instruments.c
++    src/xw_remaster/hud_readout.c
+     src/xw_remaster/hud_renderer.c
++    src/xw_remaster/target_view.c
+     src/xw_remaster/undither.c
+     src/xw_remaster/image_assets.c
+     src/xw_remaster/component_animation.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index a7c5543..a00dd2f 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -22,6 +22,9 @@ paths:
+     xw98: ""
+ audio:
+   sb16_filter: true
++  # Use X-Wing vs TIE Fighter's laser and ion cannon sounds (resources/xvt_weapon_sounds).
++  # Applies from the next mission.
++  xvt_weapon_sounds: true
+   player_engine_sound_volume_percent: 30
+ music:
+   arrangement: windows
+@@ -155,6 +158,8 @@ input:
+       - {key: "F1"}
+     view_warhead:
+       - {key: "F2"}
++    view_target:
++      - {key: "Z"}
+     view_external:
+       - {key: "F3"}
+       - {key: "/"}
+@@ -294,6 +299,10 @@ render:
+   cockpit_stretch: true
+   # With the cockpit hidden, move the side instruments out to the screen edges.
+   hud_widescreen: true
++  # X-Wing vs TIE Fighter style targeting computer (1998 flight): target name, shields,
++  # hull and systems, a live 3D model of the target, its orders and range. Also shown
++  # with the cockpit off.
++  xvt_targeting_computer: true
+   msaa_samples: 2
+   temporal_upscaling:
+     mode: "off"
+diff --git a/src/xw/audio/fsfx.c b/src/xw/audio/fsfx.c
+index e92e82b..c7e77cf 100644
+--- a/src/xw/audio/fsfx.c
++++ b/src/xw/audio/fsfx.c
+@@ -4,6 +4,7 @@
+ #include "xw_dos94/audio/fsfx.h"
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/audio/player_engine.h"
++#include "xw_runtime/audio/weapon_sounds.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #endif
+@@ -197,8 +198,14 @@ int16_t fsfx_triggerlasersfx(uint16_t projectileObjectIndex) {
+ #ifdef XW_MODERN
+ 	{
+ 		int sound = XwFlightTypes_ProjectileSound(objectType);
+-		if (sound >= 0)
++		if (sound >= 0) {
++			uint16_t source = g_objectTable[projectileObjectIndex].sourceObjectRef;
++			bool starship = source < XW_CRAFT_OBJECT_COUNT && (g_objectTable[source].genusId == XW_GENUS_STARSHIP ||
++															   g_objectTable[source].genusId == XW_GENUS_FREIGHTER);
++			sound = XwWeaponSounds_SoundIndex(sound - FSFX_FIRST_PLAYABLE_SLOT, starship) +
++					FSFX_FIRST_PLAYABLE_SLOT;
+ 			return fsfx_triggersfx(sound, projectileObjectIndex);
++		}
+ 	}
+ 	return objectType;
+ #else
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index cee9b39..a4ed7d0 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -291,7 +291,7 @@ void laser_chargeshields(uint16_t shieldIndex, int16_t delta) {
+ #ifdef XW_MODERN
+ static int s_playerGroupsLinked;
+ 
+-int laser_canlinkcannongroups(const CraftData* craft) { return craft && craft->cannonClassCount >= 2; }
++int laser_canlinkcannongroups(const struct CraftData* craft) { return craft && craft->cannonClassCount >= 2; }
+ 
+ int laser_playergroupslinked(void) {
+ 	return s_playerGroupsLinked && g_playerFlightState.selectedWeaponMode == 0 &&
+diff --git a/src/xw/flight/object/laser.h b/src/xw/flight/object/laser.h
+index 7a4749d..d8fcfcd 100644
+--- a/src/xw/flight/object/laser.h
++++ b/src/xw/flight/object/laser.h
+@@ -134,8 +134,8 @@ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotI
+ #ifdef XW_MODERN
+ /* X-Wing Alliance style "lasers and ion cannons fire linked" for the player: one trigger fires every cannon
+  * group fully linked. Reset when the player's craft is created. */
+-typedef struct CraftData CraftData;
+-int laser_canlinkcannongroups(const CraftData* craft);
++struct CraftData;
++int laser_canlinkcannongroups(const struct CraftData* craft);
+ int laser_playergroupslinked(void);
+ void laser_setplayergroupslinked(int linked);
+ #endif
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index eaafe6e..77571d2 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -52,6 +52,28 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifdef XW_MODERN
++/* view_target (Z): set while the camera chases the player's target. Other view keys can take the camera
++ * away, so it only counts while the camera is still external on a non-player object. */
++static int s_targetViewFlag, s_targetViewPreviousExternal;
++#define s_targetViewActive                                                                                  \
++	(s_targetViewFlag && g_flightCamera.externalViewActive != 0 &&                                          \
++	 g_flightCamera.focusObjectRef != g_playerFlightState.objectIndex)
++
++/* Leaves the target view; the caller has already pointed the camera focus back at the player. */
++static void user_endtargetview(void) {
++	s_targetViewFlag = 0;
++	g_flightCamera.externalViewActive = s_targetViewPreviousExternal;
++	if (!s_targetViewPreviousExternal) {
++		g_flightCamera.hudAimX = g_flightCamera.savedHudAimX;
++		g_flightCamera.hudAimY = g_flightCamera.savedHudAimY;
++		panelrts_setnewpilotview(g_flightCamera.savedHudState == USER_TARGET_ANNOUNCEMENT_HUD_STATE
++									 ? USER_TARGET_ANNOUNCEMENT_HUD_STATE
++									 : 0);
++	}
++}
++#endif
++
+ // GLOBAL: XW 0x4C51A0
+ uint8_t g_subsystemIdToFlag[XW_PLAYER_SUBSYSTEM_COUNT] = { 0x02, 0x80, 0x10, 0x20, 0x40, 0x04, 0x01, 0x08 };
+ 
+@@ -227,9 +249,30 @@ void user_userinterface(void) {
+ 	uint16_t heldTicks;
+ 	uint16_t target;
+ 
++#ifdef XW_MODERN
++	/* The viewed target exploded (its slot becomes an explosion effect and may then be reused): return to
++	 * the cockpit instead of following whatever takes the slot. */
++	if (g_replayviewmode == 0 && s_targetViewActive) {
++		const ObjectRecord* focus = &g_objectTable[g_flightCamera.focusObjectRef];
++		if (focus->objectType == XW_OBJ_NONE || focus->genusId == XW_GENUS_EXPLOSION_EFFECT ||
++			focus->familyId != XW_OBJECT_FAMILY_CRAFT) {
++			g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
++			user_endtargetview();
++			user_resetview();
++		}
++	}
++#endif
+ 	if (g_replayviewmode == 0 && (g_flightCamera.focusObjectRef != XW_PLAYER_NO_TARGET &&
+ 								  g_objectTable[g_flightCamera.focusObjectRef].objectType == XW_OBJ_NONE)) {
++#ifdef XW_MODERN
++		/* A destroyed target ends the target view rather than leaving an external view of the player. */
++		int endTargetView = s_targetViewActive;
++#endif
+ 		g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
++#ifdef XW_MODERN
++		if (endTargetView)
++			user_endtargetview();
++#endif
+ 		user_resetview();
+ 	}
+ 	if (g_replayviewmode != 0) {
+@@ -663,6 +706,32 @@ void user_inputforplane(void) {
+ 				}
+ 			}
+ 			break;
++#ifdef XW_MODERN
++		case USER_KEY_TARGET_VIEW:
++			/* TIE Fighter / XvT style: chase camera on the current target; press again to return. */
++			if (g_replayviewmode != 0)
++				break;
++			if (s_targetViewActive) {
++				g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
++				user_endtargetview();
++				user_resetview();
++			} else if (g_playerFlightState.currentTargetObjectIdx < g_mainObjectSlotEnd &&
++					   g_objectTable[g_playerFlightState.currentTargetObjectIdx].objectType != XW_OBJ_NONE) {
++				if (g_flightCamera.focusObjectRef == g_playerFlightState.objectIndex &&
++					g_flightCamera.externalViewActive == 0) {
++					g_flightCamera.savedHudState = g_flightCamera.hudStateLive;
++					g_flightCamera.savedHudAimX = g_flightCamera.hudAimX;
++					g_flightCamera.savedHudAimY = g_flightCamera.hudAimY;
++				}
++				s_targetViewPreviousExternal = g_flightCamera.externalViewActive;
++				g_flightCamera.focusObjectRef = g_playerFlightState.currentTargetObjectIdx;
++				g_flightCamera.externalViewActive = 1;
++				s_targetViewFlag = 1;
++				user_resetview();
++			}
++			fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			break;
++#endif
+ 		case '/':
+ 		case USER_KEY_EXTERNAL_VIEW:
+ 		case USER_KEY_EXTERNAL_VIEW_ALT:
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index 6bc6de7..b7d3f9a 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -76,6 +76,8 @@ enum {
+ 	USER_KEY_COCKPIT = 0xC2,
+ 	USER_KEY_PLAYER_VIEW = 0xC3,
+ 	USER_KEY_WARHEAD_VIEW = 0xC4,
++	/* Modern addition: 'z' target view (input action view_target). Unused by the original. */
++	USER_KEY_TARGET_VIEW = 'z',
+ 	USER_KEY_EXTERNAL_VIEW_ALT = 0xC5,
+ 	USER_KEY_MANUAL_CAMERA_ALT = 0xC6,
+ 	USER_KEY_RECALL_TARGET_1 = 0xC7,
+diff --git a/src/xw_app/settings/audio_page.c b/src/xw_app/settings/audio_page.c
+index d05d4e2..4a0b524 100644
+--- a/src/xw_app/settings/audio_page.c
++++ b/src/xw_app/settings/audio_page.c
+@@ -92,6 +92,7 @@ void XwAudioPage_Draw(AeronUiContext* ui) {
+ 		p->musicVolume = (int16_t)value;
+ 	AeronUi_Header(ui, "Effects and Speech");
+ 	AeronUi_Toggle(ui, "SB16 Low-pass Filter", &draft->sb16_filter_enabled);
++	AeronUi_Toggle(ui, "XvT Laser and Ion Sounds", &draft->xvt_weapon_sounds);
+ 	value = p->sfxEnabled;
+ 	if (AeronUi_Toggle(ui, "Sound effects", &value))
+ 		p->sfxEnabled = (int16_t)value;
+diff --git a/src/xw_app/settings/video_page.c b/src/xw_app/settings/video_page.c
+index cf4a946..95ad5cc 100644
+--- a/src/xw_app/settings/video_page.c
++++ b/src/xw_app/settings/video_page.c
+@@ -76,6 +76,7 @@ static void FlightControls(AeronUiContext* ui, XwSettings* draft) {
+ 		AeronUi_Help(ui, "This change will take effect on the next cockpit load.");
+ 	AeronUi_Toggle(ui, "Stretch Cockpit to Widescreen", &draft->cockpit_stretch);
+ 	AeronUi_Toggle(ui, "Widescreen Cockpit-Off HUD", &draft->hud_widescreen);
++	AeronUi_Toggle(ui, "XvT Targeting Computer", &draft->xvt_targeting_computer);
+ 	static const char* const quality[] = { "Off", "Low", "High" };
+ 	AeronUi_Selector(ui, "SSAO Quality", &r->scene.ssao.ssao_quality, quality, 3);
+ 	ShadowControl(ui, &r->scene.shadows);
+diff --git a/src/xw_dos94/audio/fsfx.c b/src/xw_dos94/audio/fsfx.c
+index f99c73c..95fa701 100644
+--- a/src/xw_dos94/audio/fsfx.c
++++ b/src/xw_dos94/audio/fsfx.c
+@@ -8,6 +8,7 @@
+ #include "xw/util/memory.h"
+ #include "xw_dos94/audio/hilevel.h"
+ #include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/weapon_sounds.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/runtime/port.h"
+@@ -90,6 +91,7 @@ uint16_t Dos94_fsfx_loadsfx(const char* path) {
+ 			goto failed;
+ 	}
+ 	g_fsfxLoaded = 1;
++	XwWeaponSounds_Apply();
+ 	return (uint16_t)loaded;
+ failed: {
+ 	char error[256];
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+new file mode 100644
+index 0000000..769f698
+--- /dev/null
++++ b/src/xw_remaster/hud_readout.c
+@@ -0,0 +1,245 @@
++/* render.xvt_targeting_computer: X-Wing vs TIE Fighter style CMD contents, drawn in the cockpit's CMD screen
++ * (or floating at the same place with the cockpit off): target name, shields/hull/systems, a live 3D view of
++ * the target, its orders and range. */
++#include "xw_remaster/hud_readout.h"
++#include "xw_remaster/target_view.h"
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++typedef struct Pen {
++	const XwHudDraw* d;
++	const XwHudImage* font;
++	const AeronRuntimeAtlas* atlas;
++	float sx, sy; /* Classic pixel to target pixel scales. */
++} Pen;
++
++static void Linear(uint32_t rgb, float alpha, float out[4]) {
++	for (unsigned i = 0; i < 3; ++i) {
++		float v = ((rgb >> (16 - 8 * i)) & 255) / 255.f;
++		out[i] = (v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f)) * alpha;
++	}
++	out[3] = alpha;
++}
++
++static const AeronDecodedGlyph* Glyph(const Pen* p, char c) {
++	const AeronDecodedFont* f = &p->font->font;
++	unsigned ch = (unsigned char)c;
++	if (ch < f->first_char || ch - f->first_char >= f->glyph_count)
++		return NULL;
++	return &f->glyphs[ch - f->first_char];
++}
++
++/* Width in classic pixels. */
++static float Measure(const Pen* p, const char* text) {
++	float w = 0;
++	for (; *text; ++text) {
++		const AeronDecodedGlyph* g = Glyph(p, *text);
++		w += g ? g->advance : p->font->font.cell_width;
++	}
++	return w;
++}
++
++/* Draws text at classic coordinates, clipped to max_width classic pixels. */
++static void Text(const Pen* p, float x, float y, const char* text, uint32_t rgb, float max_width) {
++	float rgba[4];
++	Linear(rgb, 1, rgba);
++	unsigned index = p->font->atlas_frame;
++	if (index >= (unsigned)p->atlas->layout.frame_count)
++		return;
++	unsigned page = p->atlas->layout.pages ? p->atlas->layout.pages[index] : 0;
++	AeronSpriteRect frame = p->atlas->layout.frames[index];
++	AeronRuntimeAtlasPage pg = p->atlas->pages[page];
++	float limit = x + max_width;
++	for (; *text; ++text) {
++		const AeronDecodedGlyph* g = Glyph(p, *text);
++		float advance = g ? g->advance : p->font->font.cell_width;
++		if (x + advance > limit + 0.5f)
++			break;
++		/* Per-glyph rectangle: the font image stacks foreground, shadow and fill planes. */
++		if (g && *text != ' ' && g->height) {
++			AeronDrawList2DSprite s = { .texture = pg.texture,
++										.src_u0 = (frame.x + g->x) / pg.width,
++										.src_v0 = (frame.y + g->y) / pg.height,
++										.src_u1 = (frame.x + g->x + g->advance) / pg.width,
++										.src_v1 = (frame.y + g->y + g->height) / pg.height,
++										.dst_x = p->d->offset_x + x * p->sx,
++										.dst_y = p->d->offset_y + y * p->sy,
++										.dst_w = g->advance * p->sx,
++										.dst_h = g->height * p->sy,
++										.tint = { rgba[0], rgba[1], rgba[2], rgba[3] },
++										.blend = AERON_BLIT2D_BLEND_PMA,
++										.filter = AERON_BLIT2D_FILTER_NEAREST };
++			AeronDrawList_AddSprite(p->d->list, &s);
++		}
++		x += advance;
++	}
++}
++
++static void Centered(const Pen* p, const XwSnapRect* r, float y, const char* text, uint32_t rgb) {
++	float w = Measure(p, text);
++	Text(p, r->x + fmaxf(1, (r->width - w) / 2), y, text, rgb, r->width - 2);
++}
++
++static void Fill(const Pen* p, float x, float y, float w, float h, uint32_t rgb, float alpha) {
++	float rgba[4];
++	Linear(rgb, alpha, rgba);
++	AeronDrawList_AddFill(p->d->list, p->d->offset_x + x * p->sx, p->d->offset_y + y * p->sy, w * p->sx,
++						  h * p->sy, rgba, AERON_BLIT2D_BLEND_PMA, NULL);
++}
++
++enum {
++	LABEL = 0x5A9BFF,
++	VALUE = 0xE6EEFF,
++	FRIENDLY = 0x5AFF5A,
++	HOSTILE = 0xFF4A4A,
++	OTHER = 0x6EAAFF,
++	BACKDROP = 0x020617
++};
++
++static void Stat(char* out, size_t n, const char* label, int pct) {
++	if (pct < 0)
++		snprintf(out, n, "%s --", label);
++	else
++		snprintf(out, n, "%s %d%%", label, pct);
++}
++
++bool XwHudCmd_Active(const XwRenderSnapshot* s) {
++	const XwSnapCamera* c = &s->camera;
++	return XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
++		   !c->replay_mode && !s->cockpit.suppressed &&
++		   (c->hud_state == 0 || c->hud_state == XW_SNAP_VIEW_FULL_FORWARD);
++}
++
++bool XwHudCmd_Draw(const XwHudDraw* d) {
++	const XwRenderSnapshot* s = d->snapshot;
++	const XwSnapReadout* r = &s->readout;
++	if (!d->definition)
++		return true;
++	XwRenderAssetId font_id = d->definition->fonts[1] ? d->definition->fonts[1] : d->definition->fonts[0];
++	const XwHudImage* font =
++		font_id ? XwHudAssets_Image((XwHudImageKey) { .source = font_id, .kind = XW_HUD_IMAGE_FONT }) : NULL;
++	const AeronRuntimeAtlas* atlas = font ? XwHudAssets_Atlas(font) : NULL;
++	if (!font || !atlas || !font->font.glyph_count)
++		return true;
++	Pen pen = { d, font, atlas, d->layout.scale_x, d->layout.scale_y };
++	unsigned glyph_h = 0;
++	for (unsigned i = 0; i < font->font.glyph_count; ++i)
++		if (font->font.glyphs[i].height > glyph_h)
++			glyph_h = font->font.glyphs[i].height;
++	float line = glyph_h + 2.0f;
++	const XwSnapRect* box = &r->cmd;
++	bool cockpit_off = s->camera.hud_state == XW_SNAP_VIEW_FULL_FORWARD;
++
++	/* Cover X-Wing's own CMD artwork; with the cockpit off, a translucent panel at the same place. */
++	Fill(&pen, box->x, box->y, box->width, box->height, BACKDROP, cockpit_off ? 0.55f : 1.0f);
++	if (!r->target_valid)
++		return true;
++
++	float top = box->y + 1, bottom = box->y + box->height;
++	Centered(&pen, box, top,
++			 r->target_name, r->target_relation == 0 ? FRIENDLY : r->target_relation == 1 ? HOSTILE : OTHER);
++	char shd[16], hull[16], sys[16], stats[64];
++	Stat(shd, sizeof shd, "SHD", r->target_shield_pct);
++	Stat(hull, sizeof hull, "HULL", r->target_hull_pct);
++	Stat(sys, sizeof sys, "SYS", r->target_system_pct);
++	/* X-Wing's CMD is narrower than XvT's: tighten the spacing, drop the percent signs, shorten HULL, and as a
++	 * last resort put SYS on a line of its own. */
++	float fit = box->width - 2;
++	unsigned stat_lines = 1;
++	snprintf(stats, sizeof stats, "%s  %s  %s", shd, hull, sys);
++	if (Measure(&pen, stats) > fit)
++		snprintf(stats, sizeof stats, "%s %s %s", shd, hull, sys);
++	if (Measure(&pen, stats) > fit) {
++		char* out = stats;
++		for (const char* in = stats; *in; ++in)
++			if (*in != '%')
++				*out++ = *in;
++		*out = 0;
++	}
++	if (Measure(&pen, stats) > fit) {
++		char* h = strstr(stats, "HULL");
++		if (h)
++			memmove(h + 3, h + 4, strlen(h + 4) + 1);
++	}
++	if (Measure(&pen, stats) > fit) {
++		snprintf(stats, sizeof stats, "%s %s", shd, hull);
++		Centered(&pen, box, top + 2 * line, sys, LABEL);
++		stat_lines = 2;
++	}
++	Centered(&pen, box, top + line, stats, LABEL);
++
++	/* Bottom rows as in XvT: range centred on the last line, orders (or an alert status) above it, and
++	 * cargo or the order's target above that. */
++	char dist[24];
++	snprintf(dist, sizeof dist, "DIST %u.%02u", r->target_distance_hundredths / 100,
++			 r->target_distance_hundredths % 100);
++	float last = bottom - line;
++	Centered(&pen, box, last, dist, VALUE);
++	/* Orders only: SHD/HULL/SYS already show what X-Wing's status words ("SHLD DOWN") reported. */
++	const char* orders = r->target_orders;
++	float image_bottom = last - 1;
++	if (orders[0]) {
++		/* Wrap long orders ("LEADING FORMATION FLIGHT") onto two lines at a word break. */
++		char first[48], second[48] = "";
++		snprintf(first, sizeof first, "%s", orders);
++		if (Measure(&pen, first) > fit) {
++			char* cut = NULL;
++			for (char* space = strchr(first, ' '); space; space = strchr(space + 1, ' ')) {
++				*space = 0;
++				bool fits = Measure(&pen, first) <= fit;
++				*space = ' ';
++				if (!fits)
++					break;
++				cut = space;
++			}
++			if (cut) {
++				snprintf(second, sizeof second, "%s", cut + 1);
++				*cut = 0;
++			}
++		}
++		uint32_t color = LABEL;
++		if (second[0]) {
++			image_bottom -= line;
++			Centered(&pen, box, last - 2 * line, first, color);
++			Centered(&pen, box, last - line, second, color);
++		} else
++			Centered(&pen, box, last - line, first, color);
++		image_bottom -= line;
++	}
++	char detail[64] = "";
++	if (r->cargo_valid)
++		snprintf(detail, sizeof detail, "CARGO %s", r->target_cargo);
++	else if (r->target_order_target[0])
++		snprintf(detail, sizeof detail, "> %s", r->target_order_target);
++	if (detail[0]) {
++		image_bottom -= line;
++		Centered(&pen, box, image_bottom + 1, detail, VALUE);
++	}
++
++	/* The live 3D view between the stats and the bottom rows, letterboxed to its aspect. */
++	float aspect = 1;
++	AeronTexture* view = XwTargetView_Texture(&aspect);
++	float area_top = top + (1 + stat_lines) * line, area_h = image_bottom - area_top, area_w = box->width - 4;
++	if (view && area_h > 4 && area_w > 4) {
++		float w = area_w * pen.sx, h = area_h * pen.sy;
++		if (w / h > aspect)
++			w = h * aspect;
++		else
++			h = w / aspect;
++		AeronDrawList2DSprite sprite = { .texture = view,
++										 .src_u0 = 0,
++										 .src_v0 = 0,
++										 .src_u1 = 1,
++										 .src_v1 = 1,
++										 .dst_x = d->offset_x + (box->x + box->width / 2.0f) * pen.sx - w / 2,
++										 .dst_y = d->offset_y + (area_top + area_h / 2) * pen.sy - h / 2,
++										 .dst_w = w,
++										 .dst_h = h,
++										 .tint = { 1, 1, 1, cockpit_off ? 0.9f : 1 },
++										 .blend = AERON_BLIT2D_BLEND_PMA,
++										 .filter = AERON_BLIT2D_FILTER_LINEAR };
++		AeronDrawList_AddSprite(d->list, &sprite);
++	}
++	return true;
++}
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+new file mode 100644
+index 0000000..9d8ae11
+--- /dev/null
++++ b/src/xw_remaster/hud_readout.h
+@@ -0,0 +1,10 @@
++#ifndef XW_REMASTER_HUD_READOUT_H
++#define XW_REMASTER_HUD_READOUT_H
++#include "xw_remaster/hud_draw.h"
++#include "xw_runtime/config/flight_tweaks.h"
++
++/* render.xvt_targeting_computer: true when the XvT-style CMD replaces X-Wing's CMD panes this frame. */
++bool XwHudCmd_Active(const XwRenderSnapshot* snapshot);
++/* Draws the XvT-style CMD into draw->list at the cockpit's CMD screen. */
++bool XwHudCmd_Draw(const XwHudDraw* draw);
++#endif
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 77aeb50..4032bf9 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -1,6 +1,8 @@
+ /* Native-resolution composition follows OpenXvT's retained Aeron draw-list path. */
+ #include "xw_remaster/hud_renderer.h"
+ #include "xw_remaster/hud_draw.h"
++#include "xw_remaster/hud_readout.h"
++#include "xw_remaster/target_view.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include <aeron/aeron.h>
+ #include <math.h>
+@@ -14,6 +16,9 @@ typedef struct HudKey {
+ 	int width, height;
+ 	float stretch_x;
+ 	int widescreen_hud; /* int keeps the memcmp key free of padding. */
++	int cmd_active;     /* render.xvt_targeting_computer replaces the CMD panes. */
++	XwSnapReadout readout;
++	const AeronTexture* target_view;
+ } HudKey;
+ 
+ typedef struct Ordered {
+@@ -58,7 +63,13 @@ static void PaneShifts(const XwHudDraw* draw, float shifts[XW_SNAP_HUD_PANES]) {
+ 	}
+ }
+ 
+-static bool Panes(XwHudDraw* draw) {
++static bool CmdPane(unsigned pane) {
++	return pane == XW_SNAP_PANE_TARGET_HEADER || pane == XW_SNAP_PANE_TARGET_BODY ||
++		   pane == XW_SNAP_PANE_TARGET_FOOTER;
++}
++
++/* skip_cmd: the XvT-style CMD replaces X-Wing's target panes. */
++static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 	const XwSnapCockpit* c = &draw->snapshot->cockpit;
+ 	Ordered order[XW_SNAP_HUD_GLYPHS + XW_SNAP_HUD_PAINT + XW_SNAP_HUD_SPRITES];
+ 	float shifts[XW_SNAP_HUD_PANES];
+@@ -75,15 +86,19 @@ static bool Panes(XwHudDraw* draw) {
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		unsigned index = order[i].index;
+ 		draw->pane_shift = 0;
++		bool skip = false;
+ 		for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
+ 			XwSnapRange r = order[i].kind == 0	 ? c->panes[p].glyphs
+ 							: order[i].kind == 1 ? c->panes[p].paint
+ 												 : c->panes[p].sprites;
+ 			if (InRange(r, index)) {
+ 				draw->pane_shift = shifts[p];
++				skip = skip_cmd && CmdPane(p);
+ 				break;
+ 			}
+ 		}
++		if (skip)
++			continue;
+ 		if (order[i].kind == 0) {
+ 			if (!XwHudDraw_Glyph(draw, &c->glyphs[index]))
+ 				return false;
+@@ -125,7 +140,12 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .width = width,
+ 				   .height = height,
+ 				   .stretch_x = XwRenderMath_CockpitStretchX(&snapshot->camera, width, height),
+-				   .widescreen_hud = XwFlightTweaks_WidescreenHud() };
++				   .widescreen_hud = XwFlightTweaks_WidescreenHud(),
++				   .cmd_active = XwHudCmd_Active(snapshot) };
++	if (key.cmd_active) {
++		key.readout = snapshot->readout;
++		key.target_view = XwTargetView_Texture(NULL);
++	}
+ 	if (view)
+ 		key.view = *view;
+ 	if (valid && !memcmp(&key, &prepared, sizeof key)) {
+@@ -158,9 +178,12 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		draw.list = markers;
+ 	XwHudDraw_Target(&draw, view);
+ 	draw.list = list;
+-	if (!XwHudDraw_Base(&draw) || !XwHudDraw_Instruments(&draw) || !Panes(&draw))
++	if (!XwHudDraw_Base(&draw) || !XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
+ 		return false;
+-	XwHudDraw_Cross(&draw);
++	if (key.cmd_active)
++		XwHudCmd_Draw(&draw);
++	else
++		XwHudDraw_Cross(&draw);
+ 	AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 	if (!cmd)
+ 		return false;
+diff --git a/src/xw_remaster/lighting.c b/src/xw_remaster/lighting.c
+index 8ef73d0..4226cf3 100644
+--- a/src/xw_remaster/lighting.c
++++ b/src/xw_remaster/lighting.c
+@@ -188,6 +188,11 @@ int XwLighting_Begin(AeronScene3D* scene, const XwRenderSnapshot* s) {
+ }
+ 
+ void XwLighting_Environment(AeronScene3D* scene, const XwSnapAppearance* light, const float position[3]) {
++	XwLighting_EnvironmentAmbient(scene, light, position, -1);
++}
++
++void XwLighting_EnvironmentAmbient(AeronScene3D* scene, const XwSnapAppearance* light, const float position[3],
++								   float ambient) {
+ 	const XwLightingSettings* settings = &XwRemasterConfig_Effective()->lighting;
+ 	PbrLightFS env = { 0 };
+ 	const XwRenderSettings* config = XwRemasterConfig_Effective();
+@@ -218,7 +223,7 @@ void XwLighting_Environment(AeronScene3D* scene, const XwSnapAppearance* light,
+ 		env.directional_dir[i] = direction[i];
+ 		env.sun_color[i] = light->directional_enabled ? 1 : 0;
+ 		env.amb_pos_x[i] = env.amb_neg_x[i] = env.amb_pos_y[i] = env.amb_neg_y[i] = env.amb_pos_z[i] =
+-			env.amb_neg_z[i] = settings->ambient[i];
++			env.amb_neg_z[i] = ambient >= 0 ? ambient : settings->ambient[i];
+ 	}
+ 	float length = sqrtf(env.directional_dir[0] * env.directional_dir[0] +
+ 						 env.directional_dir[1] * env.directional_dir[1] +
+diff --git a/src/xw_remaster/lighting.h b/src/xw_remaster/lighting.h
+index ede3e63..70118c9 100644
+--- a/src/xw_remaster/lighting.h
++++ b/src/xw_remaster/lighting.h
+@@ -3,6 +3,9 @@
+ #include "xw_remaster/render_math.h"
+ int XwLighting_Begin(AeronScene3D* scene, const XwRenderSnapshot* snapshot);
+ void XwLighting_Environment(AeronScene3D* scene, const XwSnapAppearance* light, const float position[3]);
++/* As XwLighting_Environment with a uniform ambient level; negative uses the configured ambient. */
++void XwLighting_EnvironmentAmbient(AeronScene3D* scene, const XwSnapAppearance* light, const float position[3],
++								   float ambient);
+ void XwLighting_AddPoint(AeronScene3D* scene, const float position[3], const float color[3], float intensity,
+ 						 float minimum_range);
+ #endif
+diff --git a/src/xw_remaster/render_math.c b/src/xw_remaster/render_math.c
+index 5c895ec..aacd643 100644
+--- a/src/xw_remaster/render_math.c
++++ b/src/xw_remaster/render_math.c
+@@ -213,6 +213,8 @@ static bool CameraBasis(const float source[9], float quat[4]) {
+ 	return true;
+ }
+ 
++bool XwRenderMath_BasisQuat(const float rows[9], float quat[4]) { return CameraBasis(rows, quat); }
++
+ bool XwRenderMath_BuildMainView(const XwSnapCamera* cam, const int32_t origin[3], int width, int height,
+ 								XwRenderView* out) {
+ 	if (!cam || !origin || !out || cam->viewport.width <= 0 || cam->viewport.height <= 0 || cam->focal_x <= 0)
+diff --git a/src/xw_remaster/render_math.h b/src/xw_remaster/render_math.h
+index e4c2c11..e7089ca 100644
+--- a/src/xw_remaster/render_math.h
++++ b/src/xw_remaster/render_math.h
+@@ -27,6 +27,8 @@ AeronRectI XwRenderMath_LayoutRect(const XwLayoutTransform* layout);
+ float XwRenderMath_CockpitStretchX(const XwSnapCamera* camera, float target_width, float target_height);
+ /* Wrapped integer subtraction precedes float conversion, matching X-Wing world arithmetic. */
+ void XwRenderMath_Local(const int32_t origin[3], const int32_t world[3], float out[3]);
++/* Camera rows (right, eye-down, forward; world axes) to an Aeron camera orientation. */
++bool XwRenderMath_BasisQuat(const float rows[9], float quat[4]);
+ bool XwRenderMath_BuildMainView(const XwSnapCamera* camera, const int32_t origin[3], int width, int height,
+ 								XwRenderView* out);
+ bool XwRenderMath_ProjectWorld(const XwRenderView* view, const int32_t world[3], float* x, float* y,
+diff --git a/src/xw_remaster/target_view.c b/src/xw_remaster/target_view.c
+new file mode 100644
+index 0000000..ec806c9
+--- /dev/null
++++ b/src/xw_remaster/target_view.c
+@@ -0,0 +1,175 @@
++/* render.xvt_targeting_computer: a live 3D view of the player's target for the CMD, as in X-Wing vs TIE Fighter
++ * and OpenTIE's targeting display. The target is seen from the player's camera direction at a fixed framing
++ * distance, so its attitude matches what the pilot would see. */
++#include "xw_remaster/target_view.h"
++#include "xw_remaster/assets.h"
++#include "xw_remaster/component_animation.h"
++#include "xw_remaster/config.h"
++#include "xw_remaster/lighting.h"
++#include "xw_remaster/ship.h"
++#include <aeron/aeron.h>
++#include <aeron/asset/opt_model.h>
++#include <math.h>
++#include <string.h>
++
++enum { TARGET_VIEW_W = 448, TARGET_VIEW_H = 256 };
++
++static AeronScene3D* scene;
++static AeronSceneMeshTable table;
++static AeronTexture* texture;
++static bool prepared;
++
++static bool Ensure(void) {
++	if (scene)
++		return true;
++	scene = AeronScene_Create(&(AeronScene3DDesc) { .rt_width = TARGET_VIEW_W,
++												   .rt_height = TARGET_VIEW_H,
++												   .color_format = AERON_TEXTURE_FORMAT_RGBA16_FLOAT,
++												   .with_normal_rt = 0,
++												   .sample_count = AERON_SAMPLE_COUNT_1,
++												   .temporal_mode = AERON_TEMPORAL_OFF,
++												   .view_space_to_meters = AERON_OPT_METERS_PER_UNIT });
++	return scene != NULL;
++}
++
++static const XwSnapObject* FindTarget(const XwRenderSnapshot* s) {
++	for (unsigned i = 0; i < s->object_count; ++i)
++		if (XwRenderMath_SameObject(s->objects[i].id, s->readout.target))
++			return &s->objects[i];
++	return NULL;
++}
++
++static void Normalize(float v[3]) {
++	float length = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++	if (length > 1e-6f)
++		for (unsigned i = 0; i < 3; ++i)
++			v[i] /= length;
++}
++
++bool XwTargetView_Render(const XwRenderSnapshot* s) {
++	texture = NULL;
++	if (!s || s->flight_version != 98 || !s->world_valid || !s->readout.target_valid)
++		return true;
++	const XwSnapObject* object = FindTarget(s);
++	const XwRenderAssetSetView* set = XwRenderAssets_Set(s->flight_assets);
++	if (!object || !set || set->failed)
++		return true;
++	XwShipSelection selection;
++	if (XwShip_Select(&set->bindings, object, &selection) != 1)
++		return true;
++	const XwMeshAsset* asset = XwRemasterAssets_Mesh(selection.asset_id);
++	const XwSnapCraft* craft = object->craft_index < s->craft_count ? &s->crafts[object->craft_index] : NULL;
++	if (!asset || !XwShip_BuildMeshTable(asset, object, craft, selection.component,
++										 XwComponentAnimation_Angles(object, false), &table))
++		return true;
++	if (!Ensure())
++		return false;
++
++	/* The model sits at the origin; the camera looks at it along the pilot's line of sight. */
++	AeronSceneMeshInstance instance = { .mesh = asset->mesh,
++										.variant = selection.variant,
++										.mesh_table = &table,
++										.prev_mesh_table = &table,
++										.zero_velocity = 1,
++										.cull_mode = AERON_CULL_BACK,
++										.shadow_flags = AERON_SCENE_INSTANCE_NO_CAST_SHADOW |
++														AERON_SCENE_INSTANCE_NO_RECEIVE_SHADOW };
++	XwRenderMath_ObjectMatrix(object, 98, object->world_pos, instance.transform);
++	memcpy(instance.prev_transform, instance.transform, sizeof instance.transform);
++	/* Frame by the model's own bounding box; the culling radius is too conservative for multi-part craft. */
++	float half2 = 0, scale = 0;
++	for (unsigned i = 0; i < 3; ++i) {
++		float half = (asset->mesh->bound_max[i] - asset->mesh->bound_min[i]) * 0.5f;
++		half2 += half * half;
++		const float* m = instance.transform;
++		scale = fmaxf(scale, sqrtf(m[i] * m[i] + m[4 + i] * m[4 + i] + m[8 + i] * m[8 + i]));
++	}
++	/* Centre the bounding box rather than the model origin. */
++	float centre[3], local[3];
++	for (unsigned i = 0; i < 3; ++i)
++		local[i] = (asset->mesh->bound_min[i] + asset->mesh->bound_max[i]) * 0.5f;
++	for (unsigned r = 0; r < 3; ++r) {
++		const float* m = instance.transform + 4 * r;
++		centre[r] = m[0] * local[0] + m[1] * local[1] + m[2] * local[2];
++	}
++	float radius = sqrtf(half2) * scale * 0.85f;
++	if (!(radius > 0))
++		return true;
++
++	float forward[3];
++	XwRenderMath_Local(s->camera.world_pos, object->world_pos, forward);
++	Normalize(forward);
++	if (!(fabsf(forward[0]) + fabsf(forward[1]) + fabsf(forward[2]) > 0))
++		memcpy(forward, s->camera.rows + 6, sizeof forward);
++	float down[3] = { s->camera.rows[3], s->camera.rows[4], s->camera.rows[5] };
++	float along = down[0] * forward[0] + down[1] * forward[1] + down[2] * forward[2];
++	for (unsigned i = 0; i < 3; ++i)
++		down[i] -= forward[i] * along;
++	Normalize(down);
++	float rows[9] = { down[1] * forward[2] - down[2] * forward[1],
++					  down[2] * forward[0] - down[0] * forward[2],
++					  down[0] * forward[1] - down[1] * forward[0],
++					  down[0],
++					  down[1],
++					  down[2],
++					  forward[0],
++					  forward[1],
++					  forward[2] };
++	float v_half = 0.32f, h_half = atanf(tanf(v_half) * TARGET_VIEW_W / TARGET_VIEW_H);
++	float distance = radius / sinf(v_half) * 1.08f;
++	AeronSceneCamera camera = { .h_half_rad = h_half,
++								.v_half_rad = v_half,
++								.near_z = fmaxf(1.0f, distance - radius * 2.0f),
++								.viewport = { 0, 0, TARGET_VIEW_W, TARGET_VIEW_H } };
++	if (!XwRenderMath_BasisQuat(rows, camera.ori))
++		return true;
++	for (unsigned i = 0; i < 3; ++i)
++		camera.pos[i] = centre[i] - forward[i] * distance;
++
++	if (!AeronScene_Begin(scene, &camera) || !AeronScene_SetMeshSampler(scene, XwRemasterConfig_MeshSampler()))
++		return false;
++	if (!prepared && !(prepared = AeronScene_PrepareResources(scene, AERON_CULL_BACK)))
++		return false;
++	/* The CMD backdrop colour (sRGB #020617) in linear light, so the image blends into the panel. */
++	AeronScene_SetClearColor(scene, (const float[4]) { 0.0006f, 0.0018f, 0.0080f, 1 });
++	AeronScene_SetPost(scene, &(AeronScenePostDesc) { 0 });
++	AeronScene_SetDirectionalShadow(scene, &(AeronSceneDirectionalShadowDesc) { .enabled = 0 });
++	/* Aeron validates the slice count even when clustering is off. */
++	if (!AeronScene_SetClusteredLights(scene, &(AeronSceneClusteredLightDesc) { .enabled = 0, .depth_slices = 16 }))
++		return false;
++	/* XvT's CMD model is brightly lit whatever the mission's sun: key light from over the viewer's shoulder
++	 * plus a strong ambient fill. */
++	XwSnapAppearance light = s->appearance;
++	for (unsigned i = 0; i < 3; ++i)
++		light.direction_q15[i] =
++			(int32_t)(-(forward[i] * 0.6f + rows[3 + i] * 0.55f - rows[i] * 0.35f) * 32767.0f);
++	light.directional_enabled = 1;
++	XwLighting_EnvironmentAmbient(scene, &light, camera.pos, 0.30f);
++	AeronScene_AddMeshInstance(scene, &instance);
++	AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
++	if (!cmd)
++		return false;
++	Aeron_GpuDebugPush(cmd, "X-Wing XvT targeting computer");
++	if (!AeronScene_Render(scene, cmd)) {
++		Aeron_CancelCommandBuffer(cmd);
++		return false;
++	}
++	Aeron_GpuDebugPop(cmd);
++	if (!Aeron_SubmitCommandBuffer(cmd))
++		return false;
++	texture = AeronScene_ColorTexture(scene);
++	return true;
++}
++
++AeronTexture* XwTargetView_Texture(float* aspect) {
++	if (aspect)
++		*aspect = (float)TARGET_VIEW_W / TARGET_VIEW_H;
++	return texture;
++}
++
++void XwTargetView_Shutdown(void) {
++	AeronScene_Destroy(scene);
++	scene = NULL;
++	texture = NULL;
++	prepared = false;
++}
+diff --git a/src/xw_remaster/target_view.h b/src/xw_remaster/target_view.h
+new file mode 100644
+index 0000000..12ac01c
+--- /dev/null
++++ b/src/xw_remaster/target_view.h
+@@ -0,0 +1,12 @@
++#ifndef XW_REMASTER_TARGET_VIEW_H
++#define XW_REMASTER_TARGET_VIEW_H
++#include "xw_runtime/snapshot/render_types.h"
++#include <aeron/aeron.h>
++#include <stdbool.h>
++
++/* Renders the player's target for the XvT-style CMD. Returns false only on a GPU failure. */
++bool XwTargetView_Render(const XwRenderSnapshot* snapshot);
++/* The last rendered target image, or NULL when there is none this frame. */
++AeronTexture* XwTargetView_Texture(float* aspect);
++void XwTargetView_Shutdown(void);
++#endif
+diff --git a/src/xw_remaster/xw_remaster.c b/src/xw_remaster/xw_remaster.c
+index 2a61b17..e774674 100644
+--- a/src/xw_remaster/xw_remaster.c
++++ b/src/xw_remaster/xw_remaster.c
+@@ -5,7 +5,9 @@
+ #include "xw_remaster/flight.h"
+ #include "xw_remaster/flight_scene.h"
+ #include "xw_remaster/hud_assets.h"
++#include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/hud_renderer.h"
++#include "xw_remaster/target_view.h"
+ #include "xw_remaster/presented_frame.h"
+ #include "xw_remaster/view_mode.h"
+ #include "xw_runtime/runtime/flight_loading.h"
+@@ -22,6 +24,7 @@ static void ReleaseFlight(void) {
+ 	XwPresentedFrame_Shutdown();
+ 	XwFlightScene_Shutdown();
+ 	XwHudRenderer_Shutdown();
++	XwTargetView_Shutdown();
+ 	XwRemasterFlight_Shutdown();
+ 	XwRemasterAssets_Shutdown();
+ 	status.assets_prepared = status.asset_failed = false;
+@@ -123,6 +126,12 @@ void XwRemaster_Frame(int32_t delta_us) {
+ 		Aeron_LogDebug("xw.remaster", "Flight renderer prepared in %.1f ms",
+ 					   (double)(Aeron_NowUs() - started) / 1000.0);
+ 	}
++	/* render.xvt_targeting_computer: the CMD's live target model, ahead of the HUD that samples it. */
++	if (status.view_prepared && status.assets_prepared && snapshot->hud_valid && XwHudCmd_Active(snapshot) &&
++		!XwTargetView_Render(snapshot)) {
++		Aeron_RequestFatalRendererError("targeting computer view");
++		return;
++	}
+ 	status.hud_prepared = XwHudRenderer_Prepare(status.view_prepared ? snapshot : NULL,
+ 												status.view_prepared ? &frame->view : NULL, width, height);
+ 	if (Aeron_FatalErrorRequested())
+diff --git a/src/xw_runtime/audio/weapon_sounds.c b/src/xw_runtime/audio/weapon_sounds.c
+new file mode 100644
+index 0000000..cfc2001
+--- /dev/null
++++ b/src/xw_runtime/audio/weapon_sounds.c
+@@ -0,0 +1,109 @@
++#include "xw_runtime/audio/weapon_sounds.h"
++#include "xw/audio/fsfx.h"
++#include "xw/util/memory.h"
++#include "xw_runtime/config/config.h"
++#include <aeron/aeron.h>
++#include <aeron/log.h>
++#include <aeron/vfs.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* XvT's SFXBLAST.LST order for species 137-142, matching X-Wing projectile indices 0-5. */
++static const char* const g_xvtCannonSounds[6] = { "REB-LS-2", "REB-LS-4", "TL-SHT-1",
++												  "TL-BIG-B", "W-LASR-3", "CANNON-1" };
++static bool g_loaded;
++
++static uint32_t Le32(const uint8_t* p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++
++static uint16_t Le16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++/* Converts an 8-bit mono PCM WAV into VOC audio blocks (type 1, unsigned 8-bit) plus a terminator, in a new
++ * memory handle. Returns 0 on any format it does not handle. */
++static uint16_t WavToVoc(const uint8_t* wav, size_t size) {
++	if (size < 12 || memcmp(wav, "RIFF", 4) || memcmp(wav + 8, "WAVE", 4))
++		return 0;
++	const uint8_t* samples = NULL;
++	uint32_t sampleBytes = 0, rate = 0;
++	bool format = false;
++	for (size_t at = 12; at + 8 <= size;) {
++		uint32_t chunk = Le32(wav + at + 4);
++		if (chunk > size - at - 8)
++			return 0;
++		if (!memcmp(wav + at, "fmt ", 4) && chunk >= 16) {
++			const uint8_t* f = wav + at + 8;
++			format = Le16(f) == 1 && Le16(f + 2) == 1 && Le16(f + 14) == 8;
++			rate = Le32(f + 4);
++		} else if (!memcmp(wav + at, "data", 4)) {
++			samples = wav + at + 8;
++			sampleBytes = chunk;
++		}
++		at += 8 + chunk + (chunk & 1);
++	}
++	if (!format || !samples || !sampleBytes || rate < 4000 || rate > 48000)
++		return 0;
++	/* One block per 64 KiB keeps the 24-bit size field and the iMUSE reader's chunking comfortable. */
++	enum { BLOCK = 0xFFF0 };
++	uint32_t blocks = (sampleBytes + BLOCK - 1) / BLOCK;
++	uint32_t total = sampleBytes + blocks * 6 + 1;
++	uint16_t handle = Memory_AllocHandle(total, 0);
++	uint8_t* out = handle ? Memory_LockHandle(handle) : NULL;
++	if (!out) {
++		if (handle)
++			Memory_FreeHandle(handle);
++		return 0;
++	}
++	int divisor = 256 - (int)((1000000 + rate / 2) / rate);
++	if (divisor < 0)
++		divisor = 0;
++	for (uint32_t done = 0; done < sampleBytes;) {
++		uint32_t n = sampleBytes - done < BLOCK ? sampleBytes - done : BLOCK;
++		uint32_t length = n + 2;
++		*out++ = 1;
++		*out++ = (uint8_t)length;
++		*out++ = (uint8_t)(length >> 8);
++		*out++ = (uint8_t)(length >> 16);
++		*out++ = (uint8_t)divisor;
++		*out++ = 0; /* 8-bit unsigned PCM */
++		memcpy(out, samples + done, n);
++		out += n;
++		done += n;
++	}
++	*out = 0;
++	return handle;
++}
++
++void XwWeaponSounds_Apply(void) {
++	g_loaded = false;
++	if (!XwConfig_Settings()->xvt_weapon_sounds)
++		return;
++	uint16_t handles[6] = { 0 };
++	for (unsigned i = 0; i < 6; ++i) {
++		char path[64];
++		snprintf(path, sizeof path, "xvt_weapon_sounds/%s.WAV", g_xvtCannonSounds[i]);
++		uint8_t* data = NULL;
++		size_t size = 0;
++		if (AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 20, &data, &size))
++			handles[i] = WavToVoc(data, size);
++		free(data);
++		if (!handles[i]) {
++			Aeron_LogWarn("xw.audio", "XvT weapon sound %s is missing or unsupported; keeping X-Wing's", path);
++			for (unsigned j = 0; j < i; ++j)
++				Memory_FreeHandle(handles[j]);
++			return;
++		}
++	}
++	for (unsigned i = 0; i < 6; ++i) {
++		unsigned slot = FSFX_FIRST_PLAYABLE_SLOT + i;
++		if (g_fsfxLoadedSoundHandles[slot])
++			Memory_FreeHandle(g_fsfxLoadedSoundHandles[slot]);
++		g_fsfxLoadedSoundHandles[slot] = handles[i];
++	}
++	g_loaded = true;
++}
++
++int XwWeaponSounds_SoundIndex(int projectileIndex, bool sourceIsStarship) {
++	if (g_loaded && !sourceIsStarship && (projectileIndex == 1 || projectileIndex == 5))
++		return projectileIndex - 1;
++	return projectileIndex;
++}
+diff --git a/src/xw_runtime/audio/weapon_sounds.h b/src/xw_runtime/audio/weapon_sounds.h
+new file mode 100644
+index 0000000..4fbecee
+--- /dev/null
++++ b/src/xw_runtime/audio/weapon_sounds.h
+@@ -0,0 +1,15 @@
++#ifndef XW_RUNTIME_AUDIO_WEAPON_SOUNDS_H
++#define XW_RUNTIME_AUDIO_WEAPON_SOUNDS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* audio.xvt_weapon_sounds: replace the six cannon bolt sounds (rebel/Imperial laser and turbolaser, ion and
++ * turbo ion) with X-Wing vs TIE Fighter's, read from RESOURCE xvt_weapon_sounds/<NAME>.WAV (8-bit PCM WAV,
++ * copied from an XvT installation at packaging time). Call after the flight sound bank loads. */
++void XwWeaponSounds_Apply(void);
++/* With the XvT set loaded, starfighters' charged shots (projectile index 1 or 5) use the plain starfighter
++ * cannon sound as in XvT; turbolaser sounds stay with starship guns. Returns the projectile index to voice. */
++int XwWeaponSounds_SoundIndex(int projectileIndex, bool sourceIsStarship);
++
++#endif
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index ebac412..6ef49e1 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -6,6 +6,7 @@ static int s_laser_convergence_m = 550;
+ static bool s_xvt_lasers = true;
+ static int s_ai_ion_link = XW_AI_ION_LINK_ALL;
+ static bool s_xvt_throttle = true;
++static bool s_xvt_targeting_computer = true;
+ 
+ enum { CANNON_PROJECTILE_TYPES = 6 };
+ 
+@@ -35,6 +36,10 @@ bool XwFlightTweaks_XvtThrottle(void) { return s_xvt_throttle; }
+ 
+ void XwFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
+ 
++bool XwFlightTweaks_XvtTargetingComputer(void) { return s_xvt_targeting_computer; }
++
++void XwFlightTweaks_SetXvtTargetingComputer(bool enabled) { s_xvt_targeting_computer = enabled; }
++
+ int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base) {
+ 	return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES ? (int16_t)(2 * base) : base;
+ }
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 5b5c641..6d318b6 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -38,6 +38,10 @@ int XwFlightTweaks_AiIonLink(void);
+ void XwFlightTweaks_SetAiIonLink(int mode);
+ bool XwFlightTweaks_XvtThrottle(void);
+ void XwFlightTweaks_SetXvtThrottle(bool enabled);
++/* render.xvt_targeting_computer: the CMD shows X-Wing vs TIE Fighter's layout (name, shields, hull and
++ * systems, a live 3D model of the target, orders, range) in 1998 flight, and also with the cockpit off. */
++bool XwFlightTweaks_XvtTargetingComputer(void);
++void XwFlightTweaks_SetXvtTargetingComputer(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 3f490b2..8d98697 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -35,6 +35,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtLasers(settings->xvt_lasers != 0);
+ 	XwFlightTweaks_SetAiIonLink(settings->ai_ion_link);
+ 	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
++	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ }
+ 
+ static void ApplyAudioFilter(void) {
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 5e24805..3ed135a 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -114,6 +114,8 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_throttle", xvt_throttle),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
++	SETTING_BOOL("render.xvt_targeting_computer", xvt_targeting_computer),
++	SETTING_BOOL("audio.xvt_weapon_sounds", xvt_weapon_sounds),
+ 	SETTING_STRING("music.arrangement", music.arrangement),
+ 	SETTING_STRING("music.backend", music.backend),
+ 	SETTING_STRING("music.soundfont", music.soundfont),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 9994d46..5c35cfc 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -38,7 +38,7 @@ typedef struct XwSettings {
+ 	int laser_convergence;
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+-	int cockpit_stretch, hud_widescreen;
++	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index 6705a32..c79da69 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -63,6 +63,8 @@ static const struct {
+ 	{ "view_toggle_cockpit", "Toggle cockpit", XW_INPUT_ACTION_CATEGORY_VIEW, 46 },
+ 	{ "view_player", "Return to player craft", XW_INPUT_ACTION_CATEGORY_VIEW, 195 },
+ 	{ "view_warhead", "Follow fired warhead", XW_INPUT_ACTION_CATEGORY_VIEW, 196 },
++	/* Not in X-Wing: TIE Fighter / XvT style target view (USER_KEY_TARGET_VIEW). */
++	{ "view_target", "View target", XW_INPUT_ACTION_CATEGORY_VIEW, 122 },
+ 	{ "view_external", "Toggle external view", XW_INPUT_ACTION_CATEGORY_VIEW, 47 },
+ 	{ "view_manual_camera", "Toggle camera control", XW_INPUT_ACTION_CATEGORY_VIEW, 63 },
+ 	{ "info_map", "Map", XW_INPUT_ACTION_CATEGORY_INFORMATION, 109 },
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index 9386d66..678a02c 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -60,6 +60,7 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_VIEW_TOGGLE_COCKPIT,
+ 	XW_INPUT_ACTION_VIEW_PLAYER,
+ 	XW_INPUT_ACTION_VIEW_WARHEAD,
++	XW_INPUT_ACTION_VIEW_TARGET,
+ 	XW_INPUT_ACTION_VIEW_EXTERNAL,
+ 	XW_INPUT_ACTION_VIEW_MANUAL_CAMERA,
+ 	XW_INPUT_ACTION_INFO_MAP,
+diff --git a/src/xw_runtime/snapshot/render_capture.c b/src/xw_runtime/snapshot/render_capture.c
+index e8d2366..01aff16 100644
+--- a/src/xw_runtime/snapshot/render_capture.c
++++ b/src/xw_runtime/snapshot/render_capture.c
+@@ -5,6 +5,7 @@
+ #include "xw_runtime/snapshot/render_camera.h"
+ #include "xw_runtime/snapshot/render_hud.h"
+ #include "xw_runtime/snapshot/render_objects.h"
++#include "xw_runtime/snapshot/render_readout.h"
+ #include "xw_runtime/snapshot/render_sky.h"
+ #include "xw_runtime/snapshot/render_snapshot_internal.h"
+ #include "xw_runtime/snapshot/render_world.h"
+@@ -184,6 +185,7 @@ void XwRenderCapture_CaptureWorld(void) {
+ 	out->world_valid = XwRenderObjects_Capture(out) && camera_valid;
+ 	if (!XwRenderWorld_Capture(out) || !XwRenderSky_Capture(out))
+ 		out->world_valid = 0;
++	XwReadout_Capture(&out->readout);
+ }
+ 
+ void XwRenderCapture_BeginView(XwRenderSurface target) {
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+new file mode 100644
+index 0000000..52c7e15
+--- /dev/null
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -0,0 +1,169 @@
++/* render.xvt_readout: X-Wing vs TIE Fighter style target and craft status text for the modern HUD. */
++#include "xw_runtime/snapshot/render_readout.h"
++#include "xw/flight/ai/pai.h"
++#include "xw/flight/hud/festring.h"
++#include "xw/flight/hud/msg.h"
++#include "xw/flight/hud/panel.h"
++#include "xw/flight/mission/mission.h"
++#include "xw/flight/object/craft.h"
++#include "xw/flight/object/create.h"
++#include "xw/flight/object/laser.h"
++#include "xw/flight/player/user.h"
++#include "xw/flight/replay/replay.h"
++#include "xw/flight/xw.h"
++#include "xw/math/math2.h"
++#include "xw/math/trig2.h"
++#include "xw_dos94/flight/hud/replay.h"
++#include "xw_runtime/runtime/flight_panel.h"
++#include "xw_runtime/runtime/flight_types.h"
++#include "xw_runtime/snapshot/render_objects.h"
++#include <ctype.h>
++#include <string.h>
++
++/* Copies visible text, dropping the flight font's color escapes, uppercased for the HUD fonts. */
++static void CopyText(char* out, size_t capacity, const char* in) {
++	size_t n = 0;
++	for (; in && *in && n + 1 < capacity; ++in) {
++		unsigned char c = (unsigned char)*in;
++		if (c == FLIGHT_TEXT_COLOR_ESCAPE) {
++			if (!in[1])
++				break;
++			++in;
++			continue;
++		}
++		if (c < FLIGHT_TEXT_FIRST_DRAWABLE_BYTE && c != ' ')
++			continue;
++		out[n++] = (char)toupper(c);
++	}
++	out[n] = 0;
++}
++
++static int Percent(int value, int maximum) {
++	if (maximum <= 0)
++		return -1;
++	if (value < 0)
++		value = 0;
++	return (int)((value * 100L + maximum / 2) / maximum);
++}
++
++static int ShieldPercent(const CraftData* craft) {
++	int nominal = g_craftTypeDefs[craft->craftTypeIndex].nominalShieldEnergy[XW_SHIELD_FRONT] +
++				  g_craftTypeDefs[craft->craftTypeIndex].nominalShieldEnergy[XW_SHIELD_REAR];
++	if (nominal <= 0)
++		return -1;
++	if (!(craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_SHIELDS))
++		return 0;
++	int energy = (craft->shieldEnergy[XW_SHIELD_FRONT] > 0 ? craft->shieldEnergy[XW_SHIELD_FRONT] : 0) +
++				 (craft->shieldEnergy[XW_SHIELD_REAR] > 0 ? craft->shieldEnergy[XW_SHIELD_REAR] : 0);
++	return Percent(energy, nominal);
++}
++
++static int HullPercent(const CraftData* craft) {
++	if (!craft->hullMax)
++		return -1;
++	int remaining = (int)craft->hullMax - (int)craft->hullDamage;
++	return Percent(remaining, craft->hullMax);
++}
++
++static bool LiveObject(uint16_t ref) {
++	return ref < XW_OBJECT_COUNT && g_objectTable[ref].objectType != XW_OBJ_NONE &&
++		   g_objectTable[ref].genusId != XW_GENUS_EXPLOSION_EFFECT;
++}
++
++static void ObjectName(uint16_t ref, char* out, size_t capacity) {
++	uint16_t type = ref < XW_MISSION_OBJECT_REF_BASE ? g_objectTable[ref].objectType
++													 : g_missionObjects[ref - XW_MISSION_OBJECT_REF_BASE].objectType;
++	char saved[FLIGHT_TEXT_SCRATCH_CAPACITY];
++	memcpy(saved, g_flightTextScratchBuffer, sizeof saved);
++	panel_buildobjectname(ref, type);
++	CopyText(out, capacity, g_flightTextScratchBuffer);
++	memcpy(g_flightTextScratchBuffer, saved, sizeof saved);
++}
++
++static void CaptureTarget(XwSnapReadout* r) {
++	uint16_t ref = g_playerFlightState.currentTargetObjectIdx;
++	if (ref == XW_OBJECT_SLOT_UNAVAILABLE)
++		return;
++	if (ref < XW_MISSION_OBJECT_REF_BASE ? !LiveObject(ref)
++										 : ref - XW_MISSION_OBJECT_REF_BASE >= MISSION_OBJECT_COUNT ||
++											   g_missionObjects[ref - XW_MISSION_OBJECT_REF_BASE].objectType ==
++												   XW_OBJ_NONE)
++		return;
++	r->target_valid = 1;
++	r->target = XwRenderObjects_Id(ref);
++	r->target_shield_pct = r->target_hull_pct = r->target_system_pct = -1;
++	ObjectName(ref, r->target_name, sizeof r->target_name);
++	/* Mission objects (mines, buoys) carry no IFF. */
++	if (ref < XW_MISSION_OBJECT_REF_BASE) {
++		uint8_t iff = g_objectTable[ref].iff;
++		r->target_relation = iff == g_playerFlightState.object->iff ? 0 : iff <= 1 ? 1 : 2;
++	} else
++		r->target_relation = 2;
++
++	/* pai_distancebetween changes trig2 globals; keep the CMD's distance scale (units * 161 >> 16). */
++	int32_t polar = g_trig2PolarDistance;
++	int16_t pitch = g_trig2Pitch, yaw = g_trig2Yaw;
++	pai_distancebetween(g_playerFlightState.objectIndex, ref);
++	unsigned hundredths = (unsigned)(((uint64_t)(uint32_t)g_trig2PolarDistance * PANEL_DISTANCE_SCALE) >>
++									 PANEL_DISTANCE_SCALE_SHIFT);
++	r->target_distance_hundredths = (uint16_t)(hundredths > 9999 ? 9999 : hundredths);
++	g_trig2PolarDistance = polar;
++	g_trig2Pitch = pitch;
++	g_trig2Yaw = yaw;
++
++	if (ref >= XW_MISSION_OBJECT_REF_BASE || g_objectTable[ref].familyId != XW_OBJECT_FAMILY_CRAFT) {
++		/* Warheads report what they are tracking, as the CMD does. */
++		if (ref < XW_MISSION_OBJECT_REF_BASE && XwFlightTypes_IsWarhead(g_objectTable[ref].objectType)) {
++			const WarheadGuidanceState* guidance = g_objectTable[ref].instanceData;
++			strcpy(r->target_orders, guidance && guidance->homingTier ? "TRACKING" : "UNGUIDED");
++			if (guidance && guidance->homingTier) {
++				if (guidance->targetObjIdx == g_playerFlightState.objectIndex)
++					strcpy(r->target_order_target, "OUR CRAFT");
++				else if (LiveObject(guidance->targetObjIdx))
++					ObjectName(guidance->targetObjIdx, r->target_order_target, sizeof r->target_order_target);
++			}
++		}
++		return;
++	}
++	const CraftData* craft = g_objectTable[ref].instanceData;
++	if (!craft)
++		return;
++	r->target_shield_pct = (int16_t)ShieldPercent(craft);
++	r->target_hull_pct = (int16_t)HullPercent(craft);
++	/* X-Wing tracks eight subsystems as working bits rather than XvT's system damage percentage. */
++	unsigned working = 0;
++	for (unsigned bit = 0; bit < 8; ++bit)
++		working += (craft->workingSubsystems >> bit) & 1;
++	r->target_system_pct = (int16_t)Percent((int)working, 8);
++	if (g_craftTypeDefs[craft->craftTypeIndex].hasCargo) {
++		r->cargo_valid = 1;
++		char cargo[sizeof craft->cargoName + 1] = { 0 };
++		memcpy(cargo, craft->cargoName, sizeof craft->cargoName);
++		CopyText(r->target_cargo, sizeof r->target_cargo,
++				 !craft->isInspected ? "UNKNOWN" : cargo[0] ? cargo : "NONE");
++	}
++	if (craft->aiCurrentPlanId < USER_AI_STATUS_COUNT) {
++		unsigned message = g_aiPlanStatusMessageIds[craft->aiCurrentPlanId];
++		if (message && message < XW_MSG_TEMPLATE_COUNT)
++			CopyText(r->target_orders, sizeof r->target_orders, g_flightMessageTemplates[message]);
++	}
++	if (craft->aiTargetRef != ref && craft->aiTargetRef < XW_OBJECT_COUNT && LiveObject(craft->aiTargetRef)) {
++		if (craft->aiTargetRef == g_playerFlightState.objectIndex)
++			strcpy(r->target_order_target, "OUR CRAFT");
++		else
++			ObjectName(craft->aiTargetRef, r->target_order_target, sizeof r->target_order_target);
++	}
++}
++
++void XwReadout_Capture(XwSnapReadout* r) {
++	memset(r, 0, sizeof *r);
++	if (!g_playerFlightState.craft || !g_playerFlightState.object || g_replayviewmode)
++		return;
++	const XwFlightPanelLayout* layout = XwFlightPanel_Layout();
++	r->cmd = (XwSnapRect) { g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].x,
++							g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].y, layout->width, layout->footerBottom };
++	r->valid = r->cmd.width > 0 && r->cmd.height > 0;
++	/* The CMD shows nothing while the targeting computer is damaged or switched off by damage. */
++	if (r->valid && (g_playerFlightState.craft->activeHudFeatureMask & PANEL_CMD_FEATURE))
++		CaptureTarget(r);
++}
+diff --git a/src/xw_runtime/snapshot/render_readout.h b/src/xw_runtime/snapshot/render_readout.h
+new file mode 100644
+index 0000000..2ec3cb5
+--- /dev/null
++++ b/src/xw_runtime/snapshot/render_readout.h
+@@ -0,0 +1,7 @@
++#ifndef XW_RUNTIME_SNAPSHOT_RENDER_READOUT_H
++#define XW_RUNTIME_SNAPSHOT_RENDER_READOUT_H
++#include "xw_runtime/snapshot/render_types.h"
++
++/* Fills the XvT-style target and craft status readout from the live flight state. */
++void XwReadout_Capture(XwSnapReadout* readout);
++#endif
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 37ffe70..2a36cb5 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -202,6 +202,18 @@ typedef struct XwSnapTargetBox {
+ 	uint8_t color_index, visible, direct_overlay;
+ } XwSnapTargetBox;
+ 
++/* render.xvt_targeting_computer: XvT-style targeting computer contents, captured from flight state each world
++ * frame. Strings are uppercase ASCII; percentages are -1 when not applicable. */
++typedef struct XwSnapReadout {
++	uint8_t valid, target_valid, target_relation; /* relation: 0 friendly, 1 hostile, 2 other. */
++	uint8_t cargo_valid;
++	XwSnapObjectId target;                        /* Rendered as a 3D model in the CMD. */
++	int16_t target_shield_pct, target_hull_pct, target_system_pct;
++	uint16_t target_distance_hundredths; /* Hundredths of a kilometre, as the CMD shows. */
++	XwSnapRect cmd;                      /* The CMD screen in classic cockpit pixels. */
++	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
++} XwSnapReadout;
++
+ typedef struct XwSnapWidget {
+ 	uint16_t value;    /* Resolved sprite state or filled count. */
+ 	uint16_t segments; /* For a repeated-segment gauge. */
+@@ -312,6 +324,7 @@ typedef struct XwRenderSnapshot {
+ 	XwSnapHyperspace hyperspace;
+ 	XwSnapSpecialWorld special;
+ 	XwSnapTargetBox target_box;
++	XwSnapReadout readout;
+ 	uint32_t object_count, craft_count;
+ 	XwSnapObject objects[XW_SNAP_OBJECTS];
+ 	XwSnapCraft crafts[XW_SNAP_CRAFTS];

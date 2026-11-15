@@ -1,0 +1,103 @@
+From a108342b6515ba894eb54155a8018a1d3034179e Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 20:24:18 +1100
+Subject: [PATCH 24/59] XvT B-Wing cockpit: panel text, CMD layout, name box
+ erased
+
+- XwXvtCockpit_PanelText covers all four craft. B-Wing clock, throttle and
+  speed boxes measured from BWING12 art; no captions (XvT shows none).
+- B-Wing CMD rect starts 22 px above the 3D view and ends 25 px below.
+- EraseNameBox can repeat plain rows down; the B-Wing box uses rows 475-479.
+---
+ src/xw_remaster/hud_readout.c |  4 ++++
+ src/xw_remaster/xvt_cockpit.c | 26 +++++++++++++++++---------
+ 2 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index bf96419..70516ed 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -242,6 +242,7 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 		{ "xwing", { 421, 390, 39, 19 }, { 425, 416, 34, 19 }, { 424, 451, 36, 18 } },
+ 		{ "ywing", { 130, 398, 46, 20 }, { 384, 448, 33, 17 }, { 400, 427, 34, 16 } },
+ 		{ "awing", { 472, 428, 46, 20 }, { 232, 444, 33, 17 }, { 252, 421, 34, 16 } },
++		{ "bwing", { 492, 370, 38, 18 }, { 152, 429, 36, 17 }, { 196, 429, 34, 17 } },
+ 	};
+ 	unsigned craft = 0;
+ 	while (craft + 1 < sizeof kBoxes / sizeof kBoxes[0] && strcmp(kBoxes[craft].craft, XwXvtCockpit_Craft()))
+@@ -263,6 +264,9 @@ bool XwHudXvtPanel_Draw(const XwHudDraw* d) {
+ 	BoxText(&labels, &throttle_box, text, PANEL_VALUE);
+ 	XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, digits, sizeof digits);
+ 	BoxText(&labels, &speed_box, digits[0] ? digits : "0", PANEL_VALUE);
++	/* The B-Wing's caption elements are placed but unused (selector 0): XvT shows no captions there. */
++	if (!strcmp(kBoxes[craft].craft, "bwing"))
++		return true;
+ 	if (!xwing) {
+ 		PanelText(&labels, 121, "SPD", PANEL_LABEL);
+ 		PanelText(&labels, 120, "THROTTLE", PANEL_LABEL);
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index 6c67fec..1d31e6d 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -235,16 +235,19 @@ static void FrameRgba(const AeronIndexedFrame* frame, const uint32_t colors[256]
+ 
+ /* XvT's craft name box shows nothing in X-Wing, so it is painted over with the cockpit's own art: the
+  * Y-Wing's from the mirror-image spot on the right (the cockpit is symmetric, so ledge and strut line up);
+- * the X-Wing's and A-Wing's from plain panel on the same rows, repeated across when narrower. */
++ * the X-Wing's and A-Wing's from plain panel on the same rows, repeated across when narrower; the B-Wing's
++ * from the plain rows under it, repeated down. */
+ static void EraseNameBox(const char* lfd_name, AeronIndexedFrame* frame) {
+ 	static const struct {
+ 		const char* lfd;
+ 		int16_t x0, y0, x1, y1;
+ 		int16_t source_x, source_width; /* source_width 0: mirrored. */
++		int16_t source_y, source_height; /* source_height > 0: same columns, rows repeated down. */
+ 	} kNameBoxes[] = {
+-		{ "XWING12", 92, 457, 192, 480, 460, 100 },
+-		{ "YWING12", 0, 300, 125, 345, 0, 0 },
+-		{ "AWING12", 120, 459, 221, 480, 220, 68 },
++		{ "XWING12", 92, 457, 192, 480, 460, 100, 0, 0 },
++		{ "YWING12", 0, 300, 125, 345, 0, 0, 0, 0 },
++		{ "AWING12", 120, 459, 221, 480, 220, 68, 0, 0 },
++		{ "BWING12", 132, 452, 234, 475, 0, 0, 475, 5 },
+ 	};
+ 	if (frame->width < 640 || frame->height < 480)
+ 		return;
+@@ -253,10 +256,14 @@ static void EraseNameBox(const char* lfd_name, AeronIndexedFrame* frame) {
+ 			continue;
+ 		for (int y = kNameBoxes[i].y0; y < kNameBoxes[i].y1; ++y)
+ 			for (int x = kNameBoxes[i].x0; x < kNameBoxes[i].x1; ++x) {
+-				int sx = kNameBoxes[i].source_width
++				int sx = kNameBoxes[i].source_height ? x
++						 : kNameBoxes[i].source_width
+ 							 ? kNameBoxes[i].source_x + (x - kNameBoxes[i].x0) % kNameBoxes[i].source_width
+ 							 : 639 - x;
+-				size_t to = (size_t)y * frame->width + x, from = (size_t)y * frame->width + sx;
++				int sy = kNameBoxes[i].source_height
++							 ? kNameBoxes[i].source_y + (y - kNameBoxes[i].y0) % kNameBoxes[i].source_height
++							 : y;
++				size_t to = (size_t)y * frame->width + x, from = (size_t)sy * frame->width + sx;
+ 				frame->indices[to] = frame->indices[from];
+ 				frame->coverage[to] = frame->coverage[from];
+ 			}
+@@ -662,7 +669,9 @@ bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* s, XwSnapRect* rect) {
+ 	if (s->cockpit.view == 0) {
+ 		/* Element 2 is the CMD's 3D view; the screen around it has a title row above and a status row below. */
+ 		const Element* crt = &g_craft.elements[2];
+-		int top = crt->y - 30, bottom = crt->y + crt->color + 20;
++		/* The B-Wing's screen starts lower above its 3D view and runs further below. */
++		bool bwing = g_craft.name[0] == 'b';
++		int top = crt->y - (bwing ? 22 : 30), bottom = crt->y + crt->color + (bwing ? 25 : 20);
+ 		*rect = (XwSnapRect) { crt->x, top, crt->selector + 2, (bottom < 480 ? bottom : 478) - top };
+ 	} else if (s->cockpit.view == VIEW_HUD)
+ 		*rect = (XwSnapRect) { 232, 358, 176, 120 };
+@@ -887,8 +896,7 @@ bool XwXvtCockpit_DrawInstrument(const XwHudDraw* d, unsigned index, const XwSna
+ }
+ 
+ bool XwXvtCockpit_PanelText(const XwRenderSnapshot* s) {
+-	return XwXvtCockpit_Active(s) && s->cockpit.view == 0 &&
+-		   (!strcmp(g_craft.name, "xwing") || !strcmp(g_craft.name, "ywing") || !strcmp(g_craft.name, "awing"));
++	return XwXvtCockpit_Active(s) && s->cockpit.view == 0;
+ }
+ 
+ const char* XwXvtCockpit_Craft(void) { return g_craft.name; }

@@ -1,0 +1,24 @@
+From 499724f2f08c4246c3660f35e40e3d8c22821b60 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 06:58:15 +1100
+Subject: [PATCH 1/4] Let manual-convergence craft cycle on to automatic
+ convergence
+
+---
+ src/xwa/flight/flight.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/xwa/flight/flight.c b/src/xwa/flight/flight.c
+index 371ab6c..54c1246 100644
+--- a/src/xwa/flight/flight.c
++++ b/src/xwa/flight/flight.c
+@@ -9176,7 +9176,8 @@ void Flight_ProcessPlayerActions(unsigned int playerIdx) {
+ 				if (!g_players[currentPlayerIdx].hasCheckpointFlag) {
+ 					uint8_t convergeMode = g_modelDefs[craft->modelIndex].laserConvergeMode;
+ 					if (convergeMode == 1) {
+-						craft->laserConvergeLevel = (uint8_t)((craft->laserConvergeLevel + 1) % 4);
++						// Manual craft also cycle on to level 4 (automatic convergence on the current target).
++						craft->laserConvergeLevel = (uint8_t)((craft->laserConvergeLevel + 1) % 5);
+ 						msg_emitInFlightMessage(
+ 							(uint16_t)(craft->laserConvergeLevel + MSG_LASERS_CONVERGE_OFF),
+ 							(int)currentPlayerIdx);

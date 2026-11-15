@@ -1,0 +1,98 @@
+From 6b40ec24197df2b786b520b8a8df4f29dc15b9de Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:18:46 +1100
+Subject: [PATCH 03/59] Fix silent XvT weapon sounds (VOC header); frame CMD
+ target by the game's model extent
+
+---
+ src/xw_remaster/target_view.c            | 6 ++++--
+ src/xw_runtime/audio/weapon_sounds.c     | 7 ++++++-
+ src/xw_runtime/snapshot/render_readout.c | 7 +++++++
+ src/xw_runtime/snapshot/render_types.h   | 1 +
+ 4 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/src/xw_remaster/target_view.c b/src/xw_remaster/target_view.c
+index ec806c9..0812ad0 100644
+--- a/src/xw_remaster/target_view.c
++++ b/src/xw_remaster/target_view.c
+@@ -92,7 +92,9 @@ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 		const float* m = instance.transform + 4 * r;
+ 		centre[r] = m[0] * local[0] + m[1] * local[1] + m[2] * local[2];
+ 	}
+-	float radius = sqrtf(half2) * scale * 0.85f;
++	/* Prefer the game's own size for the craft (the one its target brackets use); some OPT bounding boxes
++	 * are far larger than the visible ship. */
++	float radius = s->readout.target_extent ? s->readout.target_extent * 0.55f : sqrtf(half2) * scale * 0.85f;
+ 	if (!(radius > 0))
+ 		return true;
+ 
+@@ -116,7 +118,7 @@ bool XwTargetView_Render(const XwRenderSnapshot* s) {
+ 					  forward[1],
+ 					  forward[2] };
+ 	float v_half = 0.32f, h_half = atanf(tanf(v_half) * TARGET_VIEW_W / TARGET_VIEW_H);
+-	float distance = radius / sinf(v_half) * 1.08f;
++	float distance = radius / tanf(v_half) * 1.1f;
+ 	AeronSceneCamera camera = { .h_half_rad = h_half,
+ 								.v_half_rad = v_half,
+ 								.near_z = fmaxf(1.0f, distance - radius * 2.0f),
+diff --git a/src/xw_runtime/audio/weapon_sounds.c b/src/xw_runtime/audio/weapon_sounds.c
+index cfc2001..6ce43cc 100644
+--- a/src/xw_runtime/audio/weapon_sounds.c
++++ b/src/xw_runtime/audio/weapon_sounds.c
+@@ -45,7 +45,10 @@ static uint16_t WavToVoc(const uint8_t* wav, size_t size) {
+ 	/* One block per 64 KiB keeps the 24-bit size field and the iMUSE reader's chunking comfortable. */
+ 	enum { BLOCK = 0xFFF0 };
+ 	uint32_t blocks = (sampleBytes + BLOCK - 1) / BLOCK;
+-	uint32_t total = sampleBytes + blocks * 6 + 1;
++	/* imuse_start_sound recognises waves by the VOC file header ("Crea" magic). */
++	static const uint8_t header[26] = { 'C', 'r', 'e', 'a', 't', 'i', 'v', 'e', ' ', 'V', 'o', 'i', 'c',
++										'e', ' ', 'F', 'i', 'l', 'e', 0x1A, 0x1A, 0x00, 0x0A, 0x01, 0x29, 0x11 };
++	uint32_t total = sizeof header + sampleBytes + blocks * 6 + 1;
+ 	uint16_t handle = Memory_AllocHandle(total, 0);
+ 	uint8_t* out = handle ? Memory_LockHandle(handle) : NULL;
+ 	if (!out) {
+@@ -53,6 +56,8 @@ static uint16_t WavToVoc(const uint8_t* wav, size_t size) {
+ 			Memory_FreeHandle(handle);
+ 		return 0;
+ 	}
++	memcpy(out, header, sizeof header);
++	out += sizeof header;
+ 	int divisor = 256 - (int)((1000000 + rate / 2) / rate);
+ 	if (divisor < 0)
+ 		divisor = 0;
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 52c7e15..1fe41bd 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -1,5 +1,6 @@
+ /* render.xvt_readout: X-Wing vs TIE Fighter style target and craft status text for the modern HUD. */
+ #include "xw_runtime/snapshot/render_readout.h"
++#include "xw/assets/model_mesh.h"
+ #include "xw/flight/ai/pai.h"
+ #include "xw/flight/hud/festring.h"
+ #include "xw/flight/hud/msg.h"
+@@ -91,6 +92,12 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 		return;
+ 	r->target_valid = 1;
+ 	r->target = XwRenderObjects_Id(ref);
++	{
++		uint16_t type = ref < XW_MISSION_OBJECT_REF_BASE
++							? g_objectTable[ref].objectType
++							: g_missionObjects[ref - XW_MISSION_OBJECT_REF_BASE].objectType;
++		r->target_extent = type < MODEL_TYPE_RECORD_COUNT ? g_modelTypeTable[type].maxBoundsExtent : 0;
++	}
+ 	r->target_shield_pct = r->target_hull_pct = r->target_system_pct = -1;
+ 	ObjectName(ref, r->target_name, sizeof r->target_name);
+ 	/* Mission objects (mines, buoys) carry no IFF. */
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 2a36cb5..767bc08 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -210,6 +210,7 @@ typedef struct XwSnapReadout {
+ 	XwSnapObjectId target;                        /* Rendered as a 3D model in the CMD. */
+ 	int16_t target_shield_pct, target_hull_pct, target_system_pct;
+ 	uint16_t target_distance_hundredths; /* Hundredths of a kilometre, as the CMD shows. */
++	uint16_t target_extent;              /* The game's model size (maxBoundsExtent), in world units. */
+ 	XwSnapRect cmd;                      /* The CMD screen in classic cockpit pixels. */
+ 	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
+ } XwSnapReadout;

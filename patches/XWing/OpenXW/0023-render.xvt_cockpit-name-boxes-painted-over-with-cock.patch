@@ -1,0 +1,110 @@
+From e9e72f6a818dd069f053f7a5daa535f4185558c0 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 20:11:41 +1100
+Subject: [PATCH 23/59] render.xvt_cockpit: name boxes painted over with
+ cockpit art (Y-Wing mirrored from the right; X/A-Wing from plain panel)
+
+---
+ src/xw_remaster/xvt_cockpit.c | 70 ++++++++++-------------------------
+ 1 file changed, 20 insertions(+), 50 deletions(-)
+
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+index b58ca48..6c67fec 100644
+--- a/src/xw_remaster/xvt_cockpit.c
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -233,62 +233,33 @@ static void FrameRgba(const AeronIndexedFrame* frame, const uint32_t colors[256]
+ 		XwUndither_Apply(frame, (const uint8_t(*)[4])palette, 256, rgba);
+ }
+ 
+-/* XvT's craft name box shows nothing in X-Wing, so it is erased from the art. The Y-Wing's hangs over the
+- * canopy opening and is cleared; the others sit on dithered panel and take the average of the darker half of
+- * the panel around them, which is how that panel reads once smoothed. */
+-static void EraseNameBox(const char* lfd_name, unsigned width, uint8_t* rgba) {
++/* XvT's craft name box shows nothing in X-Wing, so it is painted over with the cockpit's own art: the
++ * Y-Wing's from the mirror-image spot on the right (the cockpit is symmetric, so ledge and strut line up);
++ * the X-Wing's and A-Wing's from plain panel on the same rows, repeated across when narrower. */
++static void EraseNameBox(const char* lfd_name, AeronIndexedFrame* frame) {
+ 	static const struct {
+ 		const char* lfd;
+ 		int16_t x0, y0, x1, y1;
+-		bool clear;
++		int16_t source_x, source_width; /* source_width 0: mirrored. */
+ 	} kNameBoxes[] = {
+-		{ "XWING12", 92, 457, 192, 480, false },
+-		{ "YWING12", 0, 311, 98, 329, true },
+-		{ "AWING12", 120, 459, 221, 480, false },
++		{ "XWING12", 92, 457, 192, 480, 460, 100 },
++		{ "YWING12", 0, 300, 125, 345, 0, 0 },
++		{ "AWING12", 120, 459, 221, 480, 220, 68 },
+ 	};
+-	enum { RING = 4 };
++	if (frame->width < 640 || frame->height < 480)
++		return;
+ 	for (unsigned i = 0; i < sizeof kNameBoxes / sizeof kNameBoxes[0]; ++i) {
+ 		if (strcasecmp(lfd_name, kNameBoxes[i].lfd))
+ 			continue;
+-		int x0 = kNameBoxes[i].x0, y0 = kNameBoxes[i].y0, x1 = kNameBoxes[i].x1, y1 = kNameBoxes[i].y1;
+-		uint8_t fill[4] = { 0, 0, 0, 0 };
+-		if (!kNameBoxes[i].clear) {
+-			/* Brightness histogram of the ring (r+g+b), then the mean of the pixels at or below its median. */
+-			unsigned histogram[766] = { 0 }, count = 0;
+-			for (int y = y0 - RING; y < y1 + RING; ++y)
+-				for (int x = x0 - RING; x < x1 + RING; ++x) {
+-					if (x < 0 || y < 0 || x >= 640 || y >= 480 || (x >= x0 && x < x1 && y >= y0 && y < y1))
+-						continue;
+-					const uint8_t* p = rgba + ((size_t)y * width + x) * 4;
+-					if (p[3]) {
+-						++histogram[p[0] + p[1] + p[2]];
+-						++count;
+-					}
+-				}
+-			unsigned median = 0;
+-			for (unsigned seen = 0; median < 765 && (seen += histogram[median]) < (count + 1) / 2;)
+-				++median;
+-			unsigned long sum[3] = { 0, 0, 0 }, n = 0;
+-			for (int y = y0 - RING; y < y1 + RING; ++y)
+-				for (int x = x0 - RING; x < x1 + RING; ++x) {
+-					if (x < 0 || y < 0 || x >= 640 || y >= 480 || (x >= x0 && x < x1 && y >= y0 && y < y1))
+-						continue;
+-					const uint8_t* p = rgba + ((size_t)y * width + x) * 4;
+-					if (p[3] && (unsigned)(p[0] + p[1] + p[2]) <= median) {
+-						for (unsigned c = 0; c < 3; ++c)
+-							sum[c] += p[c];
+-						++n;
+-					}
+-				}
+-			if (!n)
+-				continue;
+-			for (unsigned c = 0; c < 3; ++c)
+-				fill[c] = (uint8_t)(sum[c] / n);
+-			fill[3] = 255;
+-		}
+-		for (int y = y0; y < y1; ++y)
+-			for (int x = x0; x < x1; ++x)
+-				memcpy(rgba + ((size_t)y * width + x) * 4, fill, 4);
++		for (int y = kNameBoxes[i].y0; y < kNameBoxes[i].y1; ++y)
++			for (int x = kNameBoxes[i].x0; x < kNameBoxes[i].x1; ++x) {
++				int sx = kNameBoxes[i].source_width
++							 ? kNameBoxes[i].source_x + (x - kNameBoxes[i].x0) % kNameBoxes[i].source_width
++							 : 639 - x;
++				size_t to = (size_t)y * frame->width + x, from = (size_t)y * frame->width + sx;
++				frame->indices[to] = frame->indices[from];
++				frame->coverage[to] = frame->coverage[from];
++			}
+ 	}
+ }
+ 
+@@ -327,12 +298,11 @@ static AeronTexture* Texture(const char* lfd_name, XwSnapRect aperture, const ui
+ 	if (panl && AeronPnl_DecodeIndexed(panl->data, panl->size, 0, -1, &frame, NULL)) {
+ 		if (mask)
+ 			ApplyMask(&frame, mask, aperture);
++		EraseNameBox(lfd_name, &frame);
+ 		size_t pixels = (size_t)frame.width * frame.height;
+ 		uint8_t* rgba = malloc(pixels * 4);
+ 		if (rgba) {
+ 			FrameRgba(&frame, colors, rgba);
+-			if (frame.width >= 640 && frame.height >= 480)
+-				EraseNameBox(lfd_name, frame.width, rgba);
+ 			AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 			texture = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
+ 								.width = frame.width,

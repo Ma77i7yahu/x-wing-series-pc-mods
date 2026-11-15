@@ -1,0 +1,324 @@
+From 43f3f18df98c96f9a10623c7d4364b93a0de5bd4 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 21:42:42 +1100
+Subject: [PATCH 31/59] XvT cockpit: messages in XvT MICRO64 mixed case
+ (title-cased names, TIE kept); XvT text keeps its shape when stretched (fixes
+ HULL/SYS overlap)
+
+---
+ src/xw_remaster/hud_readout.c            | 140 +++++++++++++++++------
+ src/xw_remaster/hud_readout.h            |   5 +
+ src/xw_remaster/hud_renderer.c           |   9 +-
+ src/xw_runtime/snapshot/render_readout.c |  27 +++--
+ src/xw_runtime/snapshot/render_readout.h |   4 +
+ 5 files changed, 139 insertions(+), 46 deletions(-)
+
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index cd20c1a..0d4a8fa 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -4,6 +4,7 @@
+ #include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/target_view.h"
+ #include "xw_remaster/xvt_cockpit.h"
++#include "xw_runtime/snapshot/render_readout.h"
+ #include <aeron/asset/bitmap_font.h>
+ #include <aeron/asset/pnl.h>
+ #include <aeron/log.h>
+@@ -21,6 +22,9 @@ typedef struct Pen {
+ 	float sx, sy; /* Classic pixel to target pixel scales. */
+ 	float ox, oy; /* Target pixel origin of classic (0, 0). */
+ 	bool mixed_case; /* XvT's font has lowercase; X-Wing's fonts are drawn in capitals. */
++	/* Glyph width factor (0 = 1). XvT's font keeps its shape when the cockpit is stretched, as OpenXvT
++	 * draws it: glyphs are sy wide rather than sx. */
++	float narrow;
+ } Pen;
+ 
+ static void Linear(uint32_t rgb, float alpha, float out[4]) {
+@@ -39,49 +43,54 @@ static const AeronDecodedGlyph* Glyph(const Pen* p, char c) {
+ 	return &f->glyphs[ch - f->first_char];
+ }
+ 
++/* Advance in classic pixels. */
++static float Advance(const Pen* p, const AeronDecodedGlyph* g) {
++	return (g ? g->advance : p->font->font.cell_width) * (p->narrow > 0 ? p->narrow : 1);
++}
++
+ /* Width in classic pixels. */
+ static float Measure(const Pen* p, const char* text) {
+ 	float w = 0;
+-	for (; *text; ++text) {
+-		const AeronDecodedGlyph* g = Glyph(p, *text);
+-		w += g ? g->advance : p->font->font.cell_width;
+-	}
++	for (; *text; ++text)
++		w += Advance(p, Glyph(p, *text));
+ 	return w;
+ }
+ 
++/* Draws one glyph in premultiplied linear rgba; returns the advance. */
++static float GlyphSprite(const Pen* p, float x, float y, char c, const float rgba[4]) {
++	const AeronDecodedGlyph* g = Glyph(p, c);
++	unsigned index = p->font->atlas_frame;
++	if (g && c != ' ' && g->height && index < (unsigned)p->atlas->layout.frame_count) {
++		unsigned page = p->atlas->layout.pages ? p->atlas->layout.pages[index] : 0;
++		AeronSpriteRect frame = p->atlas->layout.frames[index];
++		AeronRuntimeAtlasPage pg = p->atlas->pages[page];
++		AeronDrawList2DSprite s = { .texture = pg.texture,
++									.src_u0 = (frame.x + g->x) / pg.width,
++									.src_v0 = (frame.y + g->y) / pg.height,
++									.src_u1 = (frame.x + g->x + g->advance) / pg.width,
++									.src_v1 = (frame.y + g->y + g->height) / pg.height,
++									.dst_x = p->ox + x * p->sx,
++									.dst_y = p->oy + y * p->sy,
++									.dst_w = Advance(p, g) * p->sx,
++									.dst_h = g->height * p->sy,
++									.tint = { rgba[0], rgba[1], rgba[2], rgba[3] },
++									.blend = AERON_BLIT2D_BLEND_PMA,
++									.filter = p->narrow > 0 && p->narrow < 1 ? AERON_BLIT2D_FILTER_LINEAR
++																			 : AERON_BLIT2D_FILTER_NEAREST };
++		AeronDrawList_AddSprite(p->d->list, &s);
++	}
++	return Advance(p, g);
++}
++
+ /* Draws text at classic coordinates, clipped to max_width classic pixels. */
+ static void Text(const Pen* p, float x, float y, const char* text, uint32_t rgb, float max_width) {
+ 	float rgba[4];
+ 	Linear(rgb, 1, rgba);
+-	unsigned index = p->font->atlas_frame;
+-	if (index >= (unsigned)p->atlas->layout.frame_count)
+-		return;
+-	unsigned page = p->atlas->layout.pages ? p->atlas->layout.pages[index] : 0;
+-	AeronSpriteRect frame = p->atlas->layout.frames[index];
+-	AeronRuntimeAtlasPage pg = p->atlas->pages[page];
+ 	float limit = x + max_width;
+ 	for (; *text; ++text) {
+-		const AeronDecodedGlyph* g = Glyph(p, *text);
+-		float advance = g ? g->advance : p->font->font.cell_width;
+-		if (x + advance > limit + 0.5f)
++		if (x + Advance(p, Glyph(p, *text)) > limit + 0.5f)
+ 			break;
+-		/* Per-glyph rectangle: the font image stacks foreground, shadow and fill planes. */
+-		if (g && *text != ' ' && g->height) {
+-			AeronDrawList2DSprite s = { .texture = pg.texture,
+-										.src_u0 = (frame.x + g->x) / pg.width,
+-										.src_v0 = (frame.y + g->y) / pg.height,
+-										.src_u1 = (frame.x + g->x + g->advance) / pg.width,
+-										.src_v1 = (frame.y + g->y + g->height) / pg.height,
+-										.dst_x = p->ox + x * p->sx,
+-										.dst_y = p->oy + y * p->sy,
+-										.dst_w = g->advance * p->sx,
+-										.dst_h = g->height * p->sy,
+-										.tint = { rgba[0], rgba[1], rgba[2], rgba[3] },
+-										.blend = AERON_BLIT2D_BLEND_PMA,
+-										.filter = AERON_BLIT2D_FILTER_NEAREST };
+-			AeronDrawList_AddSprite(p->d->list, &s);
+-		}
+-		x += advance;
++		x += GlyphSprite(p, x, y, *text, rgba);
+ 	}
+ }
+ 
+@@ -333,6 +342,70 @@ static bool LoadXvtFont(void) {
+ 	return g_xvtFontReady;
+ }
+ 
++bool XwHudXvtFont_Load(void) { return LoadXvtFont(); }
++
++/* A pen for XvT's font at classic coordinates: glyphs keep their shape when the cockpit is stretched. */
++static Pen XvtPen(const XwHudDraw* d) {
++	float sx = d->layout.scale_x, sy = d->layout.scale_y;
++	return (Pen) { d, &g_xvtFont, &g_xvtFontAtlas, sx, sy, d->offset_x, d->offset_y, true, sx > sy ? sy / sx : 1 };
++}
++
++void XwHudXvtMessage_Draw(const XwHudDraw* d, int dy) {
++	if (!g_xvtFontReady)
++		return;
++	const XwSnapCockpit* c = &d->snapshot->cockpit;
++	XwSnapRange range = c->panes[XW_SNAP_PANE_READY_MESSAGE].glyphs;
++	if (!range.count || range.first + range.count > c->glyph_count)
++		return;
++	Pen pen = XvtPen(d);
++	unsigned xvt_h = FontHeight(&g_xvtFont);
++	/* One message line per glyph row, read left to right; gaps between glyphs are spaces. */
++	bool done[XW_SNAP_HUD_GLYPHS] = { false };
++	for (unsigned start = 0; start < range.count; ++start) {
++		if (done[start])
++			continue;
++		int line_y = c->glyphs[range.first + start].y;
++		enum { LINE = 200 };
++		const XwSnapGlyph* line[LINE];
++		unsigned n = 0;
++		for (unsigned i = start; i < range.count; ++i) {
++			const XwSnapGlyph* g = &c->glyphs[range.first + i];
++			if (done[i] || g->y != line_y)
++				continue;
++			done[i] = true;
++			if (n == LINE)
++				continue;
++			unsigned at = n++;
++			while (at > 0 && line[at - 1]->x > g->x) {
++				line[at] = line[at - 1];
++				--at;
++			}
++			line[at] = g;
++		}
++		char text[2 * LINE + 1];
++		uint16_t colors[2 * LINE];
++		unsigned length = 0;
++		for (unsigned i = 0; i < n; ++i) {
++			if (i && line[i]->x > line[i - 1]->x + line[i - 1]->advance + 1 && text[length - 1] != ' ') {
++				colors[length] = line[i]->foreground;
++				text[length++] = ' ';
++			}
++			colors[length] = line[i]->foreground;
++			text[length++] = line[i]->character < 256 ? (char)line[i]->character : '?';
++		}
++		text[length] = 0;
++		XwReadout_TitleCase(text);
++		/* Same bottom edge as X-Wing's text, centred on the screen. */
++		float x = (c->screen_width - Measure(&pen, text)) / 2;
++		float y = line_y + dy + (float)line[0]->height - (float)xvt_h;
++		for (unsigned i = 0; i < length; ++i) {
++			float rgba[4];
++			XwHudDraw_Color(d, colors[i], false, rgba);
++			x += GlyphSprite(&pen, x, y, text[i], rgba);
++		}
++	}
++}
++
+ /* Colors measured from XvT's CMD. */
+ enum {
+ 	XVT_LABEL = 0x2470C4,
+@@ -434,12 +507,7 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 			return true;
+ 		XwSnapRect view;
+ 		if (XwXvtCockpit_CmdView(s, &view)) {
+-			Pen xvt_pen = pen;
+-			if (g_xvtFontReady) {
+-				xvt_pen.font = &g_xvtFont;
+-				xvt_pen.atlas = &g_xvtFontAtlas;
+-				xvt_pen.mixed_case = true;
+-			}
++			Pen xvt_pen = g_xvtFontReady ? XvtPen(d) : pen;
+ 			DrawXvtCmd(d, &xvt_pen, r, box, &view);
+ 			return true;
+ 		}
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+index cdd9c5a..884b2e1 100644
+--- a/src/xw_remaster/hud_readout.h
++++ b/src/xw_remaster/hud_readout.h
+@@ -9,6 +9,11 @@ bool XwHudCmd_Active(const XwRenderSnapshot* snapshot);
+ bool XwHudCmd_Draw(const XwHudDraw* draw);
+ /* render.xvt_cockpit: XvT's own panel text (power and shield switch letters, clock, throttle, speed). */
+ bool XwHudXvtPanel_Draw(const XwHudDraw* draw);
++/* Loads XvT's MICRO64 font (once; before drawing starts). False when it is unavailable. */
++bool XwHudXvtFont_Load(void);
++/* render.xvt_cockpit: draws the message pane's text in XvT's mixed-case font, centred, moved down by dy
++ * classic pixels, instead of X-Wing's capitals. */
++void XwHudXvtMessage_Draw(const XwHudDraw* draw, int dy);
+ /* view_target (Z) with render.xvt_targeting_computer: XvT's threat display frame and readouts replace the HUD.
+  * Active only when XvT's frame art loaded. */
+ bool XwHudThreat_Active(const XwRenderSnapshot* snapshot);
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 3dbbc28..19f28b7 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -128,6 +128,8 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 	for (unsigned i = 0; i < c->sprite_count; ++i)
+ 		order[n++] = (Ordered) { c->sprites[i].order, i, 2 };
+ 	qsort(order, n, sizeof order[0], Compare);
++	/* render.xvt_cockpit: messages are redrawn in XvT's mixed-case font after the panes. */
++	bool xvt_messages = draw->xvt && XwHudXvtFont_Load();
+ 	draw->in_pane = true;
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		unsigned index = order[i].index;
+@@ -141,7 +143,8 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 			if (InRange(r, index)) {
+ 				draw->pane_shift = shifts[p];
+ 				place = places[p];
+-				skip = (skip_cmd && CmdPane(p)) || place.hidden || (place.plain && order[i].kind == 1);
++				skip = (skip_cmd && CmdPane(p)) || place.hidden || (place.plain && order[i].kind == 1) ||
++					   (xvt_messages && p == XW_SNAP_PANE_READY_MESSAGE && order[i].kind == 0);
+ 				if (p == XW_SNAP_PANE_WARHEADS && draw->xvt && !skip)
+ 					XwXvtCockpit_WarheadPlace(draw,
+ 											  order[i].kind == 0   ? c->glyphs[index].x
+@@ -185,6 +188,8 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 		}
+ 	}
+ 	draw->in_pane = false;
++	if (xvt_messages && !places[XW_SNAP_PANE_READY_MESSAGE].hidden)
++		XwHudXvtMessage_Draw(draw, places[XW_SNAP_PANE_READY_MESSAGE].dy);
+ 	return true;
+ }
+ 
+@@ -214,6 +219,8 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .cmd_active = XwHudCmd_Active(snapshot),
+ 				   .threat_active = XwHudThreat_Active(snapshot),
+ 				   .xvt_cockpit = XwXvtCockpit_Active(snapshot) };
++	if (key.xvt_cockpit)
++		XwHudXvtFont_Load();
+ 	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 1cd8ab3..a2ee7ce 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -41,24 +41,33 @@ static void CopyText(char* out, size_t capacity, const char* in) {
+ 	out[n] = 0;
+ }
+ 
+-/* XvT writes names and words in title case ("Alpha 2", "Unknown"): all-capital words of letters only become
+- * title case. Type prefixes ("T/F") and designations with digits are kept. */
+-static void TitleCase(char* text) {
++void XwReadout_TitleCase(char* text) {
++	static const char* const kKeep[] = { "TIE", "OK" };
+ 	for (char* word = text; *word;) {
+ 		char* end = word;
+-		bool letters = true, upper = true;
+-		while (*end && *end != ' ') {
+-			letters = letters && isalpha((unsigned char)*end);
+-			upper = upper && !islower((unsigned char)*end);
++		while (*end && *end != ' ')
+ 			++end;
++		/* Trailing punctuation ("GOLD," "DISABLED.") does not stop a word counting. */
++		char* letters_end = end;
++		while (letters_end > word && strchr(".,!?:;", letters_end[-1]))
++			--letters_end;
++		bool letters = letters_end - word >= 2, upper = true;
++		for (char* c = word; c < letters_end; ++c) {
++			letters = letters && isalpha((unsigned char)*c);
++			upper = upper && !islower((unsigned char)*c);
+ 		}
+-		if (letters && upper && end - word >= 2)
+-			for (char* c = word + 1; c < end; ++c)
++		for (unsigned i = 0; letters && i < sizeof kKeep / sizeof kKeep[0]; ++i)
++			if ((size_t)(letters_end - word) == strlen(kKeep[i]) && !strncmp(word, kKeep[i], letters_end - word))
++				letters = false;
++		if (letters && upper)
++			for (char* c = word + 1; c < letters_end; ++c)
+ 				*c = (char)tolower((unsigned char)*c);
+ 		word = *end ? end + 1 : end;
+ 	}
+ }
+ 
++static void TitleCase(char* text) { XwReadout_TitleCase(text); }
++
+ /* XvT's one-word order ("Attacking", "Following") for X-Wing's plan status phrase. */
+ static void ShortOrder(char* out, size_t capacity, const char* phrase) {
+ 	static const struct {
+diff --git a/src/xw_runtime/snapshot/render_readout.h b/src/xw_runtime/snapshot/render_readout.h
+index 2ec3cb5..e7d9117 100644
+--- a/src/xw_runtime/snapshot/render_readout.h
++++ b/src/xw_runtime/snapshot/render_readout.h
+@@ -4,4 +4,8 @@
+ 
+ /* Fills the XvT-style target and craft status readout from the live flight state. */
+ void XwReadout_Capture(XwSnapReadout* readout);
++/* XvT writes names and words in title case ("Alpha 2", "Unknown"): all-capital words of letters (trailing
++ * punctuation allowed) become title case. Type prefixes ("T/F"), designations with digits and acronyms ("TIE")
++ * are kept. */
++void XwReadout_TitleCase(char* text);
+ #endif

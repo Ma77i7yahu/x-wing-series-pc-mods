@@ -1,0 +1,315 @@
+From 678aec4bc7a3c7f6d72ce96eddd1b277747e7bb9 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 21:50:29 +1100
+Subject: [PATCH 32/59] XvT self-balancing shields and throttle-dependent
+ turning
+
+- game.xvt_shields: when the player's shields take damage (lasers, warheads,
+  collisions), the hit bank takes half the difference from the other bank
+  and the distribution returns to even, as XvT does. Diverting to front or
+  rear still works until the next hit on the weaker side.
+- game.xvt_turning: player pitch/yaw/roll gain follows XvT's throttle curve,
+  full at 1/3 throttle, 2/3 at full throttle, 1/3 when stopped, plus XvT's
+  ~5% per step laser+shield recharge term.
+- Game page: "Shield Hits" and "Turning" selectors.
+---
+ resources/config.yaml                    |  6 +++
+ src/xw/flight/object/collide.c           | 32 +++++++++++++++
+ src/xw/flight/object/laser.h             |  1 +
+ src/xw/flight/player/user.c              | 51 +++++++++++++++++++-----
+ src/xw/flight/player/user.h              |  3 ++
+ src/xw_app/settings/game_page.c          |  4 ++
+ src/xw_runtime/config/flight_tweaks.c    | 10 +++++
+ src/xw_runtime/config/flight_tweaks.h    |  9 +++++
+ src/xw_runtime/config/preference_apply.c |  2 +
+ src/xw_runtime/config/settings.c         |  2 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ src/xw_runtime/timing/player_timing.c    |  4 +-
+ 12 files changed, 114 insertions(+), 12 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 01c94dd..008fb57 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -251,6 +251,12 @@ game:
+   ai_ion_link: 2
+   # Craft accelerate and brake with X-Wing vs TIE Fighter's rates. Every craft.
+   xvt_throttle: true
++  # Player shields as in X-Wing vs TIE Fighter: after a hit, the hit bank draws
++  # energy from the other until they are even, and the shield setting returns to even.
++  xvt_shields: true
++  # Player turn rate as in X-Wing vs TIE Fighter: tightest at 1/3 throttle (stock
++  # X-Wing rate), 2/3 of that at full throttle and 1/3 when stopped.
++  xvt_turning: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index 2fcb626..dab0905 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -1404,6 +1404,30 @@ void collide_laserhitcraft(uint16_t projectileObjIdx, uint16_t craftObjIdx, int1
+ 	}
+ }
+ 
++#ifdef XW_MODERN
++/* game.xvt_shields: XvT evens the player's banks after every hit. When the hit bank is below the other,
++ * half the difference moves across (a depleted bank takes half of the other), and the distribution
++ * returns to even. */
++static void collide_xvtbalanceshields(CraftData* craft, uint16_t hitSide) {
++	uint16_t otherSide = hitSide ^ 1;
++	int hit = craft->shieldEnergy[hitSide];
++	int other = craft->shieldEnergy[otherSide];
++	int maxHit = g_craftTypeDefs[craft->craftTypeIndex].nominalShieldEnergy[hitSide] *
++				 XW_SHIELD_MAX_CHARGE_MULTIPLIER;
++	int moved;
++	if (hit >= other)
++		return;
++	moved = (other - hit) / 2;
++	if (hit + moved > maxHit)
++		moved = maxHit > hit ? maxHit - hit : 0;
++	if (moved <= 0)
++		return;
++	craft->shieldEnergy[hitSide] = (int16_t)(hit + moved);
++	craft->shieldEnergy[otherSide] = (int16_t)(other - moved);
++	craft->shieldDistribMode = LASER_SHIELD_DISTRIBUTE_EVEN;
++}
++#endif
++
+ // FUNCTION: XW 0x4046D0
+ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_t sourceObjOrMissionPointRef,
+ 							uint16_t shieldSide) {
+@@ -1463,6 +1487,10 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		if (victimObjIdx == g_playerFlightState.objectIndex) {
+ 			g_flightGlobalCountdownTimers.ticks[XW_TIMER_SHIELD_FLASH] += COLLIDE_HIT_FLASH_TICKS;
+ 			g_lastShieldDamageSide = shieldSide;
++#ifdef XW_MODERN
++			if (XwFlightTweaks_XvtShields())
++				collide_xvtbalanceshields(victimCraft, shieldSide);
++#endif
+ 		}
+ 	} else {
+ 		int16_t damagePastShields;
+@@ -1477,6 +1505,10 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		finalDamagePastShields = damagePastShields;
+ #endif
+ 		victimCraft->shieldEnergy[shieldSide] = 0;
++#ifdef XW_MODERN
++		if (victimObjIdx == g_playerFlightState.objectIndex && XwFlightTweaks_XvtShields())
++			collide_xvtbalanceshields(victimCraft, shieldSide);
++#endif
+ 		if (damagePastShields != 0) {
+ #ifdef XW_MODERN
+ 			if (XwFlightTypes_CanonicalType(sourceObjectType) == XW_OBJ_ION_147 ||
+diff --git a/src/xw/flight/object/laser.h b/src/xw/flight/object/laser.h
+index d8fcfcd..6b32c07 100644
+--- a/src/xw/flight/object/laser.h
++++ b/src/xw/flight/object/laser.h
+@@ -33,6 +33,7 @@ enum {
+ 	LASER_SHIELD_RECHARGE_STEP = 20,
+ 	LASER_CHARGE_RECHARGE_STEP = 2,
+ 	LASER_SHIELD_DISTRIBUTE_FRONT = 0,
++	LASER_SHIELD_DISTRIBUTE_EVEN = 1,
+ 	LASER_SHIELD_DISTRIBUTE_REAR = 2,
+ 	LASER_FRONT_SHIELD = 0,
+ 	LASER_REAR_SHIELD = 1,
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index dcc93f7..33f4410 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -45,6 +45,7 @@
+ #include "xw/util/shared.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_frame.h"
+ #endif
+ 
+@@ -1580,16 +1581,16 @@ void user_inputforplane(void) {
+ 	XwPlayerTiming_BeginControls();
+ #endif
+ 	if (g_flightCamera.manualControlActive == 0) {
+-		int roll =
+-			(((uint16_t)math2_percentage(g_playerFlightState.craft->rollRateLimit, USER_ROLL_RATE_SCALE) >>
+-			  1) *
+-			 (int32_t)g_scaledInputYaw) >>
+-			USER_TURN_INPUT_SHIFT;
+-		int pitch =
+-			(((uint16_t)math2_percentage(g_playerFlightState.craft->pitchRateLimit, USER_PITCH_RATE_SCALE) >>
+-			  1) *
+-			 (int32_t)g_scaledInputPitch) >>
+-			USER_TURN_INPUT_SHIFT;
++		int roll = (user_xvtturngain((uint16_t)math2_percentage(g_playerFlightState.craft->rollRateLimit,
++																 USER_ROLL_RATE_SCALE) >>
++									 1) *
++					(int32_t)g_scaledInputYaw) >>
++				   USER_TURN_INPUT_SHIFT;
++		int pitch = (user_xvtturngain((uint16_t)math2_percentage(g_playerFlightState.craft->pitchRateLimit,
++																  USER_PITCH_RATE_SCALE) >>
++									  1) *
++					 (int32_t)g_scaledInputPitch) >>
++					USER_TURN_INPUT_SHIFT;
+ 		uint16_t mode = 0;
+ 		int16_t frameRoll;
+ 		int16_t framePitch;
+@@ -1730,6 +1731,36 @@ int user_framerateadjust(int16_t step) {
+ 	return math2_ABoverC32(step, g_elapsedTicks, XW_SIMULATION_TICKS_PER_SECOND);
+ }
+ 
++/* XvT player turn rate (OpenXvT player.c): the throttle setting t maps to 1/3 + 2t below 1/3 throttle and
++ * to 1 - (t - 1/3)/2 above it, so turns are tightest at 1/3 throttle (X-Wing's own rate), 2/3 as tight at
++ * full throttle and 1/3 when stopped or with the engines out. Each step of combined laser + shield
++ * recharge below neutral adds 0xC00/0x10000 (about 5%); each step above takes it away. */
++enum { USER_XVT_TURN_PEAK = 0x5555, USER_XVT_POWER_NEUTRAL = 2 * LASER_RECHARGE_NEUTRAL, USER_XVT_POWER_STEP = 0xC00 };
++
++int user_xvtturngain(int gain) {
++#ifdef XW_MODERN
++	const CraftData* craft = g_playerFlightState.craft;
++	int throttle;
++	int scale;
++	int redirect;
++	if (!XwFlightTweaks_XvtTurning() || craft == NULL)
++		return gain;
++	throttle = (craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_ENGINE) != 0 ? craft->engineThrottle[0] : 0;
++	scale = throttle < USER_XVT_TURN_PEAK ? 2 * throttle + USER_XVT_TURN_PEAK
++										  : 0x10000 - (throttle - USER_XVT_TURN_PEAK) / 2;
++	if (g_craftTypeDefs[craft->craftTypeIndex].nominalShieldEnergy[XW_SHIELD_FRONT] != 0)
++		redirect = craft->shieldRedirect + craft->laserRedirect;
++	else
++		redirect = 2 * craft->laserRedirect;
++	scale += (int)(((long long)scale * USER_XVT_POWER_STEP * (USER_XVT_POWER_NEUTRAL - redirect)) >> 16);
++	gain = (int)(((long long)gain * scale) >> 16);
++	/* The turn command is carried in int16 smoothing state. */
++	return gain > INT16_MAX ? INT16_MAX : gain;
++#else
++	return gain;
++#endif
++}
++
+ // FUNCTION: XW 0x42CC90
+ void user_increasepower(uint16_t engineIndex, uint16_t step) {
+ 	uint16_t previousThrottle = g_playerFlightState.craft->engineThrottle[engineIndex];
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index 14c4550..f571004 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -394,6 +394,9 @@ void user_inputforplane(void);
+ /* 0x42CC70 */
+ int user_framerateadjust(int16_t step);
+ 
++/* game.xvt_turning: scales a player turn-rate gain by XvT's throttle and power curve (identity when off). */
++int user_xvtturngain(int gain);
++
+ /* 0x42CC90 */
+ void user_increasepower(uint16_t engineIndex, uint16_t step);
+ 
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index cabc5b6..b192a27 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -104,6 +104,10 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 2);
+ 	AeronUi_Selector(ui, "Acceleration and Braking", &draft->xvt_throttle,
+ 					 (const char* const[]) { "X-Wing", "XvT" }, 2);
++	AeronUi_Selector(ui, "Shield Hits", &draft->xvt_shields,
++					 (const char* const[]) { "X-Wing", "XvT (Self-Balancing)" }, 2);
++	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
++					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
+ 					 (const char* const[]) { "Off", "Friendly Only", "All Craft" }, 3);
+ 	AeronUi_Selector(ui, "Killed or Captured on Tour", &draft->restore_pilot,
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index c67da27..0c25752 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -9,6 +9,16 @@ static bool s_xvt_throttle = true;
+ static bool s_xvt_targeting_computer = true;
+ static bool s_restore_pilot = true;
+ static bool s_xvt_cockpit = true;
++static bool s_xvt_shields = true;
++static bool s_xvt_turning = true;
++
++bool XwFlightTweaks_XvtShields(void) { return s_xvt_shields; }
++
++void XwFlightTweaks_SetXvtShields(bool enabled) { s_xvt_shields = enabled; }
++
++bool XwFlightTweaks_XvtTurning(void) { return s_xvt_turning; }
++
++void XwFlightTweaks_SetXvtTurning(bool enabled) { s_xvt_turning = enabled; }
+ 
+ bool XwFlightTweaks_XvtCockpit(void) { return s_xvt_cockpit; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 2ccff7e..00102d8 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -50,6 +50,15 @@ void XwFlightTweaks_SetXvtTargetingComputer(bool enabled);
+  * cockpit-off HUD, with X-Wing's instruments moved to XvT's positions. Needs xvt_targeting_computer. */
+ bool XwFlightTweaks_XvtCockpit(void);
+ void XwFlightTweaks_SetXvtCockpit(bool enabled);
++/* game.xvt_shields: when the player's shields take damage, the hit bank is topped up from the other until
++ * both are even, and the distribution returns to even (OpenXvT collide.c, player craft only). Divert to
++ * front or rear still works until the next hit. */
++bool XwFlightTweaks_XvtShields(void);
++void XwFlightTweaks_SetXvtShields(bool enabled);
++/* game.xvt_turning: player pitch/roll rate follows XvT's throttle curve (OpenXvT player.c): 1/3 at zero
++ * throttle, full at 1/3 throttle, 2/3 at full throttle, plus XvT's power balance term. */
++bool XwFlightTweaks_XvtTurning(void);
++void XwFlightTweaks_SetXvtTurning(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 15acd90..a41f39b 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -35,6 +35,8 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtLasers(settings->xvt_lasers != 0);
+ 	XwFlightTweaks_SetAiIonLink(settings->ai_ion_link);
+ 	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
++	XwFlightTweaks_SetXvtShields(settings->xvt_shields != 0);
++	XwFlightTweaks_SetXvtTurning(settings->xvt_turning != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 27d7f41..f84d9cd 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -112,6 +112,8 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_lasers", xvt_lasers),
+ 	SETTING_INT("game.ai_ion_link", ai_ion_link, 0, 2),
+ 	SETTING_BOOL("game.xvt_throttle", xvt_throttle),
++	SETTING_BOOL("game.xvt_shields", xvt_shields),
++	SETTING_BOOL("game.xvt_turning", xvt_turning),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 8e86a0c..cfdcaf6 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -39,7 +39,7 @@ typedef struct XwSettings {
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+-	int xvt_cockpit;
++	int xvt_cockpit, xvt_shields, xvt_turning;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/timing/player_timing.c b/src/xw_runtime/timing/player_timing.c
+index e2e5455..71c4ee3 100644
+--- a/src/xw_runtime/timing/player_timing.c
++++ b/src/xw_runtime/timing/player_timing.c
+@@ -184,7 +184,9 @@ int16_t XwPlayerTiming_Slew(unsigned channel, int16_t current, int16_t target) {
+ int16_t XwPlayerTiming_RollStep(int16_t input) {
+ 	bool working = (g_playerFlightState.craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_ATTITUDE) != 0;
+ 	int target =
+-		(((uint16_t)math2_percentage(g_playerFlightState.craft->rollRateLimit, USER_ROLL_RATE_SCALE) >> 1) *
++		(user_xvtturngain((uint16_t)math2_percentage(g_playerFlightState.craft->rollRateLimit,
++													 USER_ROLL_RATE_SCALE) >>
++						  1) *
+ 		 (int32_t)input) >>
+ 		USER_TURN_INPUT_SHIFT;
+ 	timing.analog_roll =

@@ -1,0 +1,120 @@
+From 1790a904459005699d0f979f0d04289f5c6cd440 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 05:53:54 +1100
+Subject: [PATCH 21/25] Single player on Hard: keep friendly AI at mission
+ skill (flight.hard_keeps_friendly_skill)
+
+---
+ resources/config.yaml             |  4 ++++
+ src/xvt/flight/mission/mission.c  | 16 +++++++++++++++-
+ src/xvt/flight/mission/mission.h  |  3 +++
+ src/xvt/flight/object/laser.c     |  2 +-
+ src/xvt_runtime/config/settings.c |  1 +
+ src/xvt_runtime/config/settings.h |  2 ++
+ 6 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index d2a5f2a..46b2f40 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -453,3 +453,7 @@ flight:
+   # fire both together at any target. Disable orders keep the original
+   # ions-only behaviour. off, friendly (your side only) or all.
+   ai_ion_link: all
++  # Hard drops friendly AI one skill level (and raises enemies two). When true,
++  # single-player missions keep wingmen at the mission's own skill level;
++  # enemies still get Hard's boost. Multiplayer is unaffected.
++  hard_keeps_friendly_skill: true
+diff --git a/src/xvt/flight/mission/mission.c b/src/xvt/flight/mission/mission.c
+index 18a5137..ac09057 100644
+--- a/src/xvt/flight/mission/mission.c
++++ b/src/xvt/flight/mission/mission.c
+@@ -33,6 +33,9 @@
+ #include "xvt/util/game_rand.h"
+ #include "xvt/util/memory.h"
+ #include "xvt/util/time.h"
++#ifdef XVT_MODERN
++#include "xvt_runtime/config/config.h"
++#endif
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -182,6 +185,13 @@ static int Mission_IsSinglePlayer(void) {
+ 			++remote;
+ 	return remote == 0;
+ }
++
++/* Hard normally drops friendly AI one skill level to balance human teams. In single player
++ * flight.hard_keeps_friendly_skill keeps wingmen at the mission's level (enemies still get +2). */
++int Mission_KeepFriendlySkillOnHard(void) {
++	const XvtSettings* settings = XvtConfig_Settings();
++	return settings && settings->hard_keeps_friendly_skill && Mission_IsSinglePlayer();
++}
+ #endif
+ 
+ // FLAGS: /O2 /G5
+@@ -3805,7 +3815,11 @@ uint16_t Mission_Init(char* fileName) {
+ 				} else if (g_missionHeader.missionType != MISSION_TYPE_QUICK_START &&
+ 						   (g_pilotData.missionDirectoryId != MISSION_DIRECTORY_TRAINING_EXERCISES ||
+ 							g_pilotData.missionSequenceActive != 1 || g_flightPlayerCount != 1) &&
+-						   g_missionFlightGroups[flightGroupIdx].fg.groupAI != 0) {
++						   g_missionFlightGroups[flightGroupIdx].fg.groupAI != 0
++#ifdef XVT_MODERN
++						   && !Mission_KeepFriendlySkillOnHard()
++#endif
++				) {
+ 					--g_missionFlightGroups[flightGroupIdx].fg.groupAI;
+ 				}
+ 			} else {
+diff --git a/src/xvt/flight/mission/mission.h b/src/xvt/flight/mission/mission.h
+index bd95646..796ced7 100644
+--- a/src/xvt/flight/mission/mission.h
++++ b/src/xvt/flight/mission/mission.h
+@@ -520,6 +520,9 @@ typedef char xvt_size_XvtV10MissionHeader[(sizeof(XvtV10MissionHeader) == 130) ?
+ 
+ uint16_t Mission_GetFlightGroupSpecialCargoOutcome8(unsigned int flightGroupIdx, uint16_t specialCargoCraft);
+ void Mission_UpdateLogic(void);
++#ifdef XVT_MODERN
++int Mission_KeepFriendlySkillOnHard(void);
++#endif
+ int Mission_EvaluateTriggerPair(const MissionTriggerPair* triggerPair, int16_t flightGroupIdx);
+ int16_t Mission_EvaluateCondition(uint16_t conditionType, int16_t variableType, uint16_t variable,
+ 								  int16_t amountType, int16_t includeDepartedAsDestroyed,
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index 3d34fe5..e989a7f 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -1967,7 +1967,7 @@ static uint16_t laser_TurretSkillAsHard(const ObjectRecord* source, uint16_t ski
+ 	int level = group->groupAI;
+ 	if (g_flightMissionState.difficulty == DIFFICULTY_EASY)
+ 		level += hostile ? 1 : -2;
+-	level += hostile ? 2 : -1;
++	level += hostile ? 2 : Mission_KeepFriendlySkillOnHard() ? 0 : -1;
+ 	level = level < 0 ? 0 : level > MAX_GROUP_AI ? MAX_GROUP_AI : level;
+ 	return g_aiSkillValueQ16ByLevel[level];
+ }
+diff --git a/src/xvt_runtime/config/settings.c b/src/xvt_runtime/config/settings.c
+index 2f3c20e..bae7af9 100644
+--- a/src/xvt_runtime/config/settings.c
++++ b/src/xvt_runtime/config/settings.c
+@@ -32,6 +32,7 @@ typedef struct XvtSettingField {
+ static const XvtSettingField g_fields[] = {
+ 	SETTING_BOOL("startup.skip_intro", skip_intro),
+ 	SETTING_INT("flight.laser_convergence", laser_convergence_m, 0, 5000),
++	SETTING_BOOL("flight.hard_keeps_friendly_skill", hard_keeps_friendly_skill),
+ 	SETTING_STRING("paths.game_data", game_data),
+ 	SETTING_STRING("ui.font", ui_font),
+ 	SETTING_STRING("network.lobby_url", lobby_url),
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index fc1dcf5..73e693f 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -94,6 +94,8 @@ typedef struct XvtSettings {
+ 	int laser_convergence_m;
+ 	/* AI fighters fire ion cannons with their lasers: 0 off, 1 friendly only, 2 everyone. */
+ 	int ai_ion_link;
++	/* Single player on Hard: friendly AI keeps its mission skill instead of dropping one level. */
++	int hard_keeps_friendly_skill;
+ 	char game_data[XVT_PATH_CAPACITY];
+ 	char ui_font[XVT_PATH_CAPACITY];
+ 	char lobby_url[AERON_DPLAY_DIRECTORY_URL_CAPACITY];

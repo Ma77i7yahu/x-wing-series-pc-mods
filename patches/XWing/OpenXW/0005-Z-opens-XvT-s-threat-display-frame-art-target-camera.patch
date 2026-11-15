@@ -1,0 +1,532 @@
+From 512f86303000dc5bd8cd4dd2d1084695cbff4a17 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:45:11 +1100
+Subject: [PATCH 05/59] Z opens XvT's threat display: frame art, target camera
+ in its window, orders, destination, distance and time remaining
+
+---
+ src/xw/flight/player/user.c              |  25 +++
+ src/xw/flight/player/user.h              |   5 +
+ src/xw_remaster/flight.c                 |   9 +
+ src/xw_remaster/hud_readout.c            | 214 ++++++++++++++++++++++-
+ src/xw_remaster/hud_readout.h            |   5 +
+ src/xw_remaster/hud_renderer.c           |  23 ++-
+ src/xw_runtime/snapshot/render_readout.c |  32 ++++
+ src/xw_runtime/snapshot/render_types.h   |   6 +
+ 8 files changed, 307 insertions(+), 12 deletions(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 77571d2..cee7546 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -56,13 +56,28 @@
+ /* view_target (Z): set while the camera chases the player's target. Other view keys can take the camera
+  * away, so it only counts while the camera is still external on a non-player object. */
+ static int s_targetViewFlag, s_targetViewPreviousExternal;
++static int16_t s_targetViewPreviousDistance;
+ #define s_targetViewActive                                                                                  \
+ 	(s_targetViewFlag && g_flightCamera.externalViewActive != 0 &&                                          \
+ 	 g_flightCamera.focusObjectRef != g_playerFlightState.objectIndex)
+ 
++int user_targetviewactive(void) { return s_targetViewActive; }
++
++/* XvT's threat display frames the target: chase distance from the game's own model size. */
++static void user_frametargetview(uint16_t target) {
++	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 2;
++	if (distance < USER_CAMERA_MIN_DISTANCE)
++		distance = USER_CAMERA_MIN_DISTANCE;
++	/* Capital ships need more room than the manual zoom's USER_CAMERA_MAX_DISTANCE. */
++	if (distance > INT16_MAX)
++		distance = INT16_MAX;
++	g_flightCamera.externalDistance = (int16_t)distance;
++}
++
+ /* Leaves the target view; the caller has already pointed the camera focus back at the player. */
+ static void user_endtargetview(void) {
+ 	s_targetViewFlag = 0;
++	g_flightCamera.externalDistance = s_targetViewPreviousDistance;
+ 	g_flightCamera.externalViewActive = s_targetViewPreviousExternal;
+ 	if (!s_targetViewPreviousExternal) {
+ 		g_flightCamera.hudAimX = g_flightCamera.savedHudAimX;
+@@ -254,11 +269,19 @@ void user_userinterface(void) {
+ 	 * the cockpit instead of following whatever takes the slot. */
+ 	if (g_replayviewmode == 0 && s_targetViewActive) {
+ 		const ObjectRecord* focus = &g_objectTable[g_flightCamera.focusObjectRef];
++		uint16_t target = g_playerFlightState.currentTargetObjectIdx;
+ 		if (focus->objectType == XW_OBJ_NONE || focus->genusId == XW_GENUS_EXPLOSION_EFFECT ||
+ 			focus->familyId != XW_OBJECT_FAMILY_CRAFT) {
+ 			g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
+ 			user_endtargetview();
+ 			user_resetview();
++		} else if (target != g_flightCamera.focusObjectRef && target < g_mainObjectSlotEnd &&
++				   target != g_playerFlightState.objectIndex && g_objectTable[target].objectType != XW_OBJ_NONE &&
++				   g_objectTable[target].familyId == XW_OBJECT_FAMILY_CRAFT) {
++			/* As in XvT, cycling targets in the threat display moves the camera to the new target. */
++			g_flightCamera.focusObjectRef = target;
++			user_frametargetview(target);
++			user_resetview();
+ 		}
+ 	}
+ #endif
+@@ -724,7 +747,9 @@ void user_inputforplane(void) {
+ 					g_flightCamera.savedHudAimY = g_flightCamera.hudAimY;
+ 				}
+ 				s_targetViewPreviousExternal = g_flightCamera.externalViewActive;
++				s_targetViewPreviousDistance = g_flightCamera.externalDistance;
+ 				g_flightCamera.focusObjectRef = g_playerFlightState.currentTargetObjectIdx;
++				user_frametargetview(g_flightCamera.focusObjectRef);
+ 				g_flightCamera.externalViewActive = 1;
+ 				s_targetViewFlag = 1;
+ 				user_resetview();
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index b7d3f9a..cb1f27b 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -136,6 +136,11 @@ extern const uint8_t g_viewKeyHudStateOffsets[USER_VIEW_DIGIT_COUNT];
+ extern const int16_t g_viewKeyPitchAngles[USER_VIEW_DIGIT_COUNT];
+ extern const uint8_t g_aiPlanStatusMessageIds[USER_AI_STATUS_COUNT];
+ 
++#ifdef XW_MODERN
++/* view_target (Z): nonzero while the camera shows the player's target (XvT threat display). */
++int user_targetviewactive(void);
++#endif
++
+ enum { USER_TURN_MODIFIER_MASK = 0xE, USER_TURN_ROLL_MODE = 2 };
+ 
+ enum {
+diff --git a/src/xw_remaster/flight.c b/src/xw_remaster/flight.c
+index 216c628..888879d 100644
+--- a/src/xw_remaster/flight.c
++++ b/src/xw_remaster/flight.c
+@@ -2,6 +2,8 @@
+ #include "xw_remaster/flight.h"
+ #include "xw_remaster/component_animation.h"
+ #include "xw_remaster/config.h"
++#include "xw_remaster/hud_readout.h"
++#include <math.h>
+ #include "xw_runtime/snapshot/render_assets.h"
+ #include <aeron/aeron.h>
+ #include <string.h>
+@@ -157,6 +159,13 @@ bool XwRemasterFlight_Prepare(const XwRenderSnapshot* s, int w, int h) {
+ 		XwRemasterFlight_Invalidate();
+ 		return false;
+ 	}
++	if (XwHudThreat_Active(s)) {
++		/* XvT's threat display window is centred at y 166 of its 640x480 frame, above the screen centre. */
++		float unit = fminf(w / 640.0f, h / 480.0f);
++		float centre_y = (h - 480 * unit) / 2 + 166 * unit;
++		frame.view.camera.proj_y_offset = 1 - 2 * centre_y / h;
++		AeronScene_ComputeViewProj(&frame.view.camera, frame.view.view_proj);
++	}
+ 	if (advance)
+ 		XwComponentAnimation_Prepare(s, reset);
+ 	/* A stretched cockpit covers the full width, so the world shows on both sides of the 4:3 art. */
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 769f698..a65f741 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -3,8 +3,12 @@
+  * the target, its orders and range. */
+ #include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/target_view.h"
++#include <aeron/asset/pnl.h>
++#include <aeron/log.h>
++#include <aeron/vfs.h>
+ #include <math.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ typedef struct Pen {
+@@ -12,6 +16,7 @@ typedef struct Pen {
+ 	const XwHudImage* font;
+ 	const AeronRuntimeAtlas* atlas;
+ 	float sx, sy; /* Classic pixel to target pixel scales. */
++	float ox, oy; /* Target pixel origin of classic (0, 0). */
+ } Pen;
+ 
+ static void Linear(uint32_t rgb, float alpha, float out[4]) {
+@@ -63,8 +68,8 @@ static void Text(const Pen* p, float x, float y, const char* text, uint32_t rgb,
+ 										.src_v0 = (frame.y + g->y) / pg.height,
+ 										.src_u1 = (frame.x + g->x + g->advance) / pg.width,
+ 										.src_v1 = (frame.y + g->y + g->height) / pg.height,
+-										.dst_x = p->d->offset_x + x * p->sx,
+-										.dst_y = p->d->offset_y + y * p->sy,
++										.dst_x = p->ox + x * p->sx,
++										.dst_y = p->oy + y * p->sy,
+ 										.dst_w = g->advance * p->sx,
+ 										.dst_h = g->height * p->sy,
+ 										.tint = { rgba[0], rgba[1], rgba[2], rgba[3] },
+@@ -84,7 +89,7 @@ static void Centered(const Pen* p, const XwSnapRect* r, float y, const char* tex
+ static void Fill(const Pen* p, float x, float y, float w, float h, uint32_t rgb, float alpha) {
+ 	float rgba[4];
+ 	Linear(rgb, alpha, rgba);
+-	AeronDrawList_AddFill(p->d->list, p->d->offset_x + x * p->sx, p->d->offset_y + y * p->sy, w * p->sx,
++	AeronDrawList_AddFill(p->d->list, p->ox + x * p->sx, p->oy + y * p->sy, w * p->sx,
+ 						  h * p->sy, rgba, AERON_BLIT2D_BLEND_PMA, NULL);
+ }
+ 
+@@ -122,7 +127,7 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 	const AeronRuntimeAtlas* atlas = font ? XwHudAssets_Atlas(font) : NULL;
+ 	if (!font || !atlas || !font->font.glyph_count)
+ 		return true;
+-	Pen pen = { d, font, atlas, d->layout.scale_x, d->layout.scale_y };
++	Pen pen = { d, font, atlas, d->layout.scale_x, d->layout.scale_y, d->offset_x, d->offset_y };
+ 	unsigned glyph_h = 0;
+ 	for (unsigned i = 0; i < font->font.glyph_count; ++i)
+ 		if (font->font.glyphs[i].height > glyph_h)
+@@ -243,3 +248,204 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 	}
+ 	return true;
+ }
++
++/* ---- view_target (Z): X-Wing vs TIE Fighter's threat display ----
++ * XvT's frame art (cp640\TIEFTRTD.LFD, entries "thrt64") is copied into RESOURCE xvt_threat_display at
++ * packaging time. Its window is transparent; the target camera shows through it. */
++
++static AeronTexture* g_threatFrame;
++static bool g_threatFrameFailed;
++
++static bool LoadThreatFrame(void) {
++	if (g_threatFrame || g_threatFrameFailed)
++		return g_threatFrame != NULL;
++	g_threatFrameFailed = true;
++	uint8_t* lfd = NULL;
++	size_t size = 0;
++	if (!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, "xvt_threat_display/TIEFTRTD.LFD", 1 << 22,
++						  &lfd, &size)) {
++		Aeron_LogWarn("xw.hud", "XvT threat display art is missing; Z shows the plain target camera");
++		return false;
++	}
++	const uint8_t *panl = NULL, *pltt = NULL;
++	size_t panl_size = 0, pltt_size = 0;
++	for (size_t at = 0; at + 16 <= size;) {
++		uint32_t length = lfd[at + 12] | (uint32_t)lfd[at + 13] << 8 | (uint32_t)lfd[at + 14] << 16 |
++						  (uint32_t)lfd[at + 15] << 24;
++		if (length > size - at - 16)
++			break;
++		if (!memcmp(lfd + at, "PANL", 4)) {
++			panl = lfd + at + 16;
++			panl_size = length;
++		} else if (!memcmp(lfd + at, "PLTT", 4)) {
++			pltt = lfd + at + 16;
++			pltt_size = length;
++		}
++		at += 16 + length;
++	}
++	AeronPnlBitmap bitmap = { 0 };
++	AeronDecodeError error = { 0 };
++	bool ok = panl && pltt && pltt_size >= 2 && AeronPnl_DecodeIndexed(panl, panl_size, 0, 0, &bitmap, &error);
++	uint8_t* rgba = ok ? malloc((size_t)bitmap.width * bitmap.height * 4) : NULL;
++	if (rgba) {
++		uint8_t palette[256][3] = { { 0 } };
++		unsigned first = pltt[0], last = pltt[1];
++		bool six_bit = true;
++		for (size_t i = 2; i < pltt_size; ++i)
++			six_bit = six_bit && pltt[i] < 64;
++		for (unsigned i = first; i <= last && 2 + (i - first) * 3 + 2 < pltt_size; ++i)
++			for (unsigned c = 0; c < 3; ++c) {
++				unsigned v = pltt[2 + (i - first) * 3 + c];
++				palette[i][c] = (uint8_t)(six_bit ? v * 4 : v);
++			}
++		/* Premultiplied: the window and other uncovered pixels are fully transparent. */
++		for (size_t i = 0; i < (size_t)bitmap.width * bitmap.height; ++i) {
++			bool covered = bitmap.coverage[i] != 0;
++			for (unsigned c = 0; c < 3; ++c)
++				rgba[i * 4 + c] = covered ? palette[bitmap.indices[i]][c] : 0;
++			rgba[i * 4 + 3] = covered ? 255 : 0;
++		}
++		AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
++		g_threatFrame = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
++								  .width = bitmap.width,
++								  .height = bitmap.height,
++								  .format = AERON_TEXTURE_FORMAT_RGBA8_SRGB,
++								  .usage = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
++								  .debug_name = "xw.xvt_threat_display" })
++							: NULL;
++		if (g_threatFrame &&
++			Aeron_UploadTextureDataCmd(cmd, &(AeronTextureUploadDesc) {
++												.texture = g_threatFrame,
++												.width = bitmap.width,
++												.height = bitmap.height,
++												.raw_data = rgba,
++												.raw_size = (size_t)bitmap.width * bitmap.height * 4 }) &&
++			Aeron_SubmitCommandBuffer(cmd))
++			g_threatFrameFailed = false;
++		else {
++			if (cmd)
++				Aeron_CancelCommandBuffer(cmd);
++			Aeron_DestroyTexture(g_threatFrame);
++			g_threatFrame = NULL;
++		}
++		free(rgba);
++	}
++	AeronIndexedFrame_Free(&bitmap);
++	free(lfd);
++	return g_threatFrame != NULL;
++}
++
++void XwHudThreat_Shutdown(void) {
++	Aeron_DestroyTexture(g_threatFrame);
++	g_threatFrame = NULL;
++	g_threatFrameFailed = false;
++}
++
++bool XwHudThreat_Active(const XwRenderSnapshot* s) {
++	return XwFlightTweaks_XvtTargetingComputer() && s->readout.threat_view && s->readout.target_valid &&
++		   !s->camera.replay_mode && LoadThreatFrame();
++}
++
++enum { THREAT_RED = 0xFF4A3A, THREAT_BLUE = 0x5A9BFF, THREAT_GREEN = 0x3CE650, THREAT_YELLOW = 0xF0C030,
++	   THREAT_WHITE = 0xF0F0F0 };
++
++static void Labelled(const Pen* p, float x, float y, float max_width, const char* label, uint32_t label_rgb,
++					 const char* value, uint32_t value_rgb) {
++	Text(p, x, y, label, label_rgb, max_width);
++	float w = Measure(p, label) + Measure(p, " ");
++	Text(p, x + w, y, value, value_rgb, max_width - w);
++}
++
++bool XwHudThreat_Draw(const XwHudDraw* d) {
++	const XwSnapReadout* r = &d->snapshot->readout;
++	float tw = d->layout.target_width, th = d->layout.target_height;
++	float unit = fminf(tw / 640.0f, th / 480.0f);
++	float ox = (tw - 640 * unit) / 2, oy = (th - 480 * unit) / 2;
++	/* XvT's display is 4:3; widescreen sides stay dark around it. */
++	const float black[4] = { 0, 0, 0, 1 };
++	if (ox > 0) {
++		AeronDrawList_AddFill(d->list, 0, 0, ox + 1, th, black, AERON_BLIT2D_BLEND_PMA, NULL);
++		AeronDrawList_AddFill(d->list, tw - ox - 1, 0, ox + 1, th, black, AERON_BLIT2D_BLEND_PMA, NULL);
++	}
++	AeronDrawList2DSprite frame = { .texture = g_threatFrame,
++									.src_u0 = 0,
++									.src_v0 = 0,
++									.src_u1 = 1,
++									.src_v1 = 1,
++									.dst_x = ox,
++									.dst_y = oy,
++									.dst_w = 640 * unit,
++									.dst_h = 480 * unit,
++									.tint = { 1, 1, 1, 1 },
++									.blend = AERON_BLIT2D_BLEND_PMA,
++									.filter = AERON_BLIT2D_FILTER_LINEAR };
++	AeronDrawList_AddSprite(d->list, &frame);
++
++	if (!d->definition)
++		return true;
++	/* The cockpit's larger HUD font when it fits the frame's boxes, as XvT's own text does. */
++	const XwHudImage* font = NULL;
++	for (unsigned i = 0; i < 2 && !font; ++i) {
++		XwRenderAssetId id = d->definition->fonts[i];
++		const XwHudImage* candidate =
++			id ? XwHudAssets_Image((XwHudImageKey) { .source = id, .kind = XW_HUD_IMAGE_FONT }) : NULL;
++		unsigned height = 0;
++		for (unsigned g = 0; candidate && g < candidate->font.glyph_count; ++g)
++			if (candidate->font.glyphs[g].height > height)
++				height = candidate->font.glyphs[g].height;
++		if (candidate && height && height <= 14)
++			font = candidate;
++	}
++	const AeronRuntimeAtlas* atlas = font ? XwHudAssets_Atlas(font) : NULL;
++	if (!font || !atlas)
++		return true;
++	/* Text in the frame's 640x480 pixels; X-Wing's 640-wide fonts map one to one. */
++	Pen pen = { d, font, atlas, unit, unit, ox, oy };
++	uint32_t name_rgb = r->target_relation == 0 ? THREAT_GREEN : r->target_relation == 1 ? THREAT_RED : THREAT_BLUE;
++
++	/* Top boxes: name, range, cargo. */
++	{
++		XwSnapRect name_box = { 100, 31, 146, 14 };
++		Centered(&pen, &name_box, name_box.y, r->target_name, name_rgb);
++		char dist[16];
++		snprintf(dist, sizeof dist, "%u.%02u", r->target_distance_hundredths / 100, r->target_distance_hundredths % 100);
++		Labelled(&pen, 272, 31, 108, "DIST:", THREAT_RED, dist, THREAT_RED);
++		Labelled(&pen, 400, 31, 146, "CARGO:", THREAT_BLUE, r->cargo_valid ? r->target_cargo : "NONE", THREAT_BLUE);
++	}
++	/* Status boxes under the window. */
++	{
++		static const float boxes[3] = { 106, 180, 254 };
++		const char* labels[3] = { "SHD:", "HULL:", "SYS:" };
++		const int16_t values[3] = { r->target_shield_pct, r->target_hull_pct, r->target_system_pct };
++		const uint32_t colors[3] = { THREAT_BLUE, THREAT_GREEN, THREAT_YELLOW };
++		for (unsigned i = 0; i < 3; ++i) {
++			char value[8];
++			if (values[i] < 0)
++				snprintf(value, sizeof value, "--");
++			else
++				snprintf(value, sizeof value, "%d", values[i]);
++			Labelled(&pen, boxes[i], 287, 60, labels[i], colors[i], value, colors[i]);
++		}
++	}
++	/* Lower panel: orders, destination, distance to destination, time remaining. */
++	{
++		float x = 132, y = 357, line = 18, width = 376;
++		char orders[80];
++		snprintf(orders, sizeof orders, "%s%s%s", r->target_orders,
++				 r->target_order_target[0] ? " " : "", r->target_order_target);
++		Labelled(&pen, x, y, width, "CURRENT ORDERS:", THREAT_BLUE, r->target_orders[0] ? orders : "NONE",
++				 THREAT_YELLOW);
++		Labelled(&pen, x, y + line, width, "CURRENT DESTINATION:", THREAT_BLUE,
++				 r->destination_valid ? r->destination : "NONE", THREAT_WHITE);
++		char distance[16] = "UNKNOWN", remaining[16] = "UNKNOWN";
++		if (r->destination_valid)
++			snprintf(distance, sizeof distance, "%u.%02u", r->destination_distance_hundredths / 100,
++					 r->destination_distance_hundredths % 100);
++		if (r->destination_valid && r->time_remaining_s >= 0)
++			snprintf(remaining, sizeof remaining, "%ld:%02ld", (long)(r->time_remaining_s / 60),
++					 (long)(r->time_remaining_s % 60));
++		Labelled(&pen, x, y + 2 * line, width, "DISTANCE TO DESTINATION:", THREAT_BLUE, distance, THREAT_RED);
++		Labelled(&pen, x, y + 3 * line, width, "TIME REMAINING:", THREAT_BLUE, remaining, THREAT_GREEN);
++	}
++	return true;
++}
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+index 9d8ae11..7808794 100644
+--- a/src/xw_remaster/hud_readout.h
++++ b/src/xw_remaster/hud_readout.h
+@@ -7,4 +7,9 @@
+ bool XwHudCmd_Active(const XwRenderSnapshot* snapshot);
+ /* Draws the XvT-style CMD into draw->list at the cockpit's CMD screen. */
+ bool XwHudCmd_Draw(const XwHudDraw* draw);
++/* view_target (Z) with render.xvt_targeting_computer: XvT's threat display frame and readouts replace the HUD.
++ * Active only when XvT's frame art loaded. */
++bool XwHudThreat_Active(const XwRenderSnapshot* snapshot);
++bool XwHudThreat_Draw(const XwHudDraw* draw);
++void XwHudThreat_Shutdown(void);
+ #endif
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 4032bf9..2670db4 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -17,6 +17,7 @@ typedef struct HudKey {
+ 	float stretch_x;
+ 	int widescreen_hud; /* int keeps the memcmp key free of padding. */
+ 	int cmd_active;     /* render.xvt_targeting_computer replaces the CMD panes. */
++	int threat_active;  /* view_target: XvT's threat display replaces the HUD. */
+ 	XwSnapReadout readout;
+ 	const AeronTexture* target_view;
+ } HudKey;
+@@ -141,8 +142,9 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .height = height,
+ 				   .stretch_x = XwRenderMath_CockpitStretchX(&snapshot->camera, width, height),
+ 				   .widescreen_hud = XwFlightTweaks_WidescreenHud(),
+-				   .cmd_active = XwHudCmd_Active(snapshot) };
+-	if (key.cmd_active) {
++				   .cmd_active = XwHudCmd_Active(snapshot),
++				   .threat_active = XwHudThreat_Active(snapshot) };
++	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+ 	}
+@@ -178,12 +180,16 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		draw.list = markers;
+ 	XwHudDraw_Target(&draw, view);
+ 	draw.list = list;
+-	if (!XwHudDraw_Base(&draw) || !XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
+-		return false;
+-	if (key.cmd_active)
+-		XwHudCmd_Draw(&draw);
+-	else
+-		XwHudDraw_Cross(&draw);
++	if (key.threat_active)
++		XwHudThreat_Draw(&draw);
++	else {
++		if (!XwHudDraw_Base(&draw) || !XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
++			return false;
++		if (key.cmd_active)
++			XwHudCmd_Draw(&draw);
++		else
++			XwHudDraw_Cross(&draw);
++	}
+ 	AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 	if (!cmd)
+ 		return false;
+@@ -244,6 +250,7 @@ void XwHudRenderer_Shutdown(void) {
+ 	AeronDrawList_Destroy(list);
+ 	list = NULL;
+ 	XwHudAssets_Shutdown();
++	XwHudThreat_Shutdown();
+ 	ready = valid = false;
+ 	memset(&prepared, 0, sizeof prepared);
+ }
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index 1fe41bd..209e37b 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -19,6 +19,8 @@
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/snapshot/render_objects.h"
+ #include <ctype.h>
++#include <math.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ /* Copies visible text, dropping the flight font's color escapes, uppercased for the HUD fonts. */
+@@ -81,6 +83,34 @@ static void ObjectName(uint16_t ref, char* out, size_t capacity) {
+ 	memcpy(g_flightTextScratchBuffer, saved, sizeof saved);
+ }
+ 
++/* XvT's threat display: where the target's AI is heading, how far that is, and how long it will take. */
++static void CaptureDestination(XwSnapReadout* r, uint16_t ref, const CraftData* craft) {
++	/* XWI point order: start 1, waypoints 1-3, starts 2-3, hyperspace. */
++	static const char* const points[7] = { "START", "WAYPT 1", "WAYPT 2", "WAYPT 3", "START", "START",
++										   "HYPERSPACE" };
++	uint16_t aim = craft->aiTargetRef;
++	if (aim & 0x8000) {
++		unsigned index = aim & 0x7FFF;
++		snprintf(r->destination, sizeof r->destination, "%s", index < 7 ? points[index] : "WAYPOINT");
++	} else if (aim < XW_OBJECT_COUNT && LiveObject(aim)) {
++		if (aim == g_playerFlightState.objectIndex)
++			strcpy(r->destination, "OUR CRAFT");
++		else
++			ObjectName(aim, r->destination, sizeof r->destination);
++	} else
++		return;
++	r->destination_valid = 1;
++	double dx = (double)(int32_t)((uint32_t)craft->aiAimPointX - (uint32_t)g_objectTable[ref].worldX);
++	double dy = (double)(int32_t)((uint32_t)craft->aiAimPointY - (uint32_t)g_objectTable[ref].worldY);
++	double dz = (double)(int32_t)((uint32_t)craft->aiAimPointZ - (uint32_t)g_objectTable[ref].worldZ);
++	double units = sqrt(dx * dx + dy * dy + dz * dz);
++	double hundredths = units * PANEL_DISTANCE_SCALE / 65536.0;
++	r->destination_distance_hundredths = (uint16_t)(hundredths > 9999 ? 9999 : hundredths);
++	/* move.c: math2_mphconvert travels speed * 4660 / 256 world units per second. */
++	double per_second = g_objectTable[ref].speed * (double)MATH2_TRAVEL_MULTIPLIER / 256.0;
++	r->time_remaining_s = per_second > 0 ? (int32_t)(units / per_second + 0.5) : -1;
++}
++
+ static void CaptureTarget(XwSnapReadout* r) {
+ 	uint16_t ref = g_playerFlightState.currentTargetObjectIdx;
+ 	if (ref == XW_OBJECT_SLOT_UNAVAILABLE)
+@@ -154,6 +184,7 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 		if (message && message < XW_MSG_TEMPLATE_COUNT)
+ 			CopyText(r->target_orders, sizeof r->target_orders, g_flightMessageTemplates[message]);
+ 	}
++	CaptureDestination(r, ref, craft);
+ 	if (craft->aiTargetRef != ref && craft->aiTargetRef < XW_OBJECT_COUNT && LiveObject(craft->aiTargetRef)) {
+ 		if (craft->aiTargetRef == g_playerFlightState.objectIndex)
+ 			strcpy(r->target_order_target, "OUR CRAFT");
+@@ -170,6 +201,7 @@ void XwReadout_Capture(XwSnapReadout* r) {
+ 	r->cmd = (XwSnapRect) { g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].x,
+ 							g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].y, layout->width, layout->footerBottom };
+ 	r->valid = r->cmd.width > 0 && r->cmd.height > 0;
++	r->threat_view = user_targetviewactive() != 0;
+ 	/* The CMD shows nothing while the targeting computer is damaged or switched off by damage. */
+ 	if (r->valid && (g_playerFlightState.craft->activeHudFeatureMask & PANEL_CMD_FEATURE))
+ 		CaptureTarget(r);
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 767bc08..c726e5a 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -213,6 +213,12 @@ typedef struct XwSnapReadout {
+ 	uint16_t target_extent;              /* The game's model size (maxBoundsExtent), in world units. */
+ 	XwSnapRect cmd;                      /* The CMD screen in classic cockpit pixels. */
+ 	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
++	/* view_target (Z): XvT's threat display. The destination is the target's current AI aim (waypoint or
++	 * craft); time_remaining_s is -1 when unknown (stationary). */
++	uint8_t threat_view, destination_valid;
++	uint16_t destination_distance_hundredths;
++	int32_t time_remaining_s;
++	char destination[32];
+ } XwSnapReadout;
+ 
+ typedef struct XwSnapWidget {

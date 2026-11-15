@@ -1,0 +1,49 @@
+From 9ed2125bc97491139d8d03f7c3a9e99f9f157742 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 06:47:38 +1100
+Subject: [PATCH 46/59] X (firing mode) plays XvT's confirm beep
+
+---
+ src/xw/flight/player/user.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index e4786a1..5070021 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -1227,7 +1227,7 @@ void user_inputforplane(void) {
+ 										 1) &
+ 										(XW_LAUNCHER_FIRE_MODE_MASK >> 1)) +
+ 									   XW_MSG_WARHEAD_LAUNCHERS_SINGLE_FIRE));
+-				fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 			} else {
+ #ifdef XW_MODERN
+ 				/* XWA-style cycle: ... -> fire linked -> lasers and ion cannons linked -> single fire. */
+@@ -1239,7 +1239,7 @@ void user_inputforplane(void) {
+ 						g_craftTypeDefs[g_playerFlightState.craftTypeIndex]
+ 							.laserGroupFirstSlot[g_playerFlightState.selectedWeaponBank];
+ 					msg_messageprintf(XW_MSG_CANNONS_SINGLE_FIRE);
+-					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 					break;
+ 				}
+ 				if (laser_canlinkcannongroups(g_playerFlightState.craft) &&
+@@ -1254,7 +1254,7 @@ void user_inputforplane(void) {
+ 					laser_setplayergroupslinked(1);
+ 					msg_messagetext(XW_MSG_CANNONS_LINKED_FIRE, hasIons ? "\005Lasers and ion cannons \007fire linked"
+ 																		: "\005All cannons \007fire linked");
+-					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 					break;
+ 				}
+ #endif
+@@ -1273,7 +1273,7 @@ void user_inputforplane(void) {
+ 					g_craftTypeDefs[g_playerFlightState.craftTypeIndex]
+ 						.laserGroupFirstSlot[g_playerFlightState.selectedWeaponBank];
+ 				msg_messageprintf((XwFlightMessageId)(link + XW_MSG_CANNONS_SINGLE_FIRE - LASER_LINK_SINGLE));
+-				fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 			}
+ 			break;
+ 		case USER_KEY_LASER_RECHARGE: {

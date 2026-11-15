@@ -1,0 +1,21 @@
+﻿Source code for the modified OpenXvT in XvTModInstaller.exe (OpenXvT v0.0.4 + 25 changes, 50d67f1).
+
+OpenXvT is free software (https://github.com/elyosh/OpenXvT); these changes are released under the same terms
+(GNU GPL version 3, see licenses\ in the installed folder).
+
+To rebuild: clone https://github.com/elyosh/OpenXvT, check out commit bc4362fac5040aee3e2903282335ae3e9cfbd14f
+(with its submodules), then apply the patches in OpenXvT\ in order:
+    git am OpenXvT/*.patch
+
+The installer patches the official OpenXvT v0.0.4 Windows release
+(https://github.com/elyosh/OpenXvT/releases/tag/v0.0.4, openxvt-0.0.4-windows-x86_64-release.zip,
+SHA-256 afc9514435d42e40d19c3e0e66c5ad72fc558b531e51c1ae2886755cda4eef8d), so the exe is built to run on that release's own DLLs. It was built
+with MSYS2 (MINGW64, GCC 16) using the scripts in build\:
+    build_ffmpeg.sh   FFmpeg 8.0.1 headers and import libraries, configured as upstream's
+                      packaging/windows/Dockerfile (the DLLs themselves come from the release)
+    mkimplib.sh       import libraries for the release's libspeexdsp.dll (and libcurl.dll)
+    speexdsp.pc       pkg-config file pointing SpeexDSP at that import library
+    build_rel.sh      configures and builds with libstdc++/libgcc/winpthread linked statically, strips
+                      the exe and runs checkimports.sh against the release folder
+Shaders and every other file are the release's own. The X-Wing vs TIE Fighter files the
+installer copies come from your own XvT install and are not part of the source.

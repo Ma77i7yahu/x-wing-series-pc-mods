@@ -1,0 +1,233 @@
+From bd40e06fe526386eb4418604442f4d73ac3b14cc Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 06:48:14 +1100
+Subject: [PATCH 13/25] Add session log files and crash stack reports
+
+---
+ CMakeLists.txt            |   1 +
+ src/xvt_app/diagnostics.c | 171 ++++++++++++++++++++++++++++++++++++++
+ src/xvt_app/diagnostics.h |   7 ++
+ src/xvt_app/main.c        |   2 +
+ 4 files changed, 181 insertions(+)
+ create mode 100644 src/xvt_app/diagnostics.c
+ create mode 100644 src/xvt_app/diagnostics.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 376a25c..8f2a21b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -293,6 +293,7 @@ target_link_libraries(xvt_remaster PUBLIC xvt_core aeron_scene aeron_asset)
+ 
+ add_executable(xvt
+     src/xvt_app/main.c
++    src/xvt_app/diagnostics.c
+     src/xvt_app/application.c
+     src/xvt_app/host_config.c
+     src/xvt_app/setup.c
+diff --git a/src/xvt_app/diagnostics.c b/src/xvt_app/diagnostics.c
+new file mode 100644
+index 0000000..6ad3aeb
+--- /dev/null
++++ b/src/xvt_app/diagnostics.c
+@@ -0,0 +1,171 @@
++#include "xvt_app/diagnostics.h"
++
++#include <SDL3/SDL.h>
++#include <signal.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++/* Each session writes logs/openxvt-<timestamp>.log in the user folder so a
++ * crash survives the next launch. Crashes append the faulting stack as
++ * module+offset pairs, which map back to source with the build's symbols. */
++
++enum { KEPT_LOGS = 10 };
++
++static FILE* g_log;
++static SDL_LogOutputFunction g_defaultOutput;
++static void* g_defaultUserdata;
++
++static void WriteLine(const char* text) {
++	if (!g_log)
++		return;
++	fputs(text, g_log);
++	fputc('\n', g_log);
++	fflush(g_log);
++}
++
++static void LogOutput(void* userdata, int category, SDL_LogPriority priority, const char* message) {
++	static const char* const names[] = { "?", "TRACE", "VERBOSE", "DEBUG", "INFO", "WARN", "ERROR", "CRITICAL" };
++	(void)userdata;
++	if (g_log) {
++		char stamp[16];
++		time_t now = time(NULL);
++		strftime(stamp, sizeof stamp, "%H:%M:%S", localtime(&now));
++		fprintf(g_log, "%s %-8s %s\n", stamp,
++				(unsigned)priority < sizeof names / sizeof names[0] ? names[priority] : "?", message);
++		fflush(g_log);
++	}
++	if (g_defaultOutput)
++		g_defaultOutput(g_defaultUserdata, category, priority, message);
++}
++
++#ifdef _WIN32
++static void WriteAddress(const char* label, DWORD64 address) {
++	HMODULE module = NULL;
++	char path[MAX_PATH] = "?";
++	char line[MAX_PATH + 96];
++	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++						   (LPCSTR)(uintptr_t)address, &module) &&
++		module) {
++		GetModuleFileNameA(module, path, sizeof path);
++		const char* name = strrchr(path, '\\');
++		snprintf(line, sizeof line, "  %s %s+0x%llx", label, name ? name + 1 : path,
++				 (unsigned long long)(address - (DWORD64)(uintptr_t)module));
++	} else
++		snprintf(line, sizeof line, "  %s 0x%llx", label, (unsigned long long)address);
++	WriteLine(line);
++}
++
++static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* exception) {
++	static volatile LONG entered;
++	if (InterlockedExchange(&entered, 1))
++		return EXCEPTION_CONTINUE_SEARCH;
++	char line[160];
++	const EXCEPTION_RECORD* record = exception->ExceptionRecord;
++	snprintf(line, sizeof line, "CRASH: exception 0x%08lx at %p, thread %lu",
++			 (unsigned long)record->ExceptionCode, record->ExceptionAddress, GetCurrentThreadId());
++	WriteLine(line);
++	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
++		snprintf(line, sizeof line, "  %s address 0x%llx", record->ExceptionInformation[0] ? "write" : "read",
++				 (unsigned long long)record->ExceptionInformation[1]);
++		WriteLine(line);
++	}
++	/* Walk the faulting thread's stack with the x64 unwind tables. */
++	CONTEXT context = *exception->ContextRecord;
++	for (int frame = 0; frame < 48 && context.Rip; ++frame) {
++		char label[16];
++		snprintf(label, sizeof label, "#%02d", frame);
++		WriteAddress(label, context.Rip);
++		DWORD64 image = 0;
++		PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, NULL);
++		if (function) {
++			void* handler_data = NULL;
++			DWORD64 establisher = 0;
++			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data,
++							 &establisher, NULL);
++		} else {
++			if (!context.Rsp)
++				break;
++			context.Rip = *(DWORD64*)(uintptr_t)context.Rsp;
++			context.Rsp += 8;
++		}
++	}
++	WriteLine("End of crash report.");
++	return EXCEPTION_CONTINUE_SEARCH;
++}
++#endif
++
++static void AbortHandler(int signal_number) {
++	char line[64];
++	snprintf(line, sizeof line, "CRASH: abort signal %d", signal_number);
++	WriteLine(line);
++}
++
++static void PruneLogs(const char* directory) {
++#ifdef _WIN32
++	/* Timestamped names sort chronologically; keep the newest KEPT_LOGS. */
++	char pattern[MAX_PATH], names[64][MAX_PATH];
++	int count = 0;
++	snprintf(pattern, sizeof pattern, "%sopenxvt-*.log", directory);
++	WIN32_FIND_DATAA data;
++	HANDLE find = FindFirstFileA(pattern, &data);
++	if (find == INVALID_HANDLE_VALUE)
++		return;
++	do {
++		if (count < 64)
++			snprintf(names[count++], MAX_PATH, "%s", data.cFileName);
++	} while (FindNextFileA(find, &data));
++	FindClose(find);
++	for (int i = 0; i < count; ++i)
++		for (int j = i + 1; j < count; ++j)
++			if (strcmp(names[i], names[j]) > 0) {
++				char swap[MAX_PATH];
++				memcpy(swap, names[i], MAX_PATH);
++				memcpy(names[i], names[j], MAX_PATH);
++				memcpy(names[j], swap, MAX_PATH);
++			}
++	for (int i = 0; i + KEPT_LOGS < count; ++i) {
++		char path[MAX_PATH * 2];
++		snprintf(path, sizeof path, "%s%s", directory, names[i]);
++		DeleteFileA(path);
++	}
++#else
++	(void)directory;
++#endif
++}
++
++void XvtDiagnostics_Init(const char* version) {
++	char* base = SDL_GetPrefPath("TotallyOpen", "OpenXvT");
++	if (!base)
++		return;
++	char directory[1024], path[1100], stamp[32];
++	snprintf(directory, sizeof directory, "%slogs/", base);
++	SDL_free(base);
++	SDL_CreateDirectory(directory);
++	PruneLogs(directory);
++	time_t now = time(NULL);
++	strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
++	snprintf(path, sizeof path, "%sopenxvt-%s.log", directory, stamp);
++	g_log = fopen(path, "w");
++	if (!g_log)
++		return;
++	fprintf(g_log, "OpenXvT %s (widescreen build), session %s\n", version, stamp);
++#ifdef _WIN32
++	{
++		const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)GetModuleHandleA(NULL);
++		const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const char*)dos + dos->e_lfanew);
++		fprintf(g_log, "Executable link stamp: %08lx\n", (unsigned long)nt->FileHeader.TimeDateStamp);
++	}
++	SetUnhandledExceptionFilter(CrashFilter);
++#endif
++	fflush(g_log);
++	signal(SIGABRT, AbortHandler);
++	SDL_GetLogOutputFunction(&g_defaultOutput, &g_defaultUserdata);
++	SDL_SetLogOutputFunction(LogOutput, NULL);
++	SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
++}
+diff --git a/src/xvt_app/diagnostics.h b/src/xvt_app/diagnostics.h
+new file mode 100644
+index 0000000..e929e86
+--- /dev/null
++++ b/src/xvt_app/diagnostics.h
+@@ -0,0 +1,7 @@
++#ifndef XVT_APP_DIAGNOSTICS_H
++#define XVT_APP_DIAGNOSTICS_H
++
++/* Start the per-session log file and the crash reporter. */
++void XvtDiagnostics_Init(const char* version);
++
++#endif
+diff --git a/src/xvt_app/main.c b/src/xvt_app/main.c
+index 1bc6511..487c8a0 100644
+--- a/src/xvt_app/main.c
++++ b/src/xvt_app/main.c
+@@ -1,4 +1,5 @@
+ #include "xvt_app/application.h"
++#include "xvt_app/diagnostics.h"
+ 
+ #include "aeron/main.h"
+ 
+@@ -24,5 +25,6 @@ int main(int argc, char* argv[]) {
+ 				"  --help                      Show this help\n");
+ 		return valid ? 0 : 2;
+ 	}
++	XvtDiagnostics_Init(OPENXVT_VERSION);
+ 	return XvtApplication_Run(&options);
+ }

@@ -1,0 +1,75 @@
+From 4a194c581e2653969eca598d27bb795aa04f1347 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 05:48:23 +1100
+Subject: [PATCH 20/25] AI ion link applies to all targets, including capital
+ ships
+
+---
+ resources/config.yaml             |  5 ++---
+ src/xvt/flight/ai/paifight.c      | 14 +++++---------
+ src/xvt_runtime/config/settings.h |  2 +-
+ 3 files changed, 8 insertions(+), 13 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 97da6f4..d2a5f2a 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -450,7 +450,6 @@ flight:
+   # target selected. 0 = always parallel.
+   laser_convergence: 550
+   # AI fighters with lasers and ion cannons (Y-Wing, B-Wing, Assault Gunboat...)
+-  # fire both together at starfighters, transports and utility craft. Against
+-  # capital ships and freighters, and on disable orders, they keep the original
+-  # behaviour. off, friendly (your side only) or all.
++  # fire both together at any target. Disable orders keep the original
++  # ions-only behaviour. off, friendly (your side only) or all.
+   ai_ion_link: all
+diff --git a/src/xvt/flight/ai/paifight.c b/src/xvt/flight/ai/paifight.c
+index 8f85134..52e12d4 100644
+--- a/src/xvt/flight/ai/paifight.c
++++ b/src/xvt/flight/ai/paifight.c
+@@ -34,18 +34,14 @@ const unsigned int g_aiFighterShootMaxRangeBySkill[3] = { 0x6000, 0x8000, 0xA000
+ // GLOBAL: XVT 0x52429C
+ const uint8_t g_aiFighterShootLinkSlot3ValueBySkill[4] = { 3, 4, 5, 0 };
+ 
+-/* XWA-style: AI fighters fire ion cannons with their lasers (flight.ai_ion_link). Only at small craft,
+- * so wingmen and enemy reinforcements don't slowly ion-disable capital ships and freighters. */
+-static int paifight_IonLinkWithLasers(uint16_t targetIndex) {
++/* XWA-style: AI fighters fire ion cannons with their lasers at any target (flight.ai_ion_link).
++ * Disable orders keep the original ions-only behaviour. */
++static int paifight_IonLinkWithLasers(void) {
+ 	enum { ION_LINK_OFF = 0, ION_LINK_FRIENDLY = 1 };
+ 	const XvtSettings* settings = XvtConfig_Settings();
+ 	int mode = settings ? settings->ai_ion_link : ION_LINK_OFF;
+-	uint8_t genus;
+ 
+-	if (mode == ION_LINK_OFF || targetIndex >= g_regionMainObjectSlotEnd)
+-		return 0;
+-	genus = g_objectTable[targetIndex].genusId;
+-	if (genus != CRAFT_GENUS_STARFIGHTER && genus != CRAFT_GENUS_TRANSPORT && genus != CRAFT_GENUS_UTILITY_VEHICLE)
++	if (mode == ION_LINK_OFF)
+ 		return 0;
+ 	if (mode == ION_LINK_FRIENDLY) {
+ 		int team = g_missionFlightGroups[g_objectTable[g_paiContext.objectIndex].flightGroupIdx].fg.team;
+@@ -980,7 +976,7 @@ int16_t paifight_fightershootorder(void) {
+ 						   g_paiContext.controller->hasLiveTarget == 1) {
+ 					slotLink = linkMode;
+ 				} else if (strcmp(g_planTable[currentPlanId].name, "disableldr1pln") != 0 &&
+-						   paifight_IonLinkWithLasers(targetIndex)) {
++						   paifight_IonLinkWithLasers()) {
+ 					slotLink = linkMode;
+ 				} else {
+ 					slotLink = 0;
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index d913ab3..fc1dcf5 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -92,7 +92,7 @@ typedef struct XvtSettings {
+ 	int flight_unlocked;
+ 	/* Player cannons converge this many metres ahead; 0 fires parallel. */
+ 	int laser_convergence_m;
+-	/* AI fighters fire ion cannons with their lasers at small craft: 0 off, 1 friendly only, 2 everyone. */
++	/* AI fighters fire ion cannons with their lasers: 0 off, 1 friendly only, 2 everyone. */
+ 	int ai_ion_link;
+ 	char game_data[XVT_PATH_CAPACITY];
+ 	char ui_font[XVT_PATH_CAPACITY];

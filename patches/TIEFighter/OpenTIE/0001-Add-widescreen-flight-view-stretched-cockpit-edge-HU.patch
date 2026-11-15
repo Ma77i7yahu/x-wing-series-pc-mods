@@ -1,0 +1,864 @@
+From 7d3587095151c626cb0376d243c142e8a67a20c3 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Fri, 9 Oct 2026 21:21:28 +1100
+Subject: [PATCH 01/18] Add widescreen flight view, stretched cockpit, edge HUD
+ and laser convergence
+
+- flight.widescreen: the modern flight layer fills the window instead of 4:3
+- flight.cockpit_stretch: classic cockpit art and its CRT span the view
+- flight.widescreen_hud: cockpit-off radars move out to the screen edges
+- flight.laser_convergence: XWA-style player cannon convergence (550 m)
+- Video and Game settings expose the options
+- Build fix: MinGW mkdir in opt_textures
+---
+ CMakeLists.txt                              |  2 +
+ aeron                                       |  2 +-
+ resources/config.yaml                       | 10 +++
+ src/tie/laser.c                             | 68 ++++++++++++++++++
+ src/tie_app/application.c                   |  5 ++
+ src/tie_app/config/app_config.c             | 24 +++++--
+ src/tie_app/config/app_config.h             |  8 +++
+ src/tie_app/settings/flight_options.c       | 11 ++-
+ src/tie_app/settings/settings.c             | 51 ++++++++++++++
+ src/tie_remaster/flight/cockpit/renderer.c  | 65 +++++++++++++++--
+ src/tie_remaster/flight/hud_geometry.h      | 16 +++++
+ src/tie_remaster/flight/passes.c            |  7 ++
+ src/tie_runtime/hooks/flight_tweaks.c       | 17 +++++
+ src/tie_runtime/hooks/flight_tweaks.h       | 21 ++++++
+ src/tie_runtime/presentation/presentation.c | 77 +++++++++++++++------
+ src/tie_runtime/presentation/presentation.h |  4 ++
+ tools/opt/opt_textures.c                    |  4 ++
+ 17 files changed, 356 insertions(+), 36 deletions(-)
+ create mode 100644 src/tie_runtime/hooks/flight_tweaks.c
+ create mode 100644 src/tie_runtime/hooks/flight_tweaks.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2fb122c..137e2e2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -521,6 +521,8 @@ set(TIE_RUNTIME_SOURCES
+     src/tie_runtime/audio/direct_sound.h
+     src/tie_runtime/hooks/axis_input.c
+     src/tie_runtime/hooks/axis_input.h
++    src/tie_runtime/hooks/flight_tweaks.c
++    src/tie_runtime/hooks/flight_tweaks.h
+     src/tie_runtime/hooks/orientation.c
+     src/tie_runtime/hooks/orientation.h)
+ 
+diff --git a/aeron b/aeron
+index 6187f38..8d1170c 160000
+--- a/aeron
++++ b/aeron
+@@ -1 +1 @@
+-Subproject commit 6187f38bb417ebbf1fcfc775eb67a5d4b34e6689
++Subproject commit 8d1170cacdf1cae092284f6143a689a7ee7edfd9
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 67b3ada..f608ab5 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -33,6 +33,16 @@ flight:
+   # add a large bias to negative pitch on craft with a low pitch rate, making
+   # Assault Gunboat pitch-down far more sensitive than pitch-up.
+   fix_axis_input_bias: true
++  # Fill a widescreen window instead of pillarboxing the flight view to 4:3.
++  widescreen: true
++  # Stretch the 4:3 cockpit art across a widescreen view.
++  cockpit_stretch: true
++  # Move the cockpit-off radars and indicators out toward the screen edges.
++  widescreen_hud: true
++  # X-Wing Alliance style cannon convergence: on the current target when it is
++  # ahead (0.1-2.5 km), otherwise this many metres ahead; parallel with no
++  # target selected. 0 = always parallel.
++  laser_convergence: 550
+   models:
+     source: original
+     smooth_angle_degrees: 90
+diff --git a/src/tie/laser.c b/src/tie/laser.c
+index b41ab4e..6f56b13 100644
+--- a/src/tie/laser.c
++++ b/src/tie/laser.c
+@@ -29,9 +29,11 @@
+ #endif
+ #include "tie_runtime/storage/storage.h"
+ #ifdef TIE_MODERN
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/timing/flight_timing.h"
+ #endif
+ 
++#include <math.h>
+ #include <stdint.h>
+ 
+ /* spec_data declared in tie.h; no local extern needed. */
+@@ -741,6 +743,65 @@ uint16_t laser_firemissile(uint16_t shooter_obj_idx, uint16_t weapon_slot_idx, u
+ 	return wh;
+ }
+ 
++#ifdef TIE_MODERN
++/* X-Wing Alliance style convergence: aim a player's cannon bolt from its
++ * hardpoint at a point straight ahead of the craft instead of parallel to the
++ * nose. The point lies at the current target's range along the nose while the
++ * target is within about 30 degrees and 0.1-2.5 km ahead, otherwise at
++ * flight.laser_convergence metres. With no target selected the bolt keeps the
++ * original parallel path. */
++static void laser_convergeplayerbolt(const FlightObject* shooter, FlightObject* bolt, int32_t length) {
++	enum { UNITS_PER_KM = 40706, COS_30_Q15 = 28378 }; /* panel_outputdistance: units * 161 >> 16 = km/100 */
++	const int metres = TieFlightTweaks_LaserConvergenceMetres();
++	const uint16_t target = pstate.target_obj_idx;
++	int64_t tx, ty, tz;
++	if (metres <= 0 || target == 0xFFFF)
++		return;
++	if (target < NUM_OBJECTS) {
++		if (!objects[target].ship_idx)
++			return;
++		tx = objects[target].world_x;
++		ty = objects[target].world_y;
++		tz = objects[target].world_z;
++	} else if (target >= OBJ_REF_STATIC_BASE && target < OBJ_REF_WAYPOINT_BASE) {
++		if (!staticobjects[target - OBJ_REF_STATIC_BASE].species)
++			return;
++		tx = (int64_t)staticobjects[target - OBJ_REF_STATIC_BASE].world_x * 256;
++		ty = (int64_t)staticobjects[target - OBJ_REF_STATIC_BASE].world_y * 256;
++		tz = (int64_t)staticobjects[target - OBJ_REF_STATIC_BASE].world_z * 256;
++	} else {
++		return;
++	}
++
++	int64_t distance = (int64_t)metres * UNITS_PER_KM / 1000;
++	{
++		const int64_t dx = tx - shooter->world_x, dy = ty - shooter->world_y, dz = tz - shooter->world_z;
++		const int64_t along = (dx * shooter->fwd_x + dy * shooter->fwd_y + dz * shooter->fwd_z) >> 15;
++		const double range = sqrt((double)dx * dx + (double)dy * dy + (double)dz * dz);
++		if (along >= UNITS_PER_KM / 10 && along <= UNITS_PER_KM * 5 / 2 && range > 0.0 &&
++			(double)along * 32768.0 >= COS_30_Q15 * range)
++			distance = along;
++	}
++
++	/* The muzzle is the hardpoint position; the bolt starts `length` ahead of it. */
++	const int32_t muzzle_x = bolt->world_x_prev, muzzle_y = bolt->world_y_prev, muzzle_z = bolt->world_z_prev;
++	const int64_t vx = shooter->world_x + ((distance * shooter->fwd_x) >> 15) - muzzle_x;
++	const int64_t vy = shooter->world_y + ((distance * shooter->fwd_y) >> 15) - muzzle_y;
++	const int64_t vz = shooter->world_z + ((distance * shooter->fwd_z) >> 15) - muzzle_z;
++	const double v_len = sqrt((double)vx * vx + (double)vy * vy + (double)vz * vz);
++	if (!(v_len > 0.0))
++		return;
++	trig2_ctop((int32_t)vx, (int32_t)vy, (int32_t)vz);
++	bolt->heading = trig2_xyangle;
++	bolt->pitch = trig2_zangle;
++	bolt->orient_dirty = 1;
++	bolt->move_dirty = 1;
++	bolt->world_x = muzzle_x + (int32_t)lround((double)vx * length / v_len);
++	bolt->world_y = muzzle_y + (int32_t)lround((double)vy * length / v_len);
++	bolt->world_z = muzzle_z + (int32_t)lround((double)vz * length / v_len);
++}
++#endif
++
+ /* ================================================================== */
+ /* laser_createprojectile                                              */
+ /* ================================================================== */
+@@ -884,6 +945,13 @@ uint16_t laser_createprojectile(uint16_t shooter_obj_idx, uint16_t hp_idx, uint1
+ 		objects[slot].fwd_z = shooter->fwd_z;
+ 		objects[slot].orient_dirty = 0;
+ 		objects[slot].move_dirty = 0;
++#ifdef TIE_MODERN
++		if (shooter_obj_idx == pstate.object_idx && !projectile_is_warhead_type[projectile_type - WEAPON_SPECIES_BASE])
++			laser_convergeplayerbolt(
++				shooter, &objects[slot],
++				(int16_t)TIE_FLIGHT_EDITION(projectilelength,
++											tie98_projectilelength)[projectile_type - WEAPON_SPECIES_BASE]);
++#endif
+ 	}
+ 
+ 	/* Pair the slot with a warhead record: no homing (tier 0), no
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index a8f8332..f3b577f 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -29,6 +29,7 @@
+ #include "tie_remaster/remaster.h"
+ #include "tie_runtime/flight_assets/service.h"
+ #include "tie_runtime/hooks/axis_input.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/input/actions.h"
+ #include "tie_runtime/input/controller_mapping.h"
+ #include "tie_runtime/input/input.h"
+@@ -180,6 +181,10 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieControllerMapping_SetOptions(&app_config.requested.controller);
+ 		TieMouseFlight_SetOptions(&app_config.requested.mouse);
+ 		TieAxisInputHook_SetEnabled(app_config.requested.fix_axis_input_bias);
++		TiePresentation_SetFillWindow(app_config.requested.widescreen);
++		TieFlightTweaks_SetCockpitStretch(app_config.requested.cockpit_stretch);
++		TieFlightTweaks_SetWidescreenHud(app_config.requested.widescreen_hud);
++		TieFlightTweaks_SetLaserConvergenceMetres(app_config.requested.laser_convergence_m);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index d643e7d..ca3eccb 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -181,7 +181,8 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "ui", warn, "font");
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+-				  "player_engine_sound", "fix_axis_input_bias", "models");
++				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
++				  "laser_convergence", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -532,7 +533,12 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 	if (!TieAppConfig_ReadBool(document, "flight.player_engine_sound", &out->player_engine_sound_enabled,
+ 							   error, capacity) ||
+ 		!TieAppConfig_ReadBool(document, "flight.fix_axis_input_bias", &out->fix_axis_input_bias, error,
+-							   capacity))
++							   capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.widescreen", &out->widescreen, error, capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.cockpit_stretch", &out->cockpit_stretch, error, capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.widescreen_hud", &out->widescreen_hud, error, capacity) ||
++		!TieAppConfig_ReadInt(document, "flight.laser_convergence", 0, 5000, &out->laser_convergence_m, error,
++							  capacity))
+ 		return false;
+ 	const char* mouse_mode = AeronConfigFile_GetString(document, "input.mouse_mode", NULL);
+ 	if (!mouse_mode)
+@@ -765,6 +771,10 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.update_rate = config->requested_flight_update_rate,
+ 		.player_engine_sound_enabled = config->player_engine_sound_enabled,
+ 		.player_engine_sound_volume_percent = config->player_engine_sound_volume_percent,
++		.widescreen = config->widescreen,
++		.cockpit_stretch = config->cockpit_stretch,
++		.widescreen_hud = config->widescreen_hud,
++		.laser_convergence_m = config->laser_convergence_m,
+ 	};
+ }
+ 
+@@ -803,7 +813,8 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		(options->update_rate != TIE_FLIGHT_UPDATE_RATE_NATIVE &&
+ 		 options->update_rate != TIE_FLIGHT_UPDATE_RATE_TIE95 &&
+ 		 options->update_rate != TIE_FLIGHT_UPDATE_RATE_UNLOCKED) ||
+-		(unsigned int)options->player_engine_sound_volume_percent > 100u)
++		(unsigned int)options->player_engine_sound_volume_percent > 100u ||
++		(unsigned int)options->laser_convergence_m > 5000u)
+ 		return TieAppConfig_ConfigError(error, capacity, "invalid live flight settings");
+ 	if (!AeronConfigFile_Clone(state->user_document, &candidate, &aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "frontend.aspect_correct_legacy_scenes",
+@@ -820,7 +831,12 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		!AeronConfigFile_SetBool(candidate, "flight.player_engine_sound",
+ 								 options->player_engine_sound_enabled, &aeron_error) ||
+ 		!AeronConfigFile_SetInt(candidate, "audio.player_engine_sound_volume_percent",
+-								options->player_engine_sound_volume_percent, &aeron_error)) {
++								options->player_engine_sound_volume_percent, &aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.widescreen", options->widescreen, &aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.cockpit_stretch", options->cockpit_stretch, &aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.widescreen_hud", options->widescreen_hud, &aeron_error) ||
++		!AeronConfigFile_SetInt(candidate, "flight.laser_convergence", options->laser_convergence_m,
++								&aeron_error)) {
+ 		AeronConfigFile_Destroy(candidate);
+ 		return TieAppConfig_LogAeronError(&aeron_error, error, capacity);
+ 	}
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index 936cca0..e9eef55 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -47,6 +47,10 @@ typedef struct TieAppLiveFlightOptions {
+ 	TieFlightUpdateRate update_rate;
+ 	bool player_engine_sound_enabled;
+ 	int player_engine_sound_volume_percent;
++	bool widescreen;
++	bool cockpit_stretch;
++	bool widescreen_hud;
++	int laser_convergence_m; /* 0 fires parallel */
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -86,6 +90,10 @@ typedef struct TieAppConfig {
+ 	TieFlightModelSource requested_model_source;
+ 	bool player_engine_sound_enabled; /* requested YAML preference */
+ 	bool fix_axis_input_bias;         /* YAML-only; see TieAxisInputHook */
++	bool widescreen;
++	bool cockpit_stretch;
++	bool widescreen_hud;
++	int laser_convergence_m;
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index 47f43a6..3a848d1 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -19,7 +19,8 @@ static bool TieFlightOptions_FlightOptionsValid(const TieAppLiveFlightOptions* o
+ 		   (options->update_rate == TIE_FLIGHT_UPDATE_RATE_NATIVE ||
+ 			options->update_rate == TIE_FLIGHT_UPDATE_RATE_TIE95 ||
+ 			options->update_rate == TIE_FLIGHT_UPDATE_RATE_UNLOCKED) &&
+-		   (unsigned int)options->player_engine_sound_volume_percent <= 100u;
++		   (unsigned int)options->player_engine_sound_volume_percent <= 100u &&
++		   (unsigned int)options->laser_convergence_m <= 5000u;
+ }
+ 
+ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* left,
+@@ -28,12 +29,18 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->tie98_original_renderer == right->tie98_original_renderer &&
+ 		   left->update_rate == right->update_rate &&
+ 		   left->player_engine_sound_enabled == right->player_engine_sound_enabled &&
+-		   left->player_engine_sound_volume_percent == right->player_engine_sound_volume_percent;
++		   left->player_engine_sound_volume_percent == right->player_engine_sound_volume_percent &&
++		   left->widescreen == right->widescreen && left->cockpit_stretch == right->cockpit_stretch &&
++		   left->widescreen_hud == right->widescreen_hud &&
++		   left->laser_convergence_m == right->laser_convergence_m;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+ 	options->aspect_correct_legacy_scenes = options->aspect_correct_legacy_scenes != 0;
+ 	options->player_engine_sound_enabled = options->player_engine_sound_enabled != 0;
++	options->widescreen = options->widescreen != 0;
++	options->cockpit_stretch = options->cockpit_stretch != 0;
++	options->widescreen_hud = options->widescreen_hud != 0;
+ }
+ 
+ bool TieFlightOptions_Configure(const TieAppLiveFlightOptions* requested, TieFlightOptionsApplyFn apply,
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index 39bc5f0..a25add7 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -19,7 +19,9 @@
+ #include "tie_app/settings/video_options.h"
+ #include "tie_app/setup/installation_ui.h"
+ #include "tie_remaster/remaster.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/input/controller_mapping.h"
++#include "tie_runtime/presentation/presentation.h"
+ #include "tie_runtime/runtime/runtime.h"
+ 
+ typedef enum TiePathPickerTarget {
+@@ -176,9 +178,21 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 		snprintf(error, error_capacity, "could not apply the player engine sound volume");
+ 		return false;
+ 	}
++	TiePresentation_SetFillWindow(requested->widescreen);
++	TieFlightTweaks_SetCockpitStretch(requested->cockpit_stretch);
++	TieFlightTweaks_SetWidescreenHud(requested->widescreen_hud);
++	TieFlightTweaks_SetLaserConvergenceMetres(requested->laser_convergence_m);
+ 	return true;
+ }
+ 
++/* Widescreen and convergence options live with the flight options but do not
++ * change the flight profile, so they apply without queueing a profile switch. */
++static void TieSettings_SetFlightTweaks(const TieAppLiveFlightOptions* flight) {
++	char error[512];
++	if (!TieFlightOptions_Set(flight, error, sizeof error))
++		TieSettings_SettingsReportError(error);
++}
++
+ static bool TieSettings_PersistFlightOptions(const TieAppLiveFlightOptions* options, void* user, char* error,
+ 											 size_t error_capacity) {
+ 	return TieAppConfig_SetLiveFlightOptions((TieAppConfigState*)user, options, error, error_capacity);
+@@ -371,6 +385,28 @@ static void TieSettings_VideoPage(AeronUiContext* ui) {
+ 		options.output.hdr = hdr != 0;
+ 		changed = true;
+ 	}
++	{
++		TieAppLiveFlightOptions flight;
++		TieFlightOptions_Get(&flight);
++		bool flight_changed = false;
++		int widescreen = flight.widescreen;
++		if (AeronUi_Toggle(ui, "Widescreen Flight View", &widescreen)) {
++			flight.widescreen = widescreen != 0;
++			flight_changed = true;
++		}
++		int stretch = flight.cockpit_stretch;
++		if (AeronUi_Toggle(ui, "Stretch Cockpit to Widescreen", &stretch)) {
++			flight.cockpit_stretch = stretch != 0;
++			flight_changed = true;
++		}
++		int hud = flight.widescreen_hud;
++		if (AeronUi_Toggle(ui, "Widescreen Cockpit-Off HUD", &hud)) {
++			flight.widescreen_hud = hud != 0;
++			flight_changed = true;
++		}
++		if (flight_changed)
++			TieSettings_SetFlightTweaks(&flight);
++	}
+ 	AeronUi_Spacer(ui, 8.0f);
+ 	AeronUi_Header(ui, "HDR Presentation");
+ 	static const char* const gamma_labels[] = { "2.2", "2.4", "sRGB" };
+@@ -730,6 +766,21 @@ static void TieSettings_GamePage(AeronUiContext* ui) {
+ 		if (!TieInflightSettings_Set(&inflight, error, sizeof error))
+ 			TieSettings_SettingsReportError(error);
+ 	}
++
++	static const int convergence_values[] = { 0, 300, 400, 550, 700, 1000 };
++	static const char* const convergence_labels[] = { "Off (Parallel)", "300 m", "400 m",
++													  "550 m",          "700 m", "1000 m" };
++	TieAppLiveFlightOptions tweaks;
++	TieFlightOptions_Get(&tweaks);
++	int convergence = 0;
++	for (int index = 1; index < 6; ++index)
++		if (tweaks.laser_convergence_m >= convergence_values[index])
++			convergence = index;
++	if (AeronUi_Selector(ui, "Laser Convergence", &convergence, convergence_labels, 6)) {
++		tweaks.laser_convergence_m = convergence_values[convergence];
++		TieSettings_SetFlightTweaks(&tweaks);
++	}
++	AeronUi_Help(ui, "Lasers converge on the target ahead, or at this distance; parallel with no target.");
+ }
+ 
+ /* Follows OpenXW's mouse page with TIE's button behavior. */
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index 6040e76..4aaf0cb 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -171,6 +171,8 @@ struct TieCockpitRenderer {
+ 		uint8_t covers_allowed;
+ 		int coord_w, coord_h;
+ 		int rt_w, rt_h;
++		float stretch_x;
++		float spread_px;
+ 	} chrome_key;
+ 	TieCockpitRendererEntry entries[COCKPIT_MAX_CACHED];
+ 	int entry_count;
+@@ -580,6 +582,28 @@ typedef struct TieCockpitRendererViewport {
+ 	float x, y, w, h;
+ } TieCockpitRendererViewport;
+ 
++/* Widescreen stretch of classic cockpit frames for the frame being prepared
++ * (TieFlightHud_CockpitStretchX); 1 keeps the centered 4:3 frame. */
++static float s_cockpit_stretch_x = 1.0f;
++/* Horizontal shift of the current forward-view HUD widget toward its screen
++ * edge (widescreen_hud); applied by every draw-space blit. */
++static float s_widget_shift_x = 0.0f;
++/* Pixels the forward-view (cockpit-off) HUD moves outward on each side: the
++ * width of the side area beyond the 4:3 frame; 0 when not spreading. */
++static float s_hud_spread_px = 0.0f;
++
++/* Outward shift for forward-view HUD content centered at coord-frame x:
++ * the left and right groups move to the screen edges, the center stays. */
++static float TieCockpitRenderer_SpreadShift(float coord_x, int coord_w) {
++	if (s_hud_spread_px <= 0.0f || coord_w <= 0)
++		return 0.0f;
++	if (coord_x < (float)coord_w * 0.4f)
++		return -s_hud_spread_px;
++	if (coord_x > (float)coord_w * 0.6f)
++		return s_hud_spread_px;
++	return 0.0f;
++}
++
+ static void TieCockpitRenderer_CockpitFitViewport(int coord_w, int coord_h, int rt_w, int rt_h,
+ 												  TieCockpitRendererViewport* out) {
+ 	const float cockpit_aspect = TieCockpitCommon_DisplayAspect(coord_w, coord_h);
+@@ -588,6 +612,8 @@ static void TieCockpitRenderer_CockpitFitViewport(int coord_w, int coord_h, int
+ 		/* Classic frame or wider RT: fit by height. */
+ 		out->h = (float)rt_h;
+ 		out->w = out->h * cockpit_aspect;
++		if (TieCockpitCommon_IsClassic4x3(coord_w, coord_h))
++			out->w *= s_cockpit_stretch_x;
+ 		out->x = ((float)rt_w - out->w) * 0.5f;
+ 		out->y = 0.0f;
+ 	} else {
+@@ -1146,9 +1172,10 @@ static void TieCockpitRenderer_BlitCockpitQuadFull(TieCockpitRenderer* cg, Aeron
+ 	if (!cg || !cg->record_list || dst_w <= 0.0f || dst_h <= 0.0f)
+ 		return;
+ 	const TieCockpitRendererDrawSpace* space = &cg->pending_space;
++	const float origin_x = space->fit_x + s_widget_shift_x;
+ 	if (!tex) {
+ 		const float color[4] = { tint_r + bias_r, tint_g + bias_g, tint_b + bias_b, tint_a + bias_a };
+-		AeronDrawList_AddFill(cg->record_list, space->fit_x + dst_x * space->scale_x,
++		AeronDrawList_AddFill(cg->record_list, origin_x + dst_x * space->scale_x,
+ 							  space->fit_y + dst_y * space->scale_y, dst_w * space->scale_x,
+ 							  dst_h * space->scale_y, color, AERON_BLIT2D_BLEND_PMA, NULL);
+ 		return;
+@@ -1159,7 +1186,7 @@ static void TieCockpitRenderer_BlitCockpitQuadFull(TieCockpitRenderer* cg, Aeron
+ 		.src_v0 = src_v0,
+ 		.src_u1 = src_u1,
+ 		.src_v1 = src_v1,
+-		.dst_x = space->fit_x + dst_x * space->scale_x,
++		.dst_x = origin_x + dst_x * space->scale_x,
+ 		.dst_y = space->fit_y + dst_y * space->scale_y,
+ 		.dst_w = dst_w * space->scale_x,
+ 		.dst_h = dst_h * space->scale_y,
+@@ -1259,11 +1286,14 @@ static void TieCockpitRenderer_DrawCockpitBase(TieCockpitRenderer* cg, AeronComm
+ 			u0 = fu0;
+ 			u1 = fu1;
+ 		}
++		s_widget_shift_x =
++			TieCockpitRenderer_SpreadShift(dst_x + (float)coord_w * (fu1 - fu0) * 0.5f, coord_w);
+ 		TieCockpitRenderer_BlitCockpitQuad(cg, cmd, pass, entry->base_tex, coord_w, coord_h, dst_x,
+ 										   base_coord_h * fv0, (float)coord_w * (fu1 - fu0),
+ 										   base_coord_h * (fv1 - fv0), u0, fv0, u1, fv1, 1.0f, 1.0f, 1.0f,
+ 										   1.0f);
+ 	}
++	s_widget_shift_x = 0.0f;
+ }
+ 
+ /* Fixed-grid cel UVs — legacy fallback used only when the per-craft
+@@ -1622,7 +1652,8 @@ static bool TieCockpitRenderer_ChromeKeyMatches(const TieCockpitRenderer* cg,
+ 		   cg->chrome_key.subsystem_active == snap->hud.subsystem_active &&
+ 		   cg->chrome_key.covers_allowed == snap->cockpit.covers_allowed &&
+ 		   cg->chrome_key.coord_w == coord_w && cg->chrome_key.coord_h == coord_h &&
+-		   cg->chrome_key.rt_w == rt_w && cg->chrome_key.rt_h == rt_h;
++		   cg->chrome_key.rt_w == rt_w && cg->chrome_key.rt_h == rt_h &&
++		   cg->chrome_key.stretch_x == s_cockpit_stretch_x && cg->chrome_key.spread_px == s_hud_spread_px;
+ }
+ 
+ /* Bake base bitmap + damage cracks + subsystem covers into chrome_rt at
+@@ -1670,6 +1701,8 @@ static bool TieCockpitRenderer_BakeCockpitChrome(TieCockpitRenderer* cg, AeronCo
+ 	cg->chrome_key.coord_h = coord_h;
+ 	cg->chrome_key.rt_w = rt_w;
+ 	cg->chrome_key.rt_h = rt_h;
++	cg->chrome_key.stretch_x = s_cockpit_stretch_x;
++	cg->chrome_key.spread_px = s_hud_spread_px;
+ 	cg->chrome_valid = true;
+ 	return true;
+ }
+@@ -2155,10 +2188,12 @@ static void TieCockpitRenderer_DrawMainTargetBox(TieCockpitRenderer* cg, AeronCo
+ 		if (side_f > side_max)
+ 			side_f = side_max;
+ 		side_f += 4.0f * pixel_sy;
+-		const float left_x_cl = center_x_cl - side_f * 0.5f;
++		/* A stretched cockpit frame widens coord-frame x; keep the box square on screen. */
++		const float side_w = side_f / s_cockpit_stretch_x;
++		const float left_x_cl = center_x_cl - side_w * 0.5f;
+ 		const float top_y_cl = center_y_cl - side_f * 0.5f;
+-		TieCockpitRenderer_BlitEngineCornerBox(cg, cmd, pass, coord_w, coord_h, left_x_cl, top_y_cl, side_f,
+-											   side_f, pixel_sx, pixel_sy, r, g, b);
++		TieCockpitRenderer_BlitEngineCornerBox(cg, cmd, pass, coord_w, coord_h, left_x_cl, top_y_cl, side_w,
++											   side_f, pixel_sx / s_cockpit_stretch_x, pixel_sy, r, g, b);
+ 	}
+ }
+ 
+@@ -2202,6 +2237,7 @@ static void TieCockpitRenderer_DrawRadarBracket(TieCockpitRenderer* cg, AeronCom
+ 	}
+ 	const float cx = disc_x + (float)snap->hud.bracket_offset_x * scale_x;
+ 	const float cy = disc_y + (float)snap->hud.bracket_offset_y * scale_y;
++	s_widget_shift_x = TieCockpitRenderer_SpreadShift(disc_x, coord_w);
+ 
+ 	for (int i = 0; i < pair_count; ++i) {
+ 		int dx = def[2 * i + 0];
+@@ -2210,6 +2246,7 @@ static void TieCockpitRenderer_DrawRadarBracket(TieCockpitRenderer* cg, AeronCom
+ 										   cy + (float)dy * scale_y, scale_x, scale_y, 0.0f, 0.0f, 1.0f, 1.0f,
+ 										   r, g, bC, 1.0f);
+ 	}
++	s_widget_shift_x = 0.0f;
+ }
+ 
+ /* Message-bar text composition (pick_msg_base_color, build_msg_body_with_colors,
+@@ -2618,6 +2655,8 @@ static void TieCockpitRenderer_DrawPipTargetBox(TieCockpitRenderer* cg, AeronCom
+ 	float v_half = snap->cockpit.pip_fov_v_half_rad;
+ 	if (h_half <= 0.0f)
+ 		h_half = 0.5586f;
++	/* A stretched cockpit widens the CRT; the PIP pass widens its view to match. */
++	h_half = atanf(tanf(h_half) * s_cockpit_stretch_x);
+ 	if (v_half <= 0.0f)
+ 		v_half = 0.3f;
+ 	float proj[16];
+@@ -2744,6 +2783,11 @@ static void TieCockpitRenderer_DrawWidgetsForView(TieCockpitRenderer* cg, AeronC
+ 		TieCockpitRendererHudWidgetKind kind = (TieCockpitRendererHudWidgetKind)hud_widget_kind[idx];
+ 		if (!TieCockpitRenderer_ViewAllowsWidget(v, idx, kind))
+ 			continue;
++		if (s_hud_spread_px > 0.0f) {
++			float ax, ay;
++			TieCockpitRenderer_InsAnchor(entry, idx, ins->x, ins->y, snap, &ax, &ay);
++			s_widget_shift_x = TieCockpitRenderer_SpreadShift(ax, coord_w);
++		}
+ 
+ 		switch (kind) {
+ 			case HUD_W_RADAR_DISC:
+@@ -2776,6 +2820,7 @@ static void TieCockpitRenderer_DrawWidgetsForView(TieCockpitRenderer* cg, AeronC
+ 			default:
+ 				break;
+ 		}
++		s_widget_shift_x = 0.0f;
+ 	}
+ }
+ 
+@@ -2818,6 +2863,14 @@ bool TieCockpitRenderer_Prepare(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+ 		Aeron_RequestFatalRendererError("flight HUD render-target dimensions");
+ 		return false;
+ 	}
++	s_cockpit_stretch_x = TieFlightHud_CockpitStretchX(snap, rt_w, rt_h);
++	s_widget_shift_x = 0.0f;
++	s_hud_spread_px = 0.0f;
++	if (TieFlightTweaks_WidescreenHud() && snap->cockpit.view_idx == 19) {
++		const float side = ((float)rt_w - (float)rt_h * (4.0f / 3.0f)) * 0.5f;
++		if (side > 0.0f)
++			s_hud_spread_px = side;
++	}
+ 
+ 	/* View 18 hides the cockpit panel, not framebuffer-level flight HUD. */
+ 	if (snap->cockpit.view_idx == 18 || !snap->cockpit.view_name[0]) {
+diff --git a/src/tie_remaster/flight/hud_geometry.h b/src/tie_remaster/flight/hud_geometry.h
+index 082c8f3..8e3655f 100644
+--- a/src/tie_remaster/flight/hud_geometry.h
++++ b/src/tie_remaster/flight/hud_geometry.h
+@@ -3,8 +3,24 @@
+ 
+ #include <stdbool.h>
+ 
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/snapshot/snapshot_types.h"
+ 
++/* Horizontal stretch applied to the classic 4:3 cockpit art (and its PIP
++ * display) so it spans a wider render target; 1 when not stretched. Views
++ * without cockpit art (18 panel hidden, 19 forward HUD) keep the 4:3 frame. */
++static inline float TieFlightHud_CockpitStretchX(const TieSnapshot* snap, int target_w, int target_h) {
++	if (!snap || target_w <= 0 || target_h <= 0 || !TieFlightTweaks_CockpitStretch())
++		return 1.0f;
++	if (snap->cockpit.view_idx == 18 || snap->cockpit.view_idx == 19 || !snap->cockpit.view_name[0])
++		return 1.0f;
++	const int w = snap->cockpit.classic_w, h = snap->cockpit.classic_h;
++	if (!((w == 320 && h == 200) || (w == 640 && h == 480)))
++		return 1.0f;
++	const float stretch = ((float)target_w / (float)target_h) / (4.0f / 3.0f);
++	return stretch > 1.0f ? stretch : 1.0f;
++}
++
+ typedef struct TieFlightHudMessageBarGeometry {
+ 	int classic_w;
+ 	int classic_h;
+diff --git a/src/tie_remaster/flight/passes.c b/src/tie_remaster/flight/passes.c
+index 402c867..a689fae 100644
+--- a/src/tie_remaster/flight/passes.c
++++ b/src/tie_remaster/flight/passes.c
+@@ -4,6 +4,7 @@
+ #include "tie_remaster/flight/billboards.h"
+ #include "tie_remaster/flight/classic_draw.h"
+ #include "tie_remaster/flight/cockpit/renderer.h"
++#include "tie_remaster/flight/hud_geometry.h"
+ #include "tie_remaster/flight/hyperstars.h"
+ #include "tie_remaster/flight/line_draw.h"
+ #include "tie_remaster/flight/mesh_common.h"
+@@ -442,6 +443,12 @@ static bool TieFlightRenderer_PreparePip(TieFlightRenderer* g, AeronCommandBuffe
+ 		h_half = snap->camera.fov_h_half_rad > 0.0f ? snap->camera.fov_h_half_rad : 0.5586f;
+ 		v_half = snap->camera.fov_v_half_rad > 0.0f ? snap->camera.fov_v_half_rad : 0.3f;
+ 	}
++	{
++		/* A stretched cockpit widens the CRT; widen the view so the target keeps its shape. */
++		int rt_w = 0, rt_h = 0;
++		TieFlightRenderer_GetRtDims(g, &rt_w, &rt_h);
++		h_half = atanf(tanf(h_half) * TieFlightHud_CockpitStretchX(snap, rt_w, rt_h));
++	}
+ 
+ 	float cam_pos[3] = { 0.0f, 0.0f, 0.0f };
+ 	float view[16];
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+new file mode 100644
+index 0000000..947906c
+--- /dev/null
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -0,0 +1,17 @@
++#include "tie_runtime/hooks/flight_tweaks.h"
++
++static bool s_cockpit_stretch = true;
++static bool s_widescreen_hud = true;
++static int s_laser_convergence_m = 550;
++
++bool TieFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
++
++void TieFlightTweaks_SetCockpitStretch(bool enabled) { s_cockpit_stretch = enabled; }
++
++bool TieFlightTweaks_WidescreenHud(void) { return s_widescreen_hud; }
++
++void TieFlightTweaks_SetWidescreenHud(bool enabled) { s_widescreen_hud = enabled; }
++
++int TieFlightTweaks_LaserConvergenceMetres(void) { return s_laser_convergence_m; }
++
++void TieFlightTweaks_SetLaserConvergenceMetres(int metres) { s_laser_convergence_m = metres > 0 ? metres : 0; }
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+new file mode 100644
+index 0000000..1016770
+--- /dev/null
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -0,0 +1,21 @@
++#ifndef TIE_RUNTIME_HOOKS_FLIGHT_TWEAKS_H
++#define TIE_RUNTIME_HOOKS_FLIGHT_TWEAKS_H
++
++#include <stdbool.h>
++
++/* Widescreen and gunnery options that are not part of either original game.
++ *
++ * cockpit_stretch (flight.cockpit_stretch): the 4:3 cockpit art spans the
++ * whole widescreen view instead of sitting in a centered 4:3 region.
++ * widescreen_hud (flight.widescreen_hud): with the cockpit hidden, the
++ * radars and side indicators move out toward the screen edges.
++ * laser_convergence (flight.laser_convergence): the player's cannon bolts
++ * converge X-Wing Alliance style; 0 fires parallel as the originals do. */
++bool TieFlightTweaks_CockpitStretch(void);
++void TieFlightTweaks_SetCockpitStretch(bool enabled);
++bool TieFlightTweaks_WidescreenHud(void);
++void TieFlightTweaks_SetWidescreenHud(bool enabled);
++int TieFlightTweaks_LaserConvergenceMetres(void);
++void TieFlightTweaks_SetLaserConvergenceMetres(int metres);
++
++#endif
+diff --git a/src/tie_runtime/presentation/presentation.c b/src/tie_runtime/presentation/presentation.c
+index 06cb8fe..30e406f 100644
+--- a/src/tie_runtime/presentation/presentation.c
++++ b/src/tie_runtime/presentation/presentation.c
+@@ -16,6 +16,9 @@ typedef struct TiePresentationState {
+ } TiePresentationState;
+ 
+ static TiePresentationState g_presentation;
++static int g_fill_window;
++
++static int TiePresentation_Relayout(void);
+ 
+ static int TiePresentation_GreatestCommonDivisor(int a, int b) {
+ 	while (b != 0) {
+@@ -34,6 +37,29 @@ static int TiePresentation_CalculateRenderWidth(int height, TieAspectRatio aspec
+ 	return 1;
+ }
+ 
++/* Fill mode renders at the window's own pixel width. */
++static int TiePresentation_RenderWidth(int pixel_width, int pixel_height, TieAspectRatio aspect, int* out_width) {
++	if (g_fill_window) {
++		if (!out_width || pixel_width <= 0)
++			return 0;
++		*out_width = pixel_width;
++		return 1;
++	}
++	return TiePresentation_CalculateRenderWidth(pixel_height, aspect, out_width);
++}
++
++static void TiePresentation_ApplyWindowAspect(TieAspectRatio aspect) {
++	if (g_fill_window) {
++		Aeron_ClearWindowAspectRatio();
++		return;
++	}
++	if (!Aeron_SetWindowAspectRatio(aspect.width, aspect.height))
++		Aeron_LogWarn("tie.presentation", "window aspect constraint %d:%d was not applied", aspect.width,
++					  aspect.height);
++	if (!Aeron_ResizeWindowToAspect(aspect.width, aspect.height))
++		Aeron_LogWarn("tie.presentation", "window resize to %d:%d was not applied", aspect.width, aspect.height);
++}
++
+ static int TiePresentation_ComputeFullHeightRect(int bounds_width, int bounds_height, TieAspectRatio aspect,
+ 												 AeronRectI* out) {
+ 	const int64_t width = ((int64_t)bounds_height * aspect.width + aspect.height / 2) / aspect.height;
+@@ -72,7 +98,7 @@ static int TiePresentation_UpdateLogicalLayout(int window_width, int window_heig
+ 		return 0;
+ 	}
+ 	layout->frame = (AeronRectI) { 0, 0, logical_width, TIE_PRESENTATION_LOGICAL_HEIGHT };
+-	layout->modern = modern;
++	layout->modern = g_fill_window ? (AeronRectI) { 0, 0, logical_width, TIE_PRESENTATION_LOGICAL_HEIGHT } : modern;
+ 	layout->classic = classic;
+ 	layout->split_scissor = (AeronRectI) {
+ 		logical_width / 2,
+@@ -100,18 +126,11 @@ int TiePresentation_Init(TieAspectRatio modern_aspect) {
+ 	memset(&g_presentation, 0, sizeof g_presentation);
+ 	g_presentation.modern_aspect = modern_aspect;
+ 
+-	if (!Aeron_SetWindowAspectRatio(modern_aspect.width, modern_aspect.height)) {
+-		Aeron_LogWarn("tie.presentation", "window aspect constraint %d:%d was not applied",
+-					  modern_aspect.width, modern_aspect.height);
+-	}
+-	if (!Aeron_ResizeWindowToAspect(modern_aspect.width, modern_aspect.height)) {
+-		Aeron_LogWarn("tie.presentation", "initial window resize to %d:%d was not applied",
+-					  modern_aspect.width, modern_aspect.height);
+-	}
++	TiePresentation_ApplyWindowAspect(modern_aspect);
+ 	if (!Aeron_GetWindowSize(&window_width, &window_height) ||
+ 		!TiePresentation_UpdateLogicalLayout(window_width, window_height, 1) ||
+ 		!Aeron_GetPresentationPixelSize(&pixel_width, &pixel_height) ||
+-		!TiePresentation_CalculateRenderWidth(pixel_height, modern_aspect, &render_width)) {
++		!TiePresentation_RenderWidth(pixel_width, pixel_height, modern_aspect, &render_width)) {
+ 		memset(&g_presentation, 0, sizeof g_presentation);
+ 		return 0;
+ 	}
+@@ -128,11 +147,6 @@ int TiePresentation_Init(TieAspectRatio modern_aspect) {
+ }
+ 
+ int TiePresentation_SetModernAspect(TieAspectRatio modern_aspect) {
+-	int window_width;
+-	int window_height;
+-	int pixel_width;
+-	int pixel_height;
+-	int render_width;
+ 	if (!g_presentation.initialized || modern_aspect.width <= 0 || modern_aspect.height <= 0)
+ 		return 0;
+ 	const int divisor = TiePresentation_GreatestCommonDivisor(modern_aspect.width, modern_aspect.height);
+@@ -142,16 +156,22 @@ int TiePresentation_SetModernAspect(TieAspectRatio modern_aspect) {
+ 		modern_aspect.height == g_presentation.modern_aspect.height)
+ 		return 1;
+ 	g_presentation.modern_aspect = modern_aspect;
+-	if (!Aeron_SetWindowAspectRatio(modern_aspect.width, modern_aspect.height))
+-		Aeron_LogWarn("tie.presentation", "window aspect constraint %d:%d was not applied",
+-					  modern_aspect.width, modern_aspect.height);
+-	if (!Aeron_ResizeWindowToAspect(modern_aspect.width, modern_aspect.height))
+-		Aeron_LogWarn("tie.presentation", "window resize to %d:%d was not applied", modern_aspect.width,
+-					  modern_aspect.height);
++	return TiePresentation_Relayout();
++}
++
++/* Re-applies the window constraint and recomputes layout and render size. */
++static int TiePresentation_Relayout(void) {
++	int window_width;
++	int window_height;
++	int pixel_width;
++	int pixel_height;
++	int render_width;
++	const TieAspectRatio modern_aspect = g_presentation.modern_aspect;
++	TiePresentation_ApplyWindowAspect(modern_aspect);
+ 	if (!Aeron_GetWindowSize(&window_width, &window_height) ||
+ 		!TiePresentation_UpdateLogicalLayout(window_width, window_height, 1) ||
+ 		!Aeron_GetPresentationPixelSize(&pixel_width, &pixel_height) ||
+-		!TiePresentation_CalculateRenderWidth(pixel_height, modern_aspect, &render_width))
++		!TiePresentation_RenderWidth(pixel_width, pixel_height, modern_aspect, &render_width))
+ 		return 0;
+ 	g_presentation.observed_pixel_width = pixel_width;
+ 	g_presentation.observed_pixel_height = pixel_height;
+@@ -194,7 +214,7 @@ TiePresentationChange TiePresentation_BeginFrame(const AeronInputSnapshot* input
+ 		g_presentation.observed_stable_us += advance_us < remaining_us ? advance_us : remaining_us;
+ 	}
+ 	if (g_presentation.observed_stable_us < TIE_PRESENTATION_RESIZE_SETTLE_US ||
+-		!TiePresentation_CalculateRenderWidth(pixel_height, g_presentation.modern_aspect, &render_width) ||
++		!TiePresentation_RenderWidth(pixel_width, pixel_height, g_presentation.modern_aspect, &render_width) ||
+ 		(render_width == g_presentation.layout.render_width &&
+ 		 pixel_height == g_presentation.layout.render_height)) {
+ 		return change;
+@@ -213,6 +233,17 @@ const TiePresentationLayout* TiePresentation_Layout(void) {
+ 
+ TieAspectRatio TiePresentation_ModernAspect(void) { return g_presentation.modern_aspect; }
+ 
++void TiePresentation_SetFillWindow(int enabled) {
++	enabled = enabled != 0;
++	if (enabled == g_fill_window)
++		return;
++	g_fill_window = enabled;
++	if (g_presentation.initialized)
++		(void)TiePresentation_Relayout();
++}
++
++int TiePresentation_FillWindow(void) { return g_fill_window; }
++
+ void TiePresentation_FromClassic(float classic_x, float classic_y, int classic_width, int classic_height,
+ 								 float* logical_x, float* logical_y) {
+ 	const AeronRectI* rect = &g_presentation.layout.classic;
+diff --git a/src/tie_runtime/presentation/presentation.h b/src/tie_runtime/presentation/presentation.h
+index 1f5dc43..2530f8b 100644
+--- a/src/tie_runtime/presentation/presentation.h
++++ b/src/tie_runtime/presentation/presentation.h
+@@ -31,6 +31,10 @@ typedef enum TiePresentationChange {
+ 
+ int TiePresentation_Init(TieAspectRatio modern_aspect);
+ int TiePresentation_SetModernAspect(TieAspectRatio modern_aspect);
++/* Widescreen: the modern layer fills the whole window at its own aspect
++ * instead of the flight assets' presentation aspect. May be set before Init. */
++void TiePresentation_SetFillWindow(int enabled);
++int TiePresentation_FillWindow(void);
+ TiePresentationChange TiePresentation_BeginFrame(const AeronInputSnapshot* input, int32_t delta_us);
+ const TiePresentationLayout* TiePresentation_Layout(void);
+ TieAspectRatio TiePresentation_ModernAspect(void);
+diff --git a/tools/opt/opt_textures.c b/tools/opt/opt_textures.c
+index b47e4bb..c8ad007 100644
+--- a/tools/opt/opt_textures.c
++++ b/tools/opt/opt_textures.c
+@@ -21,7 +21,11 @@ static int TieOptTextures_EnsureDirectory(const char* path) {
+ 	struct stat st;
+ 	if (stat(path, &st) == 0)
+ 		return S_ISDIR(st.st_mode);
++#ifdef _WIN32
++	if (mkdir(path) == 0)
++#else
+ 	if (mkdir(path, 0755) == 0)
++#endif
+ 		return 1;
+ 	return errno == EEXIST;
+ }

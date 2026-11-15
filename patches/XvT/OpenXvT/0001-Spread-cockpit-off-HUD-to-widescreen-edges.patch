@@ -1,0 +1,517 @@
+From fc797d8cb7d45c639f815a40511ae3927006c76d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 21:54:23 +1100
+Subject: [PATCH 01/25] Spread cockpit-off HUD to widescreen edges
+
+---
+ resources/config.yaml              |   1 +
+ src/xvt_remaster/hud_assets.c      | 133 +++++++++++++++++++++++++++--
+ src/xvt_remaster/hud_assets.h      |   7 +-
+ src/xvt_remaster/hud_draw.c        |  47 ++++++++--
+ src/xvt_remaster/hud_draw.h        |   7 ++
+ src/xvt_remaster/hud_instruments.c |  11 ++-
+ src/xvt_remaster/hud_layout.h      |   2 +
+ src/xvt_remaster/hud_panes.c       |  20 +++--
+ src/xvt_remaster/hud_renderer.c    |  20 ++++-
+ src/xvt_remaster/hud_text.c        |   4 +-
+ src/xvt_runtime/config/settings.c  |   1 +
+ src/xvt_runtime/config/settings.h  |   2 +
+ 12 files changed, 230 insertions(+), 25 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index eadd9ea..bf8b047 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -361,6 +361,7 @@ game:
+   continue_sequence: 1
+ render:
+   cockpit_undither: true
++  hud_widescreen: true
+   msaa_samples: 2
+   temporal_upscaling:
+     mode: "off"
+diff --git a/src/xvt_remaster/hud_assets.c b/src/xvt_remaster/hud_assets.c
+index 64eac59..04bae24 100644
+--- a/src/xvt_remaster/hud_assets.c
++++ b/src/xvt_remaster/hud_assets.c
+@@ -37,7 +37,9 @@ static void ReleaseGroup(CockpitAssetGroup* group) {
+ 			g_current = NULL;
+ 		if (group->owns_base[view]) {
+ 			Aeron_RuntimeAtlasRelease(&set->base);
+-			Aeron_ImageFreeCoverage(&set->base_coverage);
++			for (unsigned zone = 0; zone < XVT_HUD_ZONE_COUNT; ++zone)
++				Aeron_ImageFreeCoverage(&set->base_coverage[zone]);
++			free(set->base_zones);
+ 		}
+ 		free(set);
+ 	}
+@@ -255,6 +257,102 @@ static int BuildParts(AeronCommandBuffer* cmd, XvtHudAssetSet* set,
+ 	return ok;
+ }
+ 
++typedef struct BaseElement {
++	int left, top, right, bottom;
++	unsigned index;
++	uint8_t zone;
++} BaseElement;
++
++static int CompareElementArea(const void* a, const void* b) {
++	const BaseElement *x = a, *y = b;
++	long long ax = (long long)(x->right - x->left + 1) * (x->bottom - x->top + 1);
++	long long ay = (long long)(y->right - y->left + 1) * (y->bottom - y->top + 1);
++	return ax < ay ? 1 : ax > ay ? -1 : 0;
++}
++
++/* Label 8-connected opaque elements, then give each a zone: elements whose
++ * center lies inside a larger element's box inherit its zone (radar blips,
++ * text inside frames), the rest are placed by which third holds their center.
++ * owner receives each pixel's zone + 1 and regions each element box's zone + 1. */
++static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t* owner, uint8_t* regions) {
++	size_t pixels = (size_t)width * height;
++	int32_t* labels = calloc(pixels, sizeof *labels);
++	int32_t* stack = malloc(pixels * sizeof *stack);
++	unsigned capacity = 256, count = 0;
++	BaseElement* elements = malloc(capacity * sizeof *elements);
++	int ok = labels && stack && elements;
++	for (size_t start = 0; ok && start < pixels; ++start) {
++		if (!rgba[start * 4 + 3] || labels[start])
++			continue;
++		if (count == capacity) {
++			BaseElement* grown = realloc(elements, (capacity *= 2) * sizeof *elements);
++			if (!grown) {
++				ok = 0;
++				break;
++			}
++			elements = grown;
++		}
++		BaseElement* element = &elements[count++];
++		*element = (BaseElement) { width, height, -1, -1, 0, 0 };
++		size_t top = 0;
++		stack[top++] = (int32_t)start;
++		labels[start] = (int32_t)count;
++		while (top) {
++			int32_t pixel = stack[--top];
++			int x = pixel % width, y = pixel / width;
++			element->left = x < element->left ? x : element->left;
++			element->right = x > element->right ? x : element->right;
++			element->top = y < element->top ? y : element->top;
++			element->bottom = y > element->bottom ? y : element->bottom;
++			for (int dy = -1; dy <= 1; ++dy)
++				for (int dx = -1; dx <= 1; ++dx) {
++					int nx = x + dx, ny = y + dy;
++					if (nx < 0 || ny < 0 || nx >= width || ny >= height)
++						continue;
++					size_t next = (size_t)ny * width + nx;
++					if (rgba[next * 4 + 3] && !labels[next]) {
++						labels[next] = (int32_t)count;
++						stack[top++] = (int32_t)next;
++					}
++				}
++		}
++	}
++	if (ok) {
++		unsigned* order = malloc(count * sizeof *order);
++		BaseElement* sorted = malloc(count * sizeof *sorted);
++		ok = (order && sorted) || !count;
++		if (ok && count) {
++			memcpy(sorted, elements, count * sizeof *sorted);
++			for (unsigned index = 0; index < count; ++index)
++				sorted[index].index = index;
++			qsort(sorted, count, sizeof *sorted, CompareElementArea);
++			for (unsigned index = 0; index < count; ++index)
++				order[index] = sorted[index].index;
++			for (unsigned index = 0; index < count; ++index) {
++				BaseElement* element = &elements[order[index]];
++				int cx = (element->left + element->right) / 2, cy = (element->top + element->bottom) / 2;
++				uint8_t zone = regions[(size_t)cy * width + cx];
++				if (!zone)
++					zone = (uint8_t)(cx * 3 < width ? 1 : cx * 3 < width * 2 ? 2 : 3);
++				element->zone = zone;
++				for (int y = element->top; y <= element->bottom; ++y)
++					for (int x = element->left; x <= element->right; ++x)
++						if (!regions[(size_t)y * width + x])
++							regions[(size_t)y * width + x] = zone;
++			}
++			for (size_t pixel = 0; pixel < pixels; ++pixel)
++				owner[pixel] = labels[pixel] ? elements[labels[pixel] - 1].zone : 0;
++		} else if (ok)
++			memset(owner, 0, pixels);
++		free(order);
++		free(sorted);
++	}
++	free(labels);
++	free(stack);
++	free(elements);
++	return ok;
++}
++
+ static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
+ 	if (!set->base_asset_id)
+ 		return 1;
+@@ -276,11 +374,30 @@ static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
+ 		AeronIndexedFrame_Free(&bitmap);
+ 		return 0;
+ 	}
+-	AeronRuntimeAtlasFrame frame = { rgba, bitmap.width, bitmap.height, 0, 0, 0 };
+ 	AeronRuntimeAtlasOptions options = g_atlasOptions;
+ 	options.debug_name = "xvt.cockpit.base";
+-	int ok = rgba && Aeron_ImageBuildCoverageRgba8(rgba, bitmap.width, bitmap.height, &set->base_coverage) &&
+-			 Aeron_RuntimeAtlasBuild(&set->base, cmd, &frame, 1, &options);
++	size_t pixels = (size_t)bitmap.width * bitmap.height;
++	uint8_t* owner = rgba ? malloc(pixels) : NULL;
++	uint8_t* zoned = owner ? malloc(pixels * 4 * XVT_HUD_ZONE_COUNT) : NULL;
++	set->base_zones = zoned ? calloc(pixels, 1) : NULL;
++	int ok = set->base_zones && AssignBaseZones(rgba, bitmap.width, bitmap.height, owner, set->base_zones);
++	AeronRuntimeAtlasFrame frames[XVT_HUD_ZONE_COUNT];
++	for (unsigned zone = 0; ok && zone < XVT_HUD_ZONE_COUNT; ++zone) {
++		uint8_t* frame = zoned + pixels * 4 * zone;
++		for (size_t pixel = 0; pixel < pixels; ++pixel) {
++			if (owner[pixel] == zone + 1)
++				memcpy(frame + pixel * 4, rgba + pixel * 4, 4);
++			else
++				memset(frame + pixel * 4, 0, 4);
++		}
++		frames[zone] = (AeronRuntimeAtlasFrame) { frame, bitmap.width, bitmap.height, (int32_t)zone, 0, 0 };
++		ok = Aeron_ImageBuildCoverageRgba8(frame, bitmap.width, bitmap.height, &set->base_coverage[zone]);
++	}
++	set->base_zones_width = (uint16_t)bitmap.width;
++	set->base_zones_height = (uint16_t)bitmap.height;
++	ok = ok && Aeron_RuntimeAtlasBuild(&set->base, cmd, frames, XVT_HUD_ZONE_COUNT, &options);
++	free(zoned);
++	free(owner);
+ 	free(rgba);
+ 	AeronIndexedFrame_Free(&bitmap);
+ 	return ok;
+@@ -387,8 +504,12 @@ int XvtHudAssets_PrepareResources(AeronCommandBuffer* cmd, const XvtCockpitResou
+ 			if (g_pending->views[owner] && g_pending->views[owner]->base_asset_id == set->base_asset_id)
+ 				break;
+ 		if (owner < view) {
+-			set->base = g_pending->views[owner]->base;
+-			set->base_coverage = g_pending->views[owner]->base_coverage;
++			const XvtHudAssetSet* shared = g_pending->views[owner];
++			set->base = shared->base;
++			memcpy(set->base_coverage, shared->base_coverage, sizeof set->base_coverage);
++			set->base_zones = shared->base_zones;
++			set->base_zones_width = shared->base_zones_width;
++			set->base_zones_height = shared->base_zones_height;
+ 		} else {
+ 			g_pending->owns_base[view] = 1;
+ 			if (!BuildBase(cmd, set)) {
+diff --git a/src/xvt_remaster/hud_assets.h b/src/xvt_remaster/hud_assets.h
+index af3d777..38dacbc 100644
+--- a/src/xvt_remaster/hud_assets.h
++++ b/src/xvt_remaster/hud_assets.h
+@@ -13,7 +13,12 @@ typedef struct XvtHudPreparedPart {
+ 
+ typedef struct XvtHudAssetSet {
+ 	AeronRuntimeAtlas base, parts;
+-	AeronImageCoverage base_coverage;
++	/* The base artwork is split into left, center and right atlas frames by
++	 * connected element, so widescreen layouts can move each side as a unit. */
++	AeronImageCoverage base_coverage[XVT_HUD_ZONE_COUNT];
++	/* Per-pixel zone (0 = unassigned) covering each element's bounding box. */
++	uint8_t* base_zones;
++	uint16_t base_zones_width, base_zones_height;
+ 	uint64_t base_asset_id;
+ 	uint32_t palette[256];
+ 	uint16_t part_count;
+diff --git a/src/xvt_remaster/hud_draw.c b/src/xvt_remaster/hud_draw.c
+index 85cfe5e..30f35ba 100644
+--- a/src/xvt_remaster/hud_draw.c
++++ b/src/xvt_remaster/hud_draw.c
+@@ -6,6 +6,34 @@ AeronDrawList2D* XvtHudDraw_SelectList(const XvtHudDraw* draw, unsigned phase) {
+ 	return phase <= XVT_COCKPIT_BEFORE_CRT ? draw->before : draw->after;
+ }
+ 
++static XvtHudDraw InZone(const XvtHudDraw* draw, unsigned zone) {
++	XvtHudDraw zoned = *draw;
++	zoned.offset_x += ((float)zone - XVT_HUD_ZONE_CENTER) * draw->spread;
++	zoned.spread = 0;
++	return zoned;
++}
++
++XvtHudDraw XvtHudDraw_ForPoint(const XvtHudDraw* draw, int x, int y) {
++	if (draw->spread == 0)
++		return *draw;
++	const XvtHudAssetSet* assets = draw->assets;
++	unsigned zone = 0;
++	if (assets && assets->base_zones && x >= 0 && y >= 0 && x < assets->base_zones_width &&
++		y < assets->base_zones_height)
++		zone = assets->base_zones[(size_t)y * assets->base_zones_width + x];
++	if (zone)
++		--zone;
++	else {
++		int width = draw->layout->source_width;
++		zone = x * 3 < width ? XVT_HUD_ZONE_LEFT : x * 3 < width * 2 ? XVT_HUD_ZONE_CENTER : XVT_HUD_ZONE_RIGHT;
++	}
++	return InZone(draw, zone);
++}
++
++XvtHudDraw XvtHudDraw_ForRect(const XvtHudDraw* draw, XvtSnapRect rect) {
++	return XvtHudDraw_ForPoint(draw, rect.x + rect.width / 2, rect.y + rect.height / 2);
++}
++
+ static XvtSnapRect IntersectRects(XvtSnapRect a, XvtSnapRect b) {
+ 	int right = a.x + a.width < b.x + b.width ? a.x + a.width : b.x + b.width;
+ 	int bottom = a.y + a.height < b.y + b.height ? a.y + a.height : b.y + b.height;
+@@ -123,7 +151,10 @@ void XvtHudDraw_Part(const XvtHudDraw* draw, XvtHudSpriteRole role, unsigned sta
+ 	const AeronRuntimeAtlas* atlas = &draw->assets->parts;
+ 	float width = atlas->layout.classic_w[part->atlas_frame],
+ 		  height = atlas->layout.classic_h[part->atlas_frame];
+-	AppendAtlasSprite(draw, atlas, part->atlas_frame,
++	/* Zone by the binding, not the per-segment offset, so gauges move together. */
++	XvtHudDraw zoned = XvtHudDraw_ForPoint(draw, binding->x + (binding->mirrored ? -(int)width : (int)width) / 2,
++										   binding->y + (int)height / 2);
++	AppendAtlasSprite(&zoned, atlas, part->atlas_frame,
+ 					  binding->x + offset_x - (binding->mirrored ? width - 1 : 0), binding->y + offset_y, 0,
+ 					  0, width, height, binding->mirrored, part->monochrome,
+ 					  draw->state->palette_argb[part->color], phase);
+@@ -133,11 +164,15 @@ void XvtHudDraw_Base(const XvtHudDraw* draw) {
+ 	const AeronRuntimeAtlas* atlas = &draw->assets->base;
+ 	if (!atlas->layout.frame_count)
+ 		return;
+-	for (unsigned index = 0; index < draw->assets->base_coverage.count; ++index) {
+-		const AeronImageCoverageRect* rect = &draw->assets->base_coverage.rects[index];
+-		int x = draw->layout->mirrored ? draw->layout->source_width - rect->x - rect->width : rect->x;
+-		AppendAtlasSprite(draw, atlas, 0, x, rect->y, rect->x, rect->y, rect->width, rect->height,
+-						  draw->layout->mirrored, 0, 0, XVT_COCKPIT_BEFORE_CRT);
++	for (unsigned zone = 0; zone < XVT_HUD_ZONE_COUNT && zone < (unsigned)atlas->layout.frame_count; ++zone) {
++		XvtHudDraw zoned = InZone(draw, zone);
++		const AeronImageCoverage* coverage = &draw->assets->base_coverage[zone];
++		for (unsigned index = 0; index < coverage->count; ++index) {
++			const AeronImageCoverageRect* rect = &coverage->rects[index];
++			int x = draw->layout->mirrored ? draw->layout->source_width - rect->x - rect->width : rect->x;
++			AppendAtlasSprite(&zoned, atlas, zone, x, rect->y, rect->x, rect->y, rect->width, rect->height,
++							  draw->layout->mirrored, 0, 0, XVT_COCKPIT_BEFORE_CRT);
++		}
+ 	}
+ }
+ 
+diff --git a/src/xvt_remaster/hud_draw.h b/src/xvt_remaster/hud_draw.h
+index 73ad098..f1017e2 100644
+--- a/src/xvt_remaster/hud_draw.h
++++ b/src/xvt_remaster/hud_draw.h
+@@ -9,10 +9,17 @@ typedef struct XvtHudDraw {
+ 	const XvtHudLayout* layout;
+ 	const XvtHudAssetSet* assets;
+ 	float scale, offset_x, offset_y;
++	/* Widescreen HUD: left and right zone elements move outward by this many
++	 * output pixels. Zero for layouts drawn as one centered frame. */
++	float spread;
+ 	int width, height;
+ } XvtHudDraw;
+ 
+ AeronDrawList2D* XvtHudDraw_SelectList(const XvtHudDraw* draw, unsigned phase);
++/* Returns the drawing context for the element at source point (x, y), moved
++ * to that element's side when the HUD is spread. The result is not spread again. */
++XvtHudDraw XvtHudDraw_ForPoint(const XvtHudDraw* draw, int x, int y);
++XvtHudDraw XvtHudDraw_ForRect(const XvtHudDraw* draw, XvtSnapRect rect);
+ int XvtHudDraw_Clip(const XvtHudDraw* draw, XvtSnapRect rect, AeronRectI* out);
+ void XvtHudDraw_Fill(const XvtHudDraw* draw, unsigned phase, XvtSnapRect rect, uint32_t color);
+ void XvtHudDraw_TextFill(const XvtHudDraw* draw, const XvtFontAtlas* font, unsigned phase, XvtSnapRect rect,
+diff --git a/src/xvt_remaster/hud_instruments.c b/src/xvt_remaster/hud_instruments.c
+index 5bb608c..f98dd83 100644
+--- a/src/xvt_remaster/hud_instruments.c
++++ b/src/xvt_remaster/hud_instruments.c
+@@ -114,11 +114,13 @@ void XvtHudInstruments_DrawRadar(const XvtHudDraw* draw) {
+ 	for (unsigned side = 0; side < 2; ++side) {
+ 		if (!radar->visible[side])
+ 			continue;
++		/* Blips and markers follow their scope, whose anchor sits at its center. */
++		XvtHudDraw scope = XvtHudDraw_ForPoint(draw, draw->layout->radar[side].x, draw->layout->radar[side].y);
+ 		for (unsigned index = 0; index < radar->count[side]; ++index) {
+ 			const XvtSnapRadarBlip* blip = &radar->blips[side][index];
+ 			for (unsigned row = 0; row < 2; ++row)
+ 				if (radar->coverage[side][index] & (1u << row))
+-					XvtHudDraw_Fill(draw, XVT_COCKPIT_BEFORE_CRT,
++					XvtHudDraw_Fill(&scope, XVT_COCKPIT_BEFORE_CRT,
+ 									(XvtSnapRect) { draw->layout->radar[side].x + blip->x,
+ 													draw->layout->radar[side].y + blip->y + (int)row, 1, 1 },
+ 									draw->state->palette_argb[blip->color_index & 255]);
+@@ -127,9 +129,11 @@ void XvtHudInstruments_DrawRadar(const XvtHudDraw* draw) {
+ 	if (radar->marker_visible && radar->marker_side < 2) {
+ 		static const int offsets[10][2] = { { -1, 1 }, { -2, 1 }, { -2, 0 }, { -2, -1 }, { -1, -1 },
+ 											{ 1, -1 }, { 2, -1 }, { 2, 0 },  { 2, 1 },   { 1, 1 } };
++		XvtHudDraw scope = XvtHudDraw_ForPoint(draw, draw->layout->radar[radar->marker_side].x,
++											   draw->layout->radar[radar->marker_side].y);
+ 		for (unsigned index = 0; index < 10; ++index)
+ 			XvtHudDraw_Fill(
+-				draw, XVT_COCKPIT_BEFORE_CRT,
++				&scope, XVT_COCKPIT_BEFORE_CRT,
+ 				(XvtSnapRect) {
+ 					draw->layout->radar[radar->marker_side].x + radar->marker_x + offsets[index][0],
+ 					draw->layout->radar[radar->marker_side].y + radar->marker_y + offsets[index][1], 1, 1 },
+@@ -177,6 +181,7 @@ void XvtHudInstruments_DrawCrtMarker(const XvtHudDraw* draw) {
+ 		return;
+ 	XvtSnapRect rect = { crt->destination.x + (int)floorf(x) - 2, crt->destination.y + (int)floorf(y) - 2, 4,
+ 						 4 };
+-	XvtHudDraw_FrameClipped(draw, XVT_COCKPIT_AFTER_CRT, rect, crt->destination,
++	XvtHudDraw display = XvtHudDraw_ForRect(draw, crt->destination);
++	XvtHudDraw_FrameClipped(&display, XVT_COCKPIT_AFTER_CRT, rect, crt->destination,
+ 							draw->state->palette_argb[206]);
+ }
+diff --git a/src/xvt_remaster/hud_layout.h b/src/xvt_remaster/hud_layout.h
+index 26e215c..ac75696 100644
+--- a/src/xvt_remaster/hud_layout.h
++++ b/src/xvt_remaster/hud_layout.h
+@@ -33,6 +33,8 @@ typedef enum XvtHudSpriteRole {
+ 	XVT_HUD_SPRITE_ROLE_COUNT = XVT_HUD_CMD_ARMAMENT + 4
+ } XvtHudSpriteRole;
+ 
++typedef enum XvtHudZone { XVT_HUD_ZONE_LEFT, XVT_HUD_ZONE_CENTER, XVT_HUD_ZONE_RIGHT, XVT_HUD_ZONE_COUNT } XvtHudZone;
++
+ typedef enum XvtHudPartColor {
+ 	XVT_HUD_PART_ORIGINAL,
+ 	XVT_HUD_PART_MONOCHROME,
+diff --git a/src/xvt_remaster/hud_panes.c b/src/xvt_remaster/hud_panes.c
+index 9e0fcd3..53f77b9 100644
+--- a/src/xvt_remaster/hud_panes.c
++++ b/src/xvt_remaster/hud_panes.c
+@@ -72,11 +72,13 @@ static XvtSnapRect PlaceBounds(XvtSnapRect bounds, XvtSnapRect placement) {
+ 	return bounds;
+ }
+ 
+-static int DrawPage(const XvtHudDraw* draw, unsigned page_id) {
+-	const XvtCockpitPage* page = &draw->state->pages[page_id];
+-	const XvtCockpitPageStore* content = &draw->state->page_content;
++static int DrawPage(const XvtHudDraw* parent, unsigned page_id) {
++	const XvtCockpitPage* page = &parent->state->pages[page_id];
++	const XvtCockpitPageStore* content = &parent->state->page_content;
+ 	if (!page->visible)
+ 		return 1;
++	XvtHudDraw zoned = XvtHudDraw_ForRect(parent, page->placement);
++	const XvtHudDraw* draw = &zoned;
+ 	if ((unsigned)page->first_row + page->row_count > content->row_count ||
+ 		(unsigned)page->first_glyph + page->glyph_count > content->glyph_count)
+ 		return 0;
+@@ -110,10 +112,12 @@ int XvtHudPanes_DrawPages(const XvtHudDraw* draw) {
+ 	return 1;
+ }
+ 
+-static int DrawOverlayGlyphs(const XvtHudDraw* draw, unsigned first, unsigned count, XvtSnapRect placement,
++static int DrawOverlayGlyphs(const XvtHudDraw* parent, unsigned first, unsigned count, XvtSnapRect placement,
+ 							 unsigned phase) {
+-	if (first + count > draw->state->overlay_content.glyph_count)
++	if (first + count > parent->state->overlay_content.glyph_count)
+ 		return 0;
++	XvtHudDraw zoned = XvtHudDraw_ForRect(parent, placement);
++	const XvtHudDraw* draw = &zoned;
+ 	for (unsigned index = 0; index < count; ++index)
+ 		if (!XvtHudDraw_Glyph(draw, &draw->state->overlay_content.glyphs[first + index], placement.x,
+ 							  placement.y, placement, phase))
+@@ -140,7 +144,11 @@ int XvtHudPanes_DrawMessages(const XvtHudDraw* draw) {
+ 	return 1;
+ }
+ 
+-int XvtHudPanes_DrawOverlays(const XvtHudDraw* draw) {
++int XvtHudPanes_DrawOverlays(const XvtHudDraw* parent) {
++	/* Loading bars and alerts are centered on the screen, not on a HUD side. */
++	XvtHudDraw centered = *parent;
++	centered.spread = 0;
++	const XvtHudDraw* draw = &centered;
+ 	const XvtCockpitLoading* loading = &draw->state->loading;
+ 	if (loading->text_visible && !DrawOverlayGlyphs(draw, loading->first_glyph, loading->glyph_count,
+ 													loading->text_bounds, XVT_COCKPIT_ALERT))
+diff --git a/src/xvt_remaster/hud_renderer.c b/src/xvt_remaster/hud_renderer.c
+index fa86c7d..1962b2b 100644
+--- a/src/xvt_remaster/hud_renderer.c
++++ b/src/xvt_remaster/hud_renderer.c
+@@ -3,6 +3,8 @@
+ #include "xvt_remaster/crt.h"
+ #include "xvt_remaster/hud_instruments.h"
+ #include "xvt_remaster/hud_panes.h"
++#include "xvt_remaster/config.h"
++#include "xvt_runtime/snapshot/render_snapshot.h"
+ #include <string.h>
+ 
+ typedef struct HudPreparationKey {
+@@ -11,7 +13,7 @@ typedef struct HudPreparationKey {
+ 	unsigned marker_count;
+ 	XvtSnapTargetBox markers[XVT_SNAP_TARGET_BOXES];
+ 	int width, height;
+-	uint8_t crt_visible;
++	uint8_t crt_visible, hud_widescreen;
+ } HudPreparationKey;
+ 
+ static AeronDrawList2D *g_before, *g_after;
+@@ -58,6 +60,7 @@ static HudPreparationKey MakePreparationKey(const XvtCockpitState* state, const
+ 	key.width = width;
+ 	key.height = height;
+ 	key.crt_visible = crt_visible;
++	key.hud_widescreen = (uint8_t)XvtRemasterConfig_Effective()->hud_widescreen;
+ 	if (view)
+ 		key.view = *view;
+ 	key.marker_count = marker_count;
+@@ -73,6 +76,17 @@ static HudPreparationKey MakePreparationKey(const XvtCockpitState* state, const
+ 	return key;
+ }
+ 
++/* Spread the HUD to the screen edges only where the world fills the whole
++ * screen: the cockpit-off and full-screen views outside the map. */
++static float SpreadFor(const XvtCockpitState* state, const XvtRenderView* view, float margin) {
++	const XvtRenderSnapshot* snapshot = XvtRenderSnapshot_Current();
++	if (!view || !XvtRemasterConfig_Effective()->hud_widescreen || !snapshot || snapshot->camera.map_mode ||
++		state->view.mirrored ||
++		(state->view.hud_state != HUD_VIEW_HUD_ONLY && state->view.hud_state != HUD_VIEW_FULL_SCREEN))
++		return 0;
++	return margin > 0 ? margin : 0;
++}
++
+ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state, uint64_t world_generation,
+ 						   const XvtSnapTargetBox* markers, unsigned marker_count, const XvtRenderView* view,
+ 						   AeronTexture* crt_color, int width, int height) {
+@@ -104,9 +118,11 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 						.width = width,
+ 						.height = height };
+ 	XvtHudLayout_Fit(draw.layout, width, height, &draw.scale, &draw.offset_x, &draw.offset_y);
++	draw.spread = SpreadFor(state, view, draw.offset_x);
+ 	int crt_visible = state->crt.valid && crt_color;
++	XvtHudDraw display = XvtHudDraw_ForRect(&draw, state->crt.destination);
+ 	if (!XvtCrt_PrepareView(&state->crt, &state->definition.layout, crt_visible ? crt_color : NULL, width,
+-							height, draw.scale, draw.offset_x, draw.offset_y))
++							height, draw.scale, display.offset_x, draw.offset_y))
+ 		goto failed;
+ 	HudPreparationKey key =
+ 		MakePreparationKey(state, markers, marker_count, view, width, height, crt_visible);
+diff --git a/src/xvt_remaster/hud_text.c b/src/xvt_remaster/hud_text.c
+index f86cae5..eac3ad4 100644
+--- a/src/xvt_remaster/hud_text.c
++++ b/src/xvt_remaster/hud_text.c
+@@ -113,9 +113,11 @@ static int DrawString(const XvtHudDraw* draw, TextCursor* cursor, const char* st
+ 	return 1;
+ }
+ 
+-static int DrawStyledField(const XvtHudDraw* draw, const XvtCockpitTextField* field, int literal) {
++static int DrawStyledField(const XvtHudDraw* parent, const XvtCockpitTextField* field, int literal) {
+ 	if (!field->caption.visible)
+ 		return 1;
++	XvtHudDraw zoned = XvtHudDraw_ForRect(parent, field->bounds);
++	const XvtHudDraw* draw = &zoned;
+ 	unsigned tier = field->caption.font_tier;
+ 	if (tier >= XVT_HUD_FONT_TIERS)
+ 		return 0;
+diff --git a/src/xvt_runtime/config/settings.c b/src/xvt_runtime/config/settings.c
+index df13484..edaa7ea 100644
+--- a/src/xvt_runtime/config/settings.c
++++ b/src/xvt_runtime/config/settings.c
+@@ -38,6 +38,7 @@ static const XvtSettingField g_fields[] = {
+ 	SETTING_BOOL("presentation.hdr_output", render.presentation.hdr_output),
+ 	SETTING_INT("render.msaa_samples", render.msaa_samples, 1, 8),
+ 	SETTING_BOOL("render.cockpit_undither", render.cockpit_undither),
++	SETTING_BOOL("render.hud_widescreen", render.hud_widescreen),
+ 	SETTING_FLOAT("render.temporal_upscaling.sharpness", render.temporal_sharpness, 0, 1),
+ 	SETTING_BOOL("render.motion_blur.camera_blur", render.motion_blur.camera_blur),
+ 	SETTING_BOOL("render.motion_blur.pause_keep_blur", render.motion_blur.pause_keep_blur),
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index 8843e38..ac65809 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -67,6 +67,8 @@ typedef struct XvtSceneSettings {
+ 
+ typedef struct XvtRenderSettings {
+ 	int cockpit_undither;
++	/* Widescreen: spread the cockpit-off HUD to the screen edges. */
++	int hud_widescreen;
+ 	XvtSceneSettings scene;
+ 	int msaa_samples;
+ 	AeronTemporalMode temporal_mode;

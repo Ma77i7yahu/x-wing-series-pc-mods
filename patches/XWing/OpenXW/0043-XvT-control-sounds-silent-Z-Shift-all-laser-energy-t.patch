@@ -1,0 +1,494 @@
+From 498b27f10f60bd1c36284cebaafe2365adfbdfe3 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 06:30:38 +1100
+Subject: [PATCH 43/59] XvT control sounds, silent Z, Shift+' all laser energy
+ to shields
+
+audio.xvt_control_sounds: F9/F10 play XvT's per-setting tones, energy transfers its
+confirm beep (small click when nothing moves), and the 0, 1/3 and 2/3 throttle keys
+its small click. The Z threat display no longer plays a sound. New action
+xfer_all_cannon_to_shields (key 240, Shift+') ports XvT's FLIGHT_KEY_QUOTES.
+---
+ CMakeLists.txt                           |  1 +
+ resources/config.yaml                    |  5 ++
+ src/xw/flight/player/user.c              | 92 +++++++++++++++++++++---
+ src/xw/flight/player/user.h              |  2 +
+ src/xw_app/settings/audio_page.c         |  1 +
+ src/xw_dos94/audio/fsfx.c                |  2 +
+ src/xw_dos94/audio/gamesnd.c             |  6 +-
+ src/xw_runtime/audio/control_sounds.c    | 66 +++++++++++++++++
+ src/xw_runtime/audio/control_sounds.h    | 33 +++++++++
+ src/xw_runtime/config/settings.c         |  1 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ src/xw_runtime/input/actions.c           |  2 +
+ src/xw_runtime/input/actions.h           |  1 +
+ src/xw_runtime/runtime/flight_dispatch.c |  2 +
+ 14 files changed, 204 insertions(+), 12 deletions(-)
+ create mode 100644 src/xw_runtime/audio/control_sounds.c
+ create mode 100644 src/xw_runtime/audio/control_sounds.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2921ac2..5000bfa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -209,6 +209,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/audio/output.c
+     src/xw_runtime/audio/flight_music.c
+     src/xw_runtime/audio/media_device.c
++    src/xw_runtime/audio/control_sounds.c
+     src/xw_runtime/audio/engine_wash_sound.c
+     src/xw_runtime/audio/player_engine.c
+     src/xw_runtime/audio/weapon_sounds.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 8847b74..221f721 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -25,6 +25,9 @@ audio:
+   # Use X-Wing vs TIE Fighter's laser and ion cannon sounds (resources/xvt_weapon_sounds).
+   # Applies from the next mission.
+   xvt_weapon_sounds: true
++  # Use X-Wing vs TIE Fighter's tones for recharge rates (one per setting), energy transfers
++  # and the 0, 1/3 and 2/3 throttle keys (resources/xvt_control_sounds). Applies from the next mission.
++  xvt_control_sounds: true
+   player_engine_sound_volume_percent: 30
+ music:
+   arrangement: windows
+@@ -68,6 +71,8 @@ input:
+     xfer_cannon_to_shields:
+       - {key: "F10", modifiers: [shift]}
+       - {key: "'"}
++    xfer_all_cannon_to_shields:
++      - {key: "'", modifiers: [shift]}
+     target_next:
+       - {key: "T"}
+     target_prev:
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 7be81fd..8d3e79f 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -45,6 +45,7 @@
+ #include "xw/util/shared.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/audio/control_sounds.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_frame.h"
+ #endif
+@@ -53,6 +54,20 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* audio.xvt_control_sounds plays XvT's sound for the key; otherwise (or in the classic build) X-Wing's. */
++#ifdef XW_MODERN
++#define USER_CONTROL_SOUND(xvt, xwSlot)                                                                         \
++	do {                                                                                                        \
++		if (!XwControlSounds_Play(xvt))                                                                         \
++			fsfx_triggersfx((xwSlot), FSFX_UNPOSITIONED_OBJECT);                                                \
++	} while (0)
++/* XvT plays its click where X-Wing stays silent (a transfer with nothing to move, a damaged shield system). */
++#define USER_XVT_ONLY_SOUND(xvt) ((void)XwControlSounds_Play(xvt))
++#else
++#define USER_CONTROL_SOUND(xvt, xwSlot) fsfx_triggersfx((xwSlot), FSFX_UNPOSITIONED_OBJECT)
++#define USER_XVT_ONLY_SOUND(xvt) ((void)0)
++#endif
++
+ #ifdef XW_MODERN
+ /* view_target (Z): XvT's threat display. The camera always shows the player's current target, whatever kind
+  * of object it is (craft, warhead or mission object such as a mine or buoy), so the game's own camera focus
+@@ -1008,7 +1023,7 @@ void user_inputforplane(void) {
+ 				s_targetViewFlag = 1;
+ 				user_resetview();
+ 			}
+-			fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			/* Silent, as in XvT. */
+ 			break;
+ #endif
+ 		case '/':
+@@ -1046,7 +1061,7 @@ void user_inputforplane(void) {
+ 			uint16_t engine;
+ 			for (engine = 0; engine < g_playerFlightState.engineCount; ++engine)
+ 				g_playerFlightState.craft->engineThrottle[engine] = XW_CRAFT_THROTTLE_FULL * 2 / 3;
+-			fsfx_triggersfx(FSFX_THROTTLE_SETTING_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			USER_CONTROL_SOUND(XW_CONTROL_SOUND_CLICK, FSFX_THROTTLE_SETTING_SLOT);
+ 			g_msgArgTable[0] = XW_MSG_THROTTLE_TWO_THIRDS_POWER;
+ 			msg_messageprintf(XW_MSG_ENGINE_THROTTLE_SETTING);
+ 			break;
+@@ -1062,7 +1077,7 @@ void user_inputforplane(void) {
+ 			uint16_t engine;
+ 			for (engine = 0; engine < g_playerFlightState.engineCount; ++engine)
+ 				g_playerFlightState.craft->engineThrottle[engine] = XW_CRAFT_THROTTLE_FULL / 3;
+-			fsfx_triggersfx(FSFX_THROTTLE_SETTING_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			USER_CONTROL_SOUND(XW_CONTROL_SOUND_CLICK, FSFX_THROTTLE_SETTING_SLOT);
+ 			g_msgArgTable[0] = XW_MSG_THROTTLE_ONE_THIRD_POWER;
+ 			msg_messageprintf(XW_MSG_ENGINE_THROTTLE_SETTING);
+ 			break;
+@@ -1071,7 +1086,7 @@ void user_inputforplane(void) {
+ 			uint16_t engine;
+ 			for (engine = 0; engine < g_playerFlightState.engineCount; ++engine)
+ 				g_playerFlightState.craft->engineThrottle[engine] = 0;
+-			fsfx_triggersfx(FSFX_THROTTLE_SETTING_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			USER_CONTROL_SOUND(XW_CONTROL_SOUND_CLICK, FSFX_THROTTLE_SETTING_SLOT);
+ 			g_msgArgTable[0] = XW_MSG_THROTTLE_NO_POWER;
+ 			msg_messageprintf(XW_MSG_ENGINE_THROTTLE_SETTING);
+ 			break;
+@@ -1245,7 +1260,8 @@ void user_inputforplane(void) {
+ 				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+ 				msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
+ 			}
+-			fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++			/* XvT: one tone per setting, from all-to-engines up. */
++			USER_CONTROL_SOUND(XW_CONTROL_SOUND_SETTING_OFF + craft->laserRedirect, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 			break;
+ 		}
+ 		case ';':
+@@ -1300,9 +1316,10 @@ void user_inputforplane(void) {
+ 					if (++slot >= craft->laserSlotCount)
+ 						slot = 0;
+ 				}
+-				fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 				msg_messageprintf(XW_MSG_TRANSFER_SHIELDS_TO_LASERS);
+-			}
++			} else
++				USER_XVT_ONLY_SOUND(XW_CONTROL_SOUND_CLICK);
+ 			break;
+ 		}
+ 		case 's':
+@@ -1352,11 +1369,13 @@ void user_inputforplane(void) {
+ 				}
+ 				g_msgArgTable[0] = craft->shieldRedirect + XW_MSG_POWER_TO_ENGINES_MAXIMUM;
+ 				msg_messageprintf(XW_MSG_SHIELD_RECHARGE_RATE);
+-				fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_SETTING_OFF + craft->shieldRedirect,
++								   FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 			} else {
+ 				g_msgArgTable[0] = XW_MSG_SUBSYSTEM_DEFLECTOR_SHIELD;
+ 				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+ 				msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++				USER_XVT_ONLY_SOUND(XW_CONTROL_SOUND_CLICK);
+ 			}
+ 			break;
+ 		case '\'':
+@@ -1403,9 +1422,63 @@ void user_inputforplane(void) {
+ 						if (++slot >= craft->laserSlotCount)
+ 							slot = 0;
+ 					}
+-					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 					msg_messageprintf(XW_MSG_TRANSFER_LASERS_TO_SHIELDS);
++				} else
++					USER_XVT_ONLY_SOUND(XW_CONTROL_SOUND_CLICK);
++			} else {
++				g_msgArgTable[0] = XW_MSG_SUBSYSTEM_DEFLECTOR_SHIELD;
++				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
++				msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++			}
++			break;
++		}
++#ifdef XW_MODERN
++		case USER_KEY_ALL_LASERS_TO_SHIELDS: {
++			/* XvT's Shift+' (OpenXvT flight.c FLIGHT_KEY_QUOTES): drain the lasers one charge at a time, round
++			 * robin, until both banks are full or the lasers are empty. A bank still short takes the whole step
++			 * once the other is full. Full here is X-Wing's recharge ceiling, as for '. With the shields set
++			 * fully forward or aft only that bank fills, as X-Wing's ' does. */
++			CraftData* craft = g_playerFlightState.craft;
++			if ((craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_SHIELDS) != 0) {
++				int16_t capacity =
++					XW_SHIELD_MAX_CHARGE_MULTIPLIER *
++					g_craftTypeDefs[g_playerFlightState.craftTypeIndex].nominalShieldEnergy[XW_SHIELD_FRONT];
++				int fillFront = craft->shieldDistribMode != LASER_SHIELD_DISTRIBUTE_REAR;
++				int fillRear = craft->shieldDistribMode != LASER_SHIELD_DISTRIBUTE_FRONT;
++				int transferred = 0;
++				uint16_t slot = 0;
++				int16_t remaining = 0;
++				for (slot = 0; slot < craft->laserSlotCount; ++slot)
++					if (craft->weaponSlots[slot].laserCharge > 0)
++						remaining += craft->weaponSlots[slot].laserCharge;
++				for (slot = 0; remaining > 0;) {
++					int frontShort = fillFront && craft->shieldEnergy[XW_SHIELD_FRONT] < capacity;
++					int rearShort = fillRear && craft->shieldEnergy[XW_SHIELD_REAR] < capacity;
++					if (!frontShort && !rearShort)
++						break;
++					if (craft->weaponSlots[slot].laserCharge > 0) {
++						int16_t step = frontShort && rearShort
++										   ? USER_SHIELD_PER_LASER_CHARGE / XW_SHIELD_BANK_COUNT
++										   : USER_SHIELD_PER_LASER_CHARGE;
++						--craft->weaponSlots[slot].laserCharge;
++						--remaining;
++						for (int bank = 0; bank < XW_SHIELD_BANK_COUNT; ++bank)
++							if (bank == XW_SHIELD_FRONT ? frontShort : rearShort) {
++								int16_t room = capacity - craft->shieldEnergy[bank];
++								craft->shieldEnergy[bank] += step < room ? step : room;
++							}
++						transferred = 1;
++					}
++					if (++slot >= craft->laserSlotCount)
++						slot = 0;
+ 				}
++				if (transferred) {
++					USER_CONTROL_SOUND(XW_CONTROL_SOUND_CONFIRM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
++					msg_messagetext(XW_MSG_TRANSFER_LASERS_TO_SHIELDS,
++									"\005Transferring all laser energy to \007shields");
++				} else
++					USER_XVT_ONLY_SOUND(XW_CONTROL_SOUND_CLICK);
+ 			} else {
+ 				g_msgArgTable[0] = XW_MSG_SUBSYSTEM_DEFLECTOR_SHIELD;
+ 				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+@@ -1413,6 +1486,7 @@ void user_inputforplane(void) {
+ 			}
+ 			break;
+ 		}
++#endif
+ 		case 't':
+ 			if (g_playerFlightState.currentTargetObjectIdx == XW_PLAYER_NO_TARGET)
+ 				user_setnewtarget(user_picknexttarget(g_playerFlightState.previousTargetObjectIdx, 1));
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index aff4492..b79e3df 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -56,6 +56,8 @@ enum {
+ 	/* Modern addition: X-Wing vs TIE Fighter's D damage display. With game.xvt_damage_display off it acts as
+ 	 * X-Wing's 'd'. Its own code keeps films recorded with it from reading a repair-order record. */
+ 	USER_KEY_DAMAGE_DISPLAY = 239,
++	/* Modern addition: X-Wing vs TIE Fighter's Shift+' transfers all laser energy to the shields. */
++	USER_KEY_ALL_LASERS_TO_SHIELDS = 240,
+ };
+ 
+ #ifdef XW_MODERN
+diff --git a/src/xw_app/settings/audio_page.c b/src/xw_app/settings/audio_page.c
+index 4a0b524..e772d4f 100644
+--- a/src/xw_app/settings/audio_page.c
++++ b/src/xw_app/settings/audio_page.c
+@@ -93,6 +93,7 @@ void XwAudioPage_Draw(AeronUiContext* ui) {
+ 	AeronUi_Header(ui, "Effects and Speech");
+ 	AeronUi_Toggle(ui, "SB16 Low-pass Filter", &draft->sb16_filter_enabled);
+ 	AeronUi_Toggle(ui, "XvT Laser and Ion Sounds", &draft->xvt_weapon_sounds);
++	AeronUi_Toggle(ui, "XvT Power and Throttle Sounds", &draft->xvt_control_sounds);
+ 	value = p->sfxEnabled;
+ 	if (AeronUi_Toggle(ui, "Sound effects", &value))
+ 		p->sfxEnabled = (int16_t)value;
+diff --git a/src/xw_dos94/audio/fsfx.c b/src/xw_dos94/audio/fsfx.c
+index b8b6cf8..05ceaba 100644
+--- a/src/xw_dos94/audio/fsfx.c
++++ b/src/xw_dos94/audio/fsfx.c
+@@ -8,6 +8,7 @@
+ #include "xw/util/memory.h"
+ #include "xw_dos94/audio/hilevel.h"
+ #include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/control_sounds.h"
+ #include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/weapon_sounds.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+@@ -94,6 +95,7 @@ uint16_t Dos94_fsfx_loadsfx(const char* path) {
+ 	g_fsfxLoaded = 1;
+ 	XwWeaponSounds_Apply();
+ 	XwEngineWashSound_Load();
++	XwControlSounds_Load();
+ 	return (uint16_t)loaded;
+ failed: {
+ 	char error[256];
+diff --git a/src/xw_dos94/audio/gamesnd.c b/src/xw_dos94/audio/gamesnd.c
+index 0d97972..91d3315 100644
+--- a/src/xw_dos94/audio/gamesnd.c
++++ b/src/xw_dos94/audio/gamesnd.c
+@@ -3,6 +3,7 @@
+ #include "xw/landru_config.h"
+ #include "xw/util/memory.h"
+ #include "xw_dos94/audio/fmusic.h"
++#include "xw_runtime/audio/control_sounds.h"
+ #include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/imuse_host.h"
+ #include "xw_runtime/audio/imuse_session.h"
+@@ -60,8 +61,9 @@ void* Dos94_gamesnd_GetSoundAddr(intptr_t soundId) {
+ 			return Dos94_fmusic_GetPagedSound((uint16_t)(soundId - 500));
+ 		if (soundId >= FSFX_FIRST_PLAYABLE_SLOT && soundId < FSFX_SOUND_HANDLE_COUNT)
+ 			return Memory_LockHandle(g_fsfxLoadedSoundHandles[soundId]);
+-		/* Modern addition: XvT's engine wash loops. */
+-		return XwEngineWashSound_Data(soundId);
++		/* Modern additions: XvT's engine wash loops and control sounds. */
++		void* data = XwEngineWashSound_Data(soundId);
++		return data ? data : XwControlSounds_Data(soundId);
+ 	}
+ 	if (g_gameSoundMode != 1 || !soundId || soundId == -1)
+ 		return NULL;
+diff --git a/src/xw_runtime/audio/control_sounds.c b/src/xw_runtime/audio/control_sounds.c
+new file mode 100644
+index 0000000..4c48eb5
+--- /dev/null
++++ b/src/xw_runtime/audio/control_sounds.c
+@@ -0,0 +1,66 @@
++#include "xw_runtime/audio/control_sounds.h"
++#include "xw/audio/fsfx.h"
++#include "xw/frontend/shell_preferences.h"
++#include "xw/util/memory.h"
++#include "xw_runtime/audio/imuse_session.h"
++#include "xw_runtime/audio/weapon_sounds.h"
++#include "xw_runtime/config/config.h"
++#include <aeron/log.h>
++
++/* OpenXvT sounds 42-48 (SFXBLAST.LST from ID 4) and their g_fsfxBaseVolumeBySfxSlot volumes. */
++static const char* const g_controlFiles[XW_CONTROL_SOUND_COUNT] = {
++	"xvt_control_sounds/BEEP-01.WAV",  "xvt_control_sounds/SMCLICK1.WAV", "xvt_control_sounds/SET_OFF2.WAV",
++	"xvt_control_sounds/SET_VLO3.WAV", "xvt_control_sounds/SET_LO2.WAV",  "xvt_control_sounds/SET_MED2.WAV",
++	"xvt_control_sounds/SET_HI2.WAV"
++};
++static const uint8_t g_controlVolumes[XW_CONTROL_SOUND_COUNT] = { 127, 95, 56, 56, 56, 56, 56 };
++static uint16_t g_controlHandles[XW_CONTROL_SOUND_COUNT];
++
++void XwControlSounds_Free(void) {
++	for (unsigned i = 0; i < XW_CONTROL_SOUND_COUNT; ++i) {
++		if (g_dos94Imuse) {
++			imuse_stop_sound(g_dos94Imuse, XW_CONTROL_SOUND_FIRST_ID + i);
++			imuse_forget_sound(g_dos94Imuse, XW_CONTROL_SOUND_FIRST_ID + i);
++		}
++		if (g_controlHandles[i])
++			Memory_FreeHandle(g_controlHandles[i]);
++		g_controlHandles[i] = 0;
++	}
++}
++
++void XwControlSounds_Load(void) {
++	XwControlSounds_Free();
++	if (!XwConfig_Settings()->xvt_control_sounds)
++		return;
++	for (unsigned i = 0; i < XW_CONTROL_SOUND_COUNT; ++i) {
++		g_controlHandles[i] = XwWeaponSounds_LoadWav(g_controlFiles[i]);
++		if (!g_controlHandles[i])
++			Aeron_LogWarn("xw.audio", "XvT control sound %s is missing or unsupported; keeping X-Wing's",
++						  g_controlFiles[i]);
++	}
++}
++
++void* XwControlSounds_Data(intptr_t soundId) {
++	intptr_t index = soundId - XW_CONTROL_SOUND_FIRST_ID;
++	if (index < 0 || index >= XW_CONTROL_SOUND_COUNT || !g_controlHandles[index])
++		return NULL;
++	return Memory_LockHandle(g_controlHandles[index]);
++}
++
++bool XwControlSounds_Play(XwControlSound sound) {
++	if ((unsigned)sound >= XW_CONTROL_SOUND_COUNT || !g_controlHandles[sound])
++		return false;
++	imuse_t* im = g_dos94Imuse;
++	if (!im || !ShellPreferences_GetSfxEnabled() || !g_flightSfxEnabled || !g_flightSfxVolume)
++		return true;
++	intptr_t id = XW_CONTROL_SOUND_FIRST_ID + sound;
++	if (imuse_get_param(im, id, IMUSE_PARAM_SOUND_PLAY_COUNT) > 0)
++		imuse_stop_sound(im, id);
++	if (imuse_start_sound(im, id, 64))
++		return true;
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_GROUP, IMUSE_GROUP_SFX);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_PRIORITY, FSFX_PLAYER_PRIORITY);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_PAN, 64);
++	imuse_set_param(im, id, IMUSE_PARAM_SOUND_VOL, g_controlVolumes[sound]);
++	return true;
++}
+diff --git a/src/xw_runtime/audio/control_sounds.h b/src/xw_runtime/audio/control_sounds.h
+new file mode 100644
+index 0000000..43af3e0
+--- /dev/null
++++ b/src/xw_runtime/audio/control_sounds.h
+@@ -0,0 +1,33 @@
++#ifndef XW_RUNTIME_AUDIO_CONTROL_SOUNDS_H
++#define XW_RUNTIME_AUDIO_CONTROL_SOUNDS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* audio.xvt_control_sounds: X-Wing vs TIE Fighter's cockpit control sounds (OpenXvT flight.c key handling),
++ * read from RESOURCE xvt_control_sounds/ (copied from an XvT installation at packaging time): the confirm beep
++ * for energy transfers, the small click for throttle presets and refused transfers, and the five recharge
++ * setting tones. They play under their own iMUSE sound IDs, after the engine wash loops. */
++typedef enum XwControlSound {
++	XW_CONTROL_SOUND_CONFIRM, /* XvT 42, beep-01 */
++	XW_CONTROL_SOUND_CLICK, /* XvT 43, smclick1 */
++	XW_CONTROL_SOUND_SETTING_OFF, /* XvT 44-48: recharge rate 0 (all to engines) to 4 */
++	XW_CONTROL_SOUND_SETTING_VERY_LOW,
++	XW_CONTROL_SOUND_SETTING_LOW,
++	XW_CONTROL_SOUND_SETTING_MEDIUM,
++	XW_CONTROL_SOUND_SETTING_HIGH,
++	XW_CONTROL_SOUND_COUNT
++} XwControlSound;
++
++enum { XW_CONTROL_SOUND_FIRST_ID = 402 };
++
++/* Call after the flight sound bank loads; XwControlSounds_Free when it is released. */
++void XwControlSounds_Load(void);
++void XwControlSounds_Free(void);
++/* Dos94_gamesnd_GetSoundAddr: the VOC data for one of the control sound IDs, or NULL. */
++void* XwControlSounds_Data(intptr_t soundId);
++/* Plays an XvT control sound. False when the option is off or the sound is missing, so the caller can play
++ * X-Wing's own sound instead; true (even if muted) otherwise. */
++bool XwControlSounds_Play(XwControlSound sound);
++
++#endif
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index e95817b..5115933 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -125,6 +125,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("render.xvt_targeting_computer", xvt_targeting_computer),
+ 	SETTING_BOOL("render.xvt_cockpit", xvt_cockpit),
+ 	SETTING_BOOL("audio.xvt_weapon_sounds", xvt_weapon_sounds),
++	SETTING_BOOL("audio.xvt_control_sounds", xvt_control_sounds),
+ 	SETTING_STRING("music.arrangement", music.arrangement),
+ 	SETTING_STRING("music.backend", music.backend),
+ 	SETTING_STRING("music.soundfont", music.soundfont),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 8ee87a8..d00527c 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -40,7 +40,7 @@ typedef struct XwSettings {
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+-	int short_messages, xvt_damage_display;
++	int short_messages, xvt_damage_display, xvt_control_sounds;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index ddfd062..828ca28 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -18,6 +18,8 @@ static const struct {
+ 	{ "cycle_shield_mode", "Cycle shield distribution", XW_INPUT_ACTION_CATEGORY_WEAPONS, 115 },
+ 	{ "xfer_shields_to_cannon", "Transfer shields to cannons", XW_INPUT_ACTION_CATEGORY_WEAPONS, 215 },
+ 	{ "xfer_cannon_to_shields", "Transfer cannons to shields", XW_INPUT_ACTION_CATEGORY_WEAPONS, 216 },
++	/* Not in X-Wing: XvT's Shift+' (USER_KEY_ALL_LASERS_TO_SHIELDS). */
++	{ "xfer_all_cannon_to_shields", "All cannon energy to shields", XW_INPUT_ACTION_CATEGORY_WEAPONS, 240 },
+ 	{ "target_next", "Next target", XW_INPUT_ACTION_CATEGORY_TARGETING, 116 },
+ 	{ "target_prev", "Previous target", XW_INPUT_ACTION_CATEGORY_TARGETING, 121 },
+ 	{ "target_nearest_fighter", "Nearest enemy fighter", XW_INPUT_ACTION_CATEGORY_TARGETING, 114 },
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index ce2a630..dc114a4 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -15,6 +15,7 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_CYCLE_SHIELD_MODE,
+ 	XW_INPUT_ACTION_XFER_SHIELDS_TO_CANNON,
+ 	XW_INPUT_ACTION_XFER_CANNON_TO_SHIELDS,
++	XW_INPUT_ACTION_XFER_ALL_CANNON_TO_SHIELDS,
+ 	XW_INPUT_ACTION_TARGET_NEXT,
+ 	XW_INPUT_ACTION_TARGET_PREV,
+ 	XW_INPUT_ACTION_TARGET_NEAREST_FIGHTER,
+diff --git a/src/xw_runtime/runtime/flight_dispatch.c b/src/xw_runtime/runtime/flight_dispatch.c
+index aa6787c..156bfb3 100644
+--- a/src/xw_runtime/runtime/flight_dispatch.c
++++ b/src/xw_runtime/runtime/flight_dispatch.c
+@@ -17,6 +17,7 @@
+ #include "xw_dos94/flight/special_world.h"
+ #include "xw_dos94/render/display.h"
+ #include "xw_dos94/render/world.h"
++#include "xw_runtime/audio/control_sounds.h"
+ #include "xw_runtime/audio/engine_wash_sound.h"
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/runtime/flight_mode.h"
+@@ -41,6 +42,7 @@ void XwFlightMode_UnloadSounds(void) {
+ 		g_fsfxLoadedSoundHandles[i] = 0;
+ 	}
+ 	XwEngineWashSound_Free();
++	XwControlSounds_Free();
+ 	g_fsfxLoaded = 0;
+ 	g_fsfxVoiceQueueCount = 0;
+ 	g_fsfxCurrentVoiceSfxSlot = FSFX_NO_VOICE_SLOT;

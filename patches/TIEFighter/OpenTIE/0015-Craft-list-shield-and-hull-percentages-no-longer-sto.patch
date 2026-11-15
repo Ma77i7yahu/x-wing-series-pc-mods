@@ -1,0 +1,52 @@
+From 08a1b07292b6ba71309f8162c694064a3263254e Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Tue, 10 Nov 2026 07:25:07 +1100
+Subject: [PATCH 15/18] Craft list: shield and hull percentages no longer stop
+ at 127
+
+The F list's rows kept SHD/HULL in signed bytes clamped to 127. Shields
+charge to twice nominal (200%, as XvT shows it), so the player's row, and
+any craft with charged shields, sat at 127 until the shields fell below
+that. The row fields are now 16-bit and unclamped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tie/xvt_mfd.c                    | 4 ++--
+ src/tie_runtime/snapshot/hud_types.h | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/tie/xvt_mfd.c b/src/tie/xvt_mfd.c
+index 7fd4307..5883581 100644
+--- a/src/tie/xvt_mfd.c
++++ b/src/tie/xvt_mfd.c
+@@ -244,13 +244,13 @@ static void TieXvtMfd_ObjectName(uint16_t obj, char* out, size_t capacity) {
+ 	TieXvtMfd_TitleCase(out);
+ }
+ 
+-static int8_t TieXvtMfd_Percent(int32_t value, int32_t maximum) {
++static int16_t TieXvtMfd_Percent(int32_t value, int32_t maximum) {
+ 	if (maximum <= 0)
+ 		return -1;
+ 	if (value < 0)
+ 		value = 0;
+ 	int32_t pct = (value * 100 + maximum / 2) / maximum;
+-	return (int8_t)(pct > 127 ? 127 : pct);
++	return (int16_t)pct;
+ }
+ 
+ static void TieXvtMfd_CaptureList(TieHudState* hud) {
+diff --git a/src/tie_runtime/snapshot/hud_types.h b/src/tie_runtime/snapshot/hud_types.h
+index be110ed..460bd6c 100644
+--- a/src/tie_runtime/snapshot/hud_types.h
++++ b/src/tie_runtime/snapshot/hud_types.h
+@@ -238,8 +238,8 @@ typedef struct TieHudState {
+ 		char target[24];
+ 		uint8_t name_color; /* logical colors, as panel_buildobjectname's */
+ 		uint8_t target_color;
+-		int8_t shield_pct; /* -1: no shields */
+-		int8_t hull_pct;
++		int16_t shield_pct; /* -1: no shields; up to 200 when charged past nominal */
++		int16_t hull_pct;
+ 	} xvt_list_rows[8];
+ 	uint8_t xvt_damage_open;
+ 	uint8_t xvt_damage_active; /* has Up / Down: frame drawn */

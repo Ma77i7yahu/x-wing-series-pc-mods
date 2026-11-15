@@ -1,0 +1,443 @@
+From 369e0a3334a4c682fa679c9583c98be0ec4e9b30 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 22:04:13 +1100
+Subject: [PATCH 34/59] Threat display boarding time, XvT engine wash
+
+- Threat display (Z): while the target is docked and boarding (or is the
+  craft being boarded), "BOARDING TIME LEFT" counts down in place of the
+  travel time. On the way in, the full boarding time follows the travel
+  time ("+ 2:00 BOARDING"). paiman_boardmaneuver runs aiOrderProgress
+  units of 14160 ticks (one mission minute) once docked.
+- game.xvt_engine_wash (OpenXvT collide_ApplyEngineWashDamage): every 29
+  mission ticks, the player behind a working freighter's or starship's
+  OPT engine meshes (component 6) takes up to 64 damage per engine, on
+  the shield bank facing the engine; 1/8 with shields down. Front-half
+  engines (CAL.OPT bow pods) are skipped. Clocked from the mission clock
+  so replays repeat it. XvT's warning message, at most every 5 s.
+---
+ resources/config.yaml                    |   3 +
+ src/xw/assets/model_mesh.h               |   2 +
+ src/xw/flight/ai/paiorder.h              |   1 +
+ src/xw/flight/object/collide.c           | 158 +++++++++++++++++++++++
+ src/xw_app/settings/game_page.c          |   2 +
+ src/xw_remaster/hud_readout.c            |  17 ++-
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   4 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ src/xw_runtime/snapshot/render_readout.c |  33 +++++
+ src/xw_runtime/snapshot/render_types.h   |   4 +
+ 13 files changed, 231 insertions(+), 2 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 5f91947..9f879e5 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -267,6 +267,9 @@ game:
+   # The player launches with both shield banks fully overcharged (twice normal strength,
+   # the most recharging can reach). Missions that start with no or half shields are unchanged.
+   start_overshield: true
++  # X-Wing vs TIE Fighter's engine wash: flying close behind a working freighter's or
++  # starship's engines drains the player's shields, then hull. 1998 flight only.
++  xvt_engine_wash: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/assets/model_mesh.h b/src/xw/assets/model_mesh.h
+index 4d0cd13..a3509b0 100644
+--- a/src/xw/assets/model_mesh.h
++++ b/src/xw/assets/model_mesh.h
+@@ -39,6 +39,8 @@ enum {
+ 	MODEL_MESH_TYPE_DAMAGE_ANIMATION = 3,
+ 	MODEL_MESH_TYPE_4 = 4,
+ 	MODEL_MESH_TYPE_5 = 5,
++	/* OPT component "Engine" (XvT MESH_COMPONENT_06_ENGINE); engine wash uses its box. */
++	MODEL_MESH_TYPE_ENGINE = 6,
+ 	MODEL_MESH_TYPE_BRIDGE = 7,
+ 	MODEL_MESH_TYPE_SFOIL = 20,
+ 	MODEL_MESH_TYPE_21 = 21,
+diff --git a/src/xw/flight/ai/paiorder.h b/src/xw/flight/ai/paiorder.h
+index 8bd9c32..42cfc0f 100644
+--- a/src/xw/flight/ai/paiorder.h
++++ b/src/xw/flight/ai/paiorder.h
+@@ -113,6 +113,7 @@ enum {
+ 	PAIORDER_BOARD_DISABLED_43 = 43,
+ 	PAIORDER_BOARD_DISABLED_44 = 44,
+ 	PAIORDER_BOARD_LAST = 44,
++	PAIORDER_MANEUVER_BOARD = 18,
+ 	PAIORDER_MANEUVER_AWAIT_BOARD = 19,
+ 	PAIORDER_MANEUVER_AWAIT_BOARD_ALTERNATE = 25
+ };
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index dab0905..7801979 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -119,6 +119,158 @@ int g_collisionSegmentStartWorldY = 0;
+ // GLOBAL: XW 0x6377B8
+ int g_collisionSegmentStartWorldZ = 0;
+ 
++#ifdef XW_MODERN
++/* game.xvt_engine_wash (OpenXvT collide_ApplyEngineWashDamage): flying in the exhaust behind a working
++ * freighter's or starship's engines drains the player's shields, then hull. The wash is a box behind each
++ * engine mesh of the OPT model that widens and weakens with depth. */
++enum {
++	COLLIDE_WASH_UPDATE_TICKS = 29,
++	COLLIDE_WASH_RANGE_SCALE = 3,
++	COLLIDE_WASH_LENGTH_SCALE = 8,
++	COLLIDE_WASH_MAX_DAMAGE = 64,
++	COLLIDE_WASH_PERCENT = 100,
++	COLLIDE_WASH_MESSAGE_TICKS = 5 * XW_SIMULATION_TICKS_PER_SECOND,
++};
++static int16_t s_washDamageOverride = -1;
++static uint32_t s_washLastBucket = UINT32_MAX, s_washLastMessageTick;
++static uint8_t s_washWasActive;
++
++static uint32_t collide_missionticks(void) {
++	uint32_t seconds = ((uint32_t)g_missionElapsedClock.hours * 60 + g_missionElapsedClock.minutes) * 60 +
++					   g_missionElapsedClock.seconds;
++	return seconds * XW_SIMULATION_TICKS_PER_SECOND +
++		   (uint32_t)(XW_SIMULATION_TICKS_PER_SECOND - g_missionElapsedClock.subsecondTicks);
++}
++
++static int32_t collide_q15dot(int16_t ax, int16_t ay, int16_t az, int32_t bx, int32_t by, int32_t bz) {
++	return (int32_t)(((int64_t)ax * bx + (int64_t)ay * by + (int64_t)az * bz) >> FVIEW_MATRIX_FRACTION_BITS);
++}
++
++/* Applies one source's wash to the player; returns nonzero when any engine's wash reached it. */
++static int collide_enginewash(uint16_t sourceIndex) {
++	ObjectRecord* source = &g_objectTable[sourceIndex];
++	ObjectRecord* player = g_playerFlightState.object;
++	int extent = g_modelTypeTable[source->objectType].maxBoundsExtent;
++	int32_t dx = (int32_t)((uint32_t)player->worldX - (uint32_t)source->worldX);
++	int32_t dy = (int32_t)((uint32_t)player->worldY - (uint32_t)source->worldY);
++	int32_t dz = (int32_t)((uint32_t)player->worldZ - (uint32_t)source->worldZ);
++	int64_t range = (int64_t)COLLIDE_WASH_RANGE_SCALE * extent;
++	int washed = 0;
++	if ((int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz > range * range)
++		return 0;
++	if (source->orientMatrixDirty != 0) {
++		fview_calcrotatemove(source->pitch, source->yaw, source);
++		fview_calcrotateorient(source->roll, 0, source);
++	}
++	/* Model space as starship.c's collision sweep: X side, Y aft (negated forward), Z up. */
++	int32_t localSide = collide_q15dot(source->cachedSideX, source->cachedSideY, source->cachedSideZ, dx, dy, dz);
++	int32_t localAft =
++		-collide_q15dot(source->cachedForwardX, source->cachedForwardY, source->cachedForwardZ, dx, dy, dz);
++	int32_t localUp = collide_q15dot(source->cachedUpX, source->cachedUpY, source->cachedUpZ, dx, dy, dz);
++	if (localAft < -extent)
++		return 0;
++	/* The player's nose in the same model space picks the shield bank facing the engine. */
++	int32_t noseSide = collide_q15dot(source->cachedSideX, source->cachedSideY, source->cachedSideZ,
++									  player->cachedForwardX, player->cachedForwardY, player->cachedForwardZ);
++	int32_t noseAft = -collide_q15dot(source->cachedForwardX, source->cachedForwardY, source->cachedForwardZ,
++									  player->cachedForwardX, player->cachedForwardY, player->cachedForwardZ);
++	int32_t noseUp = collide_q15dot(source->cachedUpX, source->cachedUpY, source->cachedUpZ, player->cachedForwardX,
++									player->cachedForwardY, player->cachedForwardZ);
++	int meshCount = ModelMesh_GetCachedObjectTypeMeshCount(source->objectType);
++	for (int meshIndex = 0; meshIndex < meshCount; ++meshIndex) {
++		const MeshDescriptor* engine = ModelMesh_GetCachedDescriptor(source->objectType, meshIndex);
++		if (!engine || engine->meshType != MODEL_MESH_TYPE_ENGINE)
++			continue;
++		/* Engines on the front half (CAL.OPT's under-bow pods) would wash along the hull; XvT's models have
++		 * none there. */
++		if (engine->center.y < 0)
++			continue;
++		int lengthExtent = (int)(engine->boxMax.y - engine->boxMin.y);
++		int sideExtent = (int)(engine->boxMax.x - engine->boxMin.x);
++		int upExtent = (int)(engine->boxMax.z - engine->boxMin.z);
++		if (lengthExtent < sideExtent)
++			lengthExtent = sideExtent;
++		if (lengthExtent < upExtent)
++			lengthExtent = upExtent;
++		int washLength = COLLIDE_WASH_LENGTH_SCALE * lengthExtent;
++		if (washLength > 2 * extent)
++			washLength = 2 * extent;
++		int depth = localAft - (int)engine->boxMin.y;
++		if (depth <= 0 || washLength < depth)
++			continue;
++		int sideOffset = abs(localSide - (int)engine->center.x);
++		int upOffset = abs(localUp - (int)engine->center.z);
++		sideExtent += sideExtent >> 1;
++		sideExtent += (int)((int64_t)depth * sideExtent / washLength);
++		upExtent += upExtent >> 1;
++		upExtent += (int)((int64_t)depth * upExtent / washLength);
++		if (sideExtent < sideOffset || upExtent < upOffset || sideExtent + upExtent <= 0)
++			continue;
++		int damage = (washLength >> 8) *
++					 (COLLIDE_WASH_PERCENT * (washLength - depth) / washLength *
++					  (COLLIDE_WASH_PERCENT * (sideExtent + upExtent - upOffset - sideOffset) / (sideExtent + upExtent)) /
++					  COLLIDE_WASH_PERCENT) /
++					 COLLIDE_WASH_PERCENT;
++		if (damage > COLLIDE_WASH_MAX_DAMAGE)
++			damage = COLLIDE_WASH_MAX_DAMAGE;
++		/* As XvT: with the shields down the wash only scorches the hull. */
++		if (g_playerFlightState.craft->shieldEnergy[XW_SHIELD_FRONT] +
++				g_playerFlightState.craft->shieldEnergy[XW_SHIELD_REAR] ==
++			0)
++			damage >>= 3;
++		if (damage < 1)
++			damage = 1;
++		/* Facing the engine: front bank. */
++		int64_t toEngine = (int64_t)noseSide * ((int)engine->center.x - localSide) +
++						   (int64_t)noseAft * ((int)engine->center.y - localAft) +
++						   (int64_t)noseUp * ((int)engine->center.z - localUp);
++		CraftData* savedCraft = g_curCraft;
++		s_washDamageOverride = (int16_t)damage;
++		collide_damagecraft(g_playerFlightState.objectIndex, -1, sourceIndex,
++							toEngine >= 0 ? XW_SHIELD_FRONT : XW_SHIELD_REAR);
++		s_washDamageOverride = -1;
++		g_curCraft = savedCraft;
++		washed = 1;
++		if (g_playerFlightState.craft->objectKind != XW_CRAFT_OBJECT_KIND_0)
++			break;
++	}
++	return washed;
++}
++
++/* Every 29 mission ticks, as XvT, from the mission clock so replays repeat it exactly. */
++static void collide_updateenginewash(void) {
++	if (!XwFlightTweaks_XvtEngineWash() || XwFlightTypes_Dos() || g_flightInvulnerabilityEnabled != 0 ||
++		g_hyperspaceflag != 0 || g_playerFlightState.craft->objectKind != XW_CRAFT_OBJECT_KIND_0)
++		return;
++	uint32_t now = collide_missionticks();
++	uint32_t bucket = now / COLLIDE_WASH_UPDATE_TICKS;
++	if (bucket == s_washLastBucket)
++		return;
++	s_washLastBucket = bucket;
++	int washed = 0;
++	for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index) {
++		ObjectRecord* source = &g_objectTable[index];
++		const CraftData* sourceCraft;
++		if (index == g_playerFlightState.objectIndex || source->objectType == XW_OBJ_NONE ||
++			(source->genusId != XW_GENUS_FREIGHTER && source->genusId != XW_GENUS_STARSHIP) ||
++			source->familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		sourceCraft = source->instanceData;
++		if (!sourceCraft || sourceCraft->workingSubsystems == 0)
++			continue;
++		washed |= collide_enginewash(index);
++		if (g_playerFlightState.craft->objectKind != XW_CRAFT_OBJECT_KIND_0)
++			break;
++	}
++	if (washed && g_replayviewmode == 0 &&
++		(!s_washWasActive || now - s_washLastMessageTick >= COLLIDE_WASH_MESSAGE_TICKS)) {
++		msg_messagetext(XW_MSG_INCOMING_MISSILE_TARGET_PROMPT, "\013You're taking damage from engine wash!");
++		s_washLastMessageTick = now;
++	}
++	s_washWasActive = (uint8_t)washed;
++}
++#endif
++
+ // FUNCTION: XW 0x402E10
+ void collide_collisions(void) {
+ 	uint16_t collisionObjectIndex;
+@@ -142,6 +294,8 @@ void collide_collisions(void) {
+ 			ObjectRecord* object;
+ #ifdef XW_MODERN
+ 			if (continuation.phase != XW_COLLISION_LOOP_PLAYER_GATE)
++				collide_updateenginewash();
++			if (continuation.phase != XW_COLLISION_LOOP_PLAYER_GATE)
+ #endif
+ 			{
+ #ifdef XW_MODERN
+@@ -1465,6 +1619,10 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		sourceObjectType = g_objectTable[sourceObjOrMissionPointRef].objectType;
+ 		damageAmount = g_objectTable[sourceObjOrMissionPointRef].damageAmount;
+ 	}
++#ifdef XW_MODERN
++	if (s_washDamageOverride >= 0)
++		damageAmount = s_washDamageOverride;
++#endif
+ 	if (g_objectTable[victimObjIdx].genusId == XW_GENUS_STARSHIP) {
+ 		damageAmount >>= COLLIDE_STARSHIP_DAMAGE_SHIFT;
+ 	}
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index fcb6088..f03fb50 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -108,6 +108,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing", "XvT (Self-Balancing)" }, 2);
+ 	AeronUi_Selector(ui, "Shields at Launch", &draft->start_overshield,
+ 					 (const char* const[]) { "Normal", "Overcharged" }, 2);
++	AeronUi_Selector(ui, "Engine Wash", &draft->xvt_engine_wash,
++					 (const char* const[]) { "Off", "XvT (Capital Ships & Freighters)" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+ 					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 0d4a8fa..92831bb 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -805,7 +805,22 @@ bool XwHudThreat_Draw(const XwHudDraw* d) {
+ 			snprintf(remaining, sizeof remaining, "%ld:%02ld", (long)(r->time_remaining_s / 60),
+ 					 (long)(r->time_remaining_s % 60));
+ 		Labelled(&pen, x, y + 2 * line, width, "DISTANCE TO DESTINATION:", THREAT_BLUE, distance, THREAT_RED);
+-		Labelled(&pen, x, y + 3 * line, width, "TIME REMAINING:", THREAT_BLUE, remaining, THREAT_GREEN);
++		if (r->boarding_remaining_s >= 0 && r->boarding_docked) {
++			/* Docked: the boarding countdown replaces the travel time. */
++			snprintf(remaining, sizeof remaining, "%ld:%02ld", (long)(r->boarding_remaining_s / 60),
++					 (long)(r->boarding_remaining_s % 60));
++			Labelled(&pen, x, y + 3 * line, width, "BOARDING TIME LEFT:", THREAT_BLUE, remaining, THREAT_YELLOW);
++		} else {
++			Labelled(&pen, x, y + 3 * line, width, "TIME REMAINING:", THREAT_BLUE, remaining, THREAT_GREEN);
++			if (r->boarding_remaining_s >= 0) {
++				/* On the way in: the boarding time that follows docking. */
++				char boarding[32];
++				snprintf(boarding, sizeof boarding, "+ %ld:%02ld BOARDING", (long)(r->boarding_remaining_s / 60),
++						 (long)(r->boarding_remaining_s % 60));
++				float used = Measure(&pen, "TIME REMAINING: ") + Measure(&pen, remaining) + Measure(&pen, "  ");
++				Text(&pen, x + used, y + 3 * line, boarding, THREAT_YELLOW, width - used);
++			}
++		}
+ 	}
+ 	return true;
+ }
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index b8fab51..7d220bc 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -12,6 +12,11 @@ static bool s_xvt_cockpit = true;
+ static bool s_xvt_shields = true;
+ static bool s_xvt_turning = true;
+ static bool s_start_overshield = true;
++static bool s_xvt_engine_wash = true;
++
++bool XwFlightTweaks_XvtEngineWash(void) { return s_xvt_engine_wash; }
++
++void XwFlightTweaks_SetXvtEngineWash(bool enabled) { s_xvt_engine_wash = enabled; }
+ 
+ bool XwFlightTweaks_StartOvershield(void) { return s_start_overshield; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 9c20f22..ee52f13 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -64,6 +64,10 @@ void XwFlightTweaks_SetXvtTurning(bool enabled);
+  * half shields are unchanged. */
+ bool XwFlightTweaks_StartOvershield(void);
+ void XwFlightTweaks_SetStartOvershield(bool enabled);
++/* game.xvt_engine_wash: X-Wing vs TIE Fighter's engine wash (OpenXvT collide.c). Behind a working freighter's
++ * or starship's engine meshes, the player takes shield then hull damage every 29 ticks. 1998 flight only. */
++bool XwFlightTweaks_XvtEngineWash(void);
++void XwFlightTweaks_SetXvtEngineWash(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 42ef645..05d867a 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -38,6 +38,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtShields(settings->xvt_shields != 0);
+ 	XwFlightTweaks_SetXvtTurning(settings->xvt_turning != 0);
+ 	XwFlightTweaks_SetStartOvershield(settings->start_overshield != 0);
++	XwFlightTweaks_SetXvtEngineWash(settings->xvt_engine_wash != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 0534836..cb44504 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -115,6 +115,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_shields", xvt_shields),
+ 	SETTING_BOOL("game.xvt_turning", xvt_turning),
+ 	SETTING_BOOL("game.start_overshield", start_overshield),
++	SETTING_BOOL("game.xvt_engine_wash", xvt_engine_wash),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index b025f3c..175aaf7 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -39,7 +39,7 @@ typedef struct XwSettings {
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+-	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield;
++	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index a2ee7ce..f0649b6 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -2,6 +2,8 @@
+ #include "xw_runtime/snapshot/render_readout.h"
+ #include "xw/assets/model_mesh.h"
+ #include "xw/flight/ai/pai.h"
++#include "xw/flight/ai/paiman.h"
++#include "xw/flight/ai/paiorder.h"
+ #include "xw/flight/hud/festring.h"
+ #include "xw/flight/hud/msg.h"
+ #include "xw/flight/hud/panel.h"
+@@ -168,6 +170,35 @@ static void CaptureDestination(XwSnapReadout* r, uint16_t ref, const CraftData*
+ 	r->time_remaining_s = per_second > 0 ? (int32_t)(units / per_second + 0.5) : -1;
+ }
+ 
++/* Threat display: how long the target's boarding has to run. The target is the boarding craft, or the craft
++ * docked with it. paiman_boardmaneuver counts aiOrderProgress units of PAIMAN_BOARD_DURATION_UNIT_TICKS once
++ * docked; on the way in, the whole order (aiOrderParameter units) is still ahead. */
++static void CaptureBoarding(XwSnapReadout* r, uint16_t ref, const CraftData* craft) {
++	const CraftData* boarder = craft->aiManeuverId == PAIORDER_MANEUVER_BOARD ? craft : NULL;
++	for (uint16_t index = 0; !boarder && index < XW_CRAFT_OBJECT_COUNT; ++index) {
++		const CraftData* other;
++		if (index == ref || !LiveObject(index) || g_objectTable[index].familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		other = g_objectTable[index].instanceData;
++		if (other && other->aiManeuverId == PAIORDER_MANEUVER_BOARD && other->aiTargetRef == ref &&
++			other->aiManeuverPhase == PAIMAN_BOARD_TRANSFER)
++			boarder = other;
++	}
++	if (!boarder)
++		return;
++	uint32_t ticks;
++	if (boarder->aiManeuverPhase == PAIMAN_BOARD_TRANSFER) {
++		r->boarding_docked = 1;
++		ticks = boarder->aiOrderProgress
++					? (uint32_t)(boarder->aiOrderProgress - 1) * PAIMAN_BOARD_DURATION_UNIT_TICKS +
++						  boarder->aiManeuverTimerTicks
++					: 0;
++	} else
++		ticks = (uint32_t)(uint8_t)boarder->aiOrderParameter * PAIMAN_BOARD_DURATION_UNIT_TICKS;
++	r->boarding_remaining_s =
++		(int32_t)((ticks + XW_SIMULATION_TICKS_PER_SECOND - 1) / XW_SIMULATION_TICKS_PER_SECOND);
++}
++
+ static void CaptureTarget(XwSnapReadout* r) {
+ 	uint16_t ref = g_playerFlightState.currentTargetObjectIdx;
+ 	if (ref == XW_OBJECT_SLOT_UNAVAILABLE)
+@@ -242,6 +273,7 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 			ShortOrder(r->target_order_word, sizeof r->target_order_word, r->target_orders);
+ 	}
+ 	CaptureDestination(r, ref, craft);
++	CaptureBoarding(r, ref, craft);
+ 	if (craft->aiTargetRef != ref && craft->aiTargetRef < XW_OBJECT_COUNT && LiveObject(craft->aiTargetRef)) {
+ 		ObjectName(craft->aiTargetRef, r->target_order_target, sizeof r->target_order_target);
+ 		r->order_target_relation = Relation(craft->aiTargetRef);
+@@ -254,6 +286,7 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 
+ void XwReadout_Capture(XwSnapReadout* r) {
+ 	memset(r, 0, sizeof *r);
++	r->boarding_remaining_s = -1;
+ 	if (!g_playerFlightState.craft || !g_playerFlightState.object || g_replayviewmode)
+ 		return;
+ 	const XwFlightPanelLayout* layout = XwFlightPanel_Layout();
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index c95564b..6f8e633 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -223,6 +223,10 @@ typedef struct XwSnapReadout {
+ 	uint16_t destination_distance_hundredths;
+ 	int32_t time_remaining_s;
+ 	char destination[32];
++	/* Boarding by or of the target: seconds left (-1 when not boarding). Until the boarder docks this is the
++	 * whole boarding time still to come. */
++	int32_t boarding_remaining_s;
++	uint8_t boarding_docked;
+ } XwSnapReadout;
+ 
+ typedef struct XwSnapWidget {

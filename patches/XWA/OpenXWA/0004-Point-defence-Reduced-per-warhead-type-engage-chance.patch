@@ -1,0 +1,64 @@
+From fe0abcb97bde41e5296000b14224693a60945a9d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 07:34:15 +1100
+Subject: [PATCH 4/4] Point defence Reduced: per-warhead-type engage chances
+
+---
+ src/xwa/flight/ai/paifight.c                  | 21 +++++++++++++++++--
+ .../config/modern_gameplay_options.h          |  8 ++++---
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/xwa/flight/ai/paifight.c b/src/xwa/flight/ai/paifight.c
+index ee9f362..b1947e6 100644
+--- a/src/xwa/flight/ai/paifight.c
++++ b/src/xwa/flight/ai/paifight.c
+@@ -64,11 +64,28 @@ static int paifight_PointDefenseMayEngageWarhead(uint16_t projectileObjIdx) {
+ 	}
+ 	mobj = g_objectTable[projectileObjIdx].mobj;
+ 	if (mobj->pointDefenseRoll == 0) {
++		unsigned int engagePercent;
++
++		/* Slow heavy rockets are easy prey, faster advanced torpedoes and
++		 * small space bombs are hard to pick off, as in the earlier games. */
++		switch (g_objectTable[projectileObjIdx].objectType) {
++			case OBJ_WarheadRocket:
++				engagePercent = 75;
++				break;
++			case OBJ_WarheadAdvancedTorpedo:
++				engagePercent = 15;
++				break;
++			case OBJ_WarheadSpaceBomb:
++				engagePercent = 10;
++				break;
++			default:
++				engagePercent = XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT;
++				break;
++		}
+ 		s_rollState ^= s_rollState << 13;
+ 		s_rollState ^= s_rollState >> 17;
+ 		s_rollState ^= s_rollState << 5;
+-		mobj->pointDefenseRoll =
+-			(uint8_t)((s_rollState % 100u) < XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT ? 1 : 2);
++		mobj->pointDefenseRoll = (uint8_t)((s_rollState % 100u) < engagePercent ? 1 : 2);
+ 	}
+ 	return mobj->pointDefenseRoll == 1;
+ }
+diff --git a/src/xwa_runtime/config/modern_gameplay_options.h b/src/xwa_runtime/config/modern_gameplay_options.h
+index cdf84fe..1b11214 100644
+--- a/src/xwa_runtime/config/modern_gameplay_options.h
++++ b/src/xwa_runtime/config/modern_gameplay_options.h
+@@ -8,9 +8,11 @@ extern "C" {
+ #endif
+ 
+ /* How readily starship laser turrets shoot down incoming warheads. ORIGINAL
+- * engages every warhead; REDUCED gives each warhead a single launch-time roll
+- * (XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT) on whether turrets engage it at
+- * all; OFF never engages warheads, as in the earlier Totally Games titles. */
++ * engages every warhead; REDUCED gives each warhead a single roll on whether
++ * turrets engage it at all (XWA_POINT_DEFENSE_REDUCED_ENGAGE_PERCENT for
++ * torpedoes and missiles, with per-type chances in paifight.c for heavy
++ * rockets, advanced torpedoes and space bombs); OFF never engages warheads,
++ * as in the earlier Totally Games titles. */
+ typedef enum XwaPointDefense {
+ 	XWA_POINT_DEFENSE_ORIGINAL = 0,
+ 	XWA_POINT_DEFENSE_REDUCED,

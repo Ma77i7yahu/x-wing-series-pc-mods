@@ -1,0 +1,640 @@
+From 62d1e6373b9938c085cebcd7eacdd44675ea84d2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 07:58:56 +1100
+Subject: [PATCH 06/18] XvT cockpit readouts (flight.xvt_hud): CMD orders for
+ starfighters, messages at the top, cockpit over the message bar
+
+---
+ resources/config.yaml                      |   1 +
+ src/tie/panel.c                            | 107 ++++++++++++++++++++-
+ src/tie/panel.h                            |   3 +
+ src/tie_app/application.c                  |   1 +
+ src/tie_app/config/app_config.c            |   7 +-
+ src/tie_app/config/app_config.h            |   2 +
+ src/tie_app/settings/flight_options.c      |   4 +-
+ src/tie_app/settings/settings.c            |   6 ++
+ src/tie_remaster/flight/cockpit/renderer.c |  85 +++++++++++++---
+ src/tie_remaster/flight/cockpit/text.c     |  53 +++++++---
+ src/tie_remaster/flight/cockpit/text.h     |   5 +-
+ src/tie_remaster/flight/renderer.c         |   3 +-
+ src/tie_runtime/hooks/flight_tweaks.c      |   7 +-
+ src/tie_runtime/hooks/flight_tweaks.h      |   6 ++
+ src/tie_runtime/snapshot/hud_types.h       |   5 +-
+ 15 files changed, 258 insertions(+), 37 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 7bffa8c..6a84999 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -54,6 +54,7 @@ flight:
+   # large throttle cuts brake quickly instead of shedding 20 speed per second.
+   # Applies to every craft.
+   xvt_throttle: true
++  xvt_hud: true
+   models:
+     source: original
+     smooth_angle_degrees: 90
+diff --git a/src/tie/panel.c b/src/tie/panel.c
+index 813c9a3..6e5e720 100644
+--- a/src/tie/panel.c
++++ b/src/tie/panel.c
+@@ -33,6 +33,7 @@
+ #include "tie/xtrans2.h"
+ #include "tie_runtime/audio/config.h"
+ #include "tie_runtime/diagnostics/diagnostics.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/display/classic_display.h"
+ #include "tie_runtime/display/classic_framebuffer.h"
+ #include "tie_runtime/flight_assets/model_types.h"
+@@ -1148,8 +1149,12 @@ void panel_updatecmd(void) {
+ 	}
+ 
+ 	/* Subsystem focus (instrument[65]). */
+-	if (pstate.target_obj_idx >= NUM_CRAFTS && pstate.target_obj_idx < 0x3800)
++	if (pstate.target_obj_idx >= NUM_CRAFTS && pstate.target_obj_idx < 0x3800) {
++#ifdef TIE_MODERN
++		panel_xvtcmdorders();
++#endif
+ 		return;
++	}
+ 
+ 	if (pstate.target_obj_idx < NUM_CRAFTS)
+ 		focus = pstate.radar_target1;
+@@ -1190,8 +1195,108 @@ void panel_updatecmd(void) {
+ 		}
+ #endif
+ 	}
++#ifdef TIE_MODERN
++	panel_xvtcmdorders();
++#endif
+ }
+ 
++#ifdef TIE_MODERN
++/* flight.xvt_hud: X-Wing vs TIE Fighter's CMD (Hud_UpdateTargetDetails) shows a
++ * starfighter's orders instead of its cargo and targeted component: the first
++ * word of its status report on the left, the craft or waypoint it is after on
++ * the right. TIE's report phrases start with words such as "on" and "doing",
++ * so each maps to the word XvT's rewritten phrase starts with. The status is
++ * the threat display's: disabled craft await boarding, and stopped craft on
++ * hangar/hyperspace/home orders are waiting. */
++static const char* const xvt_order_words[] = {
++	"Holding",	  /* 0x7A holding steady */
++	"Patrolling", /* 0x7B on patrol */
++	"Protecting", /* 0x7C protecting craft */
++	"Patrolling", /* 0x7D patrolling for craft to attack */
++	"Patrolling", /* 0x7E patrolling for escorters */
++	"Attacking",  /* 0x7F setting up for attack run */
++	"Attacking",  /* 0x80 attacking target */
++	"Evading",	  /* 0x81 doing evasive maneuver */
++	"Following",  /* 0x82 following flight leader */
++	"Looking",	  /* 0x83 looking for craft to disable */
++	"Escorting",  /* 0x84 flying escort */
++	"Looking",	  /* 0x85 looking for craft to board */
++	"Looking",	  /* 0x86 looking for craft to capture */
++	"Looking",	  /* 0x87 looking for craft to pick up */
++	"Docking",	  /* 0x88 performing docking operation */
++	"Flying",	  /* 0x89 flying to rendezvous point */
++	"Waiting",	  /* 0x8A awaiting boarding craft */
++	"Awaiting",	  /* 0x8B awaiting boarding */
++	"Holding",	  /* 0x8C holding station */
++	"Flying",	  /* 0x8D flying home */
++	"Entering",	  /* 0x8E entering hangar */
++	"Exiting",	  /* 0x8F exiting hangar */
++	"Hypering",	  /* 0x90 entering hyperspace */
++	"Hypering",	  /* 0x91 exiting hyperspace */
++	"Flying",	  /* 0x92 following flight plan */
++	"Awaiting",	  /* 0x93 awaiting return of craft */
++	"Awaiting",	  /* 0x94 awaiting launch of craft */
++	"Changing",	  /* 0x95 changing orders */
++	"Awaiting",	  /* 0x96 awaiting further orders */
++	"Waiting",	  /* 0x97 waiting */
++	"Deploying",  /* 0x98 dropping off craft */
++};
++
++static bool s_xvtcmd_shown;
++
++void panel_xvtcmdorders(void) {
++	uint16_t target = pstate.target_obj_idx;
++	TieHudState* hud;
++	CraftData* cp;
++	uint16_t order, link;
++	unsigned message;
++
++	if (!TieFlightTweaks_XvtHud() || target >= NUM_CRAFTS || objects[target].category ||
++		objects[target].genus != GENUS_FIGHTER) {
++		if (s_xvtcmd_shown) {
++			/* Repaint TIE's cargo and component lines. */
++			s_xvtcmd_shown = false;
++			oldinstruments[63] = -1;
++			oldinstruments[65] = -1;
++			hud = TieSnapshotBuilder_HudMut();
++			hud->target_cargo[0] = '\0';
++			hud->target_subsystem_text[0] = '\0';
++			hud->cmd_orders = 0;
++		}
++		return;
++	}
++	s_xvtcmd_shown = true;
++	hud = TieSnapshotBuilder_HudMut();
++	hud->cmd_orders = 1;
++	cp = objects[target].craft_ptr;
++
++	order = cp->current_order;
++	if (!cp->status_flags)
++		order = 42;
++	else if (!objects[target].current_speed && order >= 45 && order <= 54)
++		order = 66;
++	message = order < sizeof convertmessage ? convertmessage[order] : 0;
++	snprintf(hud->target_cargo, sizeof hud->target_cargo, "%s",
++			 message >= 0x7A && message - 0x7A < sizeof xvt_order_words / sizeof xvt_order_words[0]
++				 ? xvt_order_words[message - 0x7A]
++				 : "");
++	hud->instruments[63].color = 0x46;
++
++	link = (uint16_t)cp->ai_target_ref;
++	if (!cp->status_flags || order == 66 || link == 0xFF || link == 0xFFFF || link == target) {
++		hud->target_subsystem_text[0] = '\0';
++	} else {
++		char saved[sizeof tempstring];
++		memcpy(saved, tempstring, sizeof saved);
++		panel_buildobjectname(link, 3);
++		TieHudSnapshot_CopyFestringText(hud->target_subsystem_text, sizeof hud->target_subsystem_text,
++										(const uint8_t*)tempstring);
++		memcpy(tempstring, saved, sizeof saved);
++	}
++	hud->instruments[65].color = 0x4E;
++}
++#endif
++
+ /*
+  * panel_buildobjectname -- format target name into tempstring using
+  * FESTRING color-escape prefixes (0xFE). flags bit 0 = ship name,
+diff --git a/src/tie/panel.h b/src/tie/panel.h
+index 4666cb8..dea8c86 100644
+--- a/src/tie/panel.h
++++ b/src/tie/panel.h
+@@ -243,6 +243,9 @@ void panel_updategunsight(void);
+ void panel_updateradar(void);
+ void panel_addbliptoradar(uint16_t obj_idx);
+ void panel_updatecmd(void);
++#ifdef TIE_MODERN
++void panel_xvtcmdorders(void); /* flight.xvt_hud CMD orders; see panel.c */
++#endif
+ void panel_buildobjectname(uint16_t obj_idx, uint16_t flags);
+ uint16_t panel_getcraftstatus(uint16_t obj_idx);
+ void panel_outputdistance(int32_t polar_dist);
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index ec1e0b6..96997fc 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -188,6 +188,7 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieFlightTweaks_SetXvtLasers(app_config.requested.xvt_lasers);
+ 		TieFlightTweaks_SetAiIonLink(app_config.requested.ai_ion_link);
+ 		TieFlightTweaks_SetXvtThrottle(app_config.requested.xvt_throttle);
++		TieFlightTweaks_SetXvtHud(app_config.requested.xvt_hud);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index 0264246..511582b 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -183,7 +183,7 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+ 				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
+-				  "laser_convergence", "xvt_lasers", "ai_ion_link", "xvt_throttle", "models");
++				  "laser_convergence", "xvt_lasers", "ai_ion_link", "xvt_throttle", "xvt_hud", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -541,7 +541,8 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 		!TieAppConfig_ReadInt(document, "flight.laser_convergence", 0, 5000, &out->laser_convergence_m, error,
+ 							  capacity) ||
+ 		!TieAppConfig_ReadBool(document, "flight.xvt_lasers", &out->xvt_lasers, error, capacity) ||
+-		!TieAppConfig_ReadBool(document, "flight.xvt_throttle", &out->xvt_throttle, error, capacity))
++		!TieAppConfig_ReadBool(document, "flight.xvt_throttle", &out->xvt_throttle, error, capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.xvt_hud", &out->xvt_hud, error, capacity))
+ 		return false;
+ 	const char* ai_ion_link = AeronConfigFile_GetString(document, "flight.ai_ion_link", NULL);
+ 	if (!ai_ion_link)
+@@ -792,6 +793,7 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.xvt_lasers = config->xvt_lasers,
+ 		.ai_ion_link = config->ai_ion_link,
+ 		.xvt_throttle = config->xvt_throttle,
++		.xvt_hud = config->xvt_hud,
+ 	};
+ }
+ 
+@@ -856,6 +858,7 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 								&aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "flight.xvt_lasers", options->xvt_lasers, &aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "flight.xvt_throttle", options->xvt_throttle, &aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.xvt_hud", options->xvt_hud, &aeron_error) ||
+ 		!AeronConfigFile_SetString(candidate, "flight.ai_ion_link",
+ 								   options->ai_ion_link == TIE_AI_ION_LINK_OFF		  ? "off"
+ 								   : options->ai_ion_link == TIE_AI_ION_LINK_FRIENDLY ? "friendly"
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index 7cf5b45..24507cd 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -54,6 +54,7 @@ typedef struct TieAppLiveFlightOptions {
+ 	bool xvt_lasers;
+ 	int ai_ion_link; /* TIE_AI_ION_LINK_* */
+ 	bool xvt_throttle;
++	bool xvt_hud;
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -100,6 +101,7 @@ typedef struct TieAppConfig {
+ 	bool xvt_lasers;
+ 	int ai_ion_link;
+ 	bool xvt_throttle;
++	bool xvt_hud;
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index fbe1287..d695de5 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -33,7 +33,8 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->widescreen == right->widescreen && left->cockpit_stretch == right->cockpit_stretch &&
+ 		   left->widescreen_hud == right->widescreen_hud &&
+ 		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers &&
+-		   left->ai_ion_link == right->ai_ion_link && left->xvt_throttle == right->xvt_throttle;
++		   left->ai_ion_link == right->ai_ion_link && left->xvt_throttle == right->xvt_throttle &&
++		   left->xvt_hud == right->xvt_hud;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+@@ -44,6 +45,7 @@ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* opt
+ 	options->widescreen_hud = options->widescreen_hud != 0;
+ 	options->xvt_lasers = options->xvt_lasers != 0;
+ 	options->xvt_throttle = options->xvt_throttle != 0;
++	options->xvt_hud = options->xvt_hud != 0;
+ }
+ 
+ bool TieFlightOptions_Configure(const TieAppLiveFlightOptions* requested, TieFlightOptionsApplyFn apply,
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index b0e1f7d..810a4d4 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -185,6 +185,7 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 	TieFlightTweaks_SetXvtLasers(requested->xvt_lasers);
+ 	TieFlightTweaks_SetAiIonLink(requested->ai_ion_link);
+ 	TieFlightTweaks_SetXvtThrottle(requested->xvt_throttle);
++	TieFlightTweaks_SetXvtHud(requested->xvt_hud);
+ 	return true;
+ }
+ 
+@@ -407,6 +408,11 @@ static void TieSettings_VideoPage(AeronUiContext* ui) {
+ 			flight.widescreen_hud = hud != 0;
+ 			flight_changed = true;
+ 		}
++		int xvt_hud = flight.xvt_hud;
++		if (AeronUi_Toggle(ui, "XvT Cockpit Readouts", &xvt_hud)) {
++			flight.xvt_hud = xvt_hud != 0;
++			flight_changed = true;
++		}
+ 		if (flight_changed)
+ 			TieSettings_SetFlightTweaks(&flight);
+ 	}
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index 4aaf0cb..f91c05f 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -173,6 +173,7 @@ struct TieCockpitRenderer {
+ 		int rt_w, rt_h;
+ 		float stretch_x;
+ 		float spread_px;
++		float lower_stretch_y;
+ 	} chrome_key;
+ 	TieCockpitRendererEntry entries[COCKPIT_MAX_CACHED];
+ 	int entry_count;
+@@ -591,6 +592,19 @@ static float s_widget_shift_x = 0.0f;
+ /* Pixels the forward-view (cockpit-off) HUD moves outward on each side: the
+  * width of the side area beyond the 4:3 frame; 0 when not spreading. */
+ static float s_hud_spread_px = 0.0f;
++/* flight.xvt_hud: classic cockpit frames run to the bottom edge, over the
++ * message bar's rows, as X-Wing vs TIE Fighter's cockpits do. Coord rows above
++ * s_lower_pivot_y keep their place, so the gunsight stays on the 3D view's
++ * centre; the panel below stretches by s_lower_stretch_y so the art's last
++ * row (456 of 480) lands on the bottom edge. 1 leaves the frame as it was. */
++static float s_lower_pivot_y = 0.0f;
++static float s_lower_stretch_y = 1.0f;
++/* Top row of the message line with flight.xvt_hud, in 640x480 rows. */
++#define XVT_MESSAGE_TOP_Y 6
++
++static float TieCockpitRenderer_LowerMapY(float y) {
++	return y <= s_lower_pivot_y ? y : s_lower_pivot_y + (y - s_lower_pivot_y) * s_lower_stretch_y;
++}
+ 
+ /* Outward shift for forward-view HUD content centered at coord-frame x:
+  * the left and right groups move to the screen edges, the center stays. */
+@@ -1171,6 +1185,23 @@ static void TieCockpitRenderer_BlitCockpitQuadFull(TieCockpitRenderer* cg, Aeron
+ 	(void)coord_h;
+ 	if (!cg || !cg->record_list || dst_w <= 0.0f || dst_h <= 0.0f)
+ 		return;
++	if (tex && s_lower_stretch_y != 1.0f && dst_y < s_lower_pivot_y && dst_y + dst_h > s_lower_pivot_y) {
++		/* Straddles the pivot: the halves stretch differently. */
++		const float split_h = s_lower_pivot_y - dst_y;
++		const float split_v = src_v0 + (src_v1 - src_v0) * (split_h / dst_h);
++		TieCockpitRenderer_BlitCockpitQuadFull(cg, cmd, pass, tex, coord_w, coord_h, dst_x, dst_y, dst_w, split_h,
++											   src_u0, src_v0, src_u1, split_v, tint_r, tint_g, tint_b, tint_a,
++											   bias_r, bias_g, bias_b, bias_a, filter);
++		TieCockpitRenderer_BlitCockpitQuadFull(cg, cmd, pass, tex, coord_w, coord_h, dst_x, s_lower_pivot_y,
++											   dst_w, dst_h - split_h, src_u0, split_v, src_u1, src_v1, tint_r,
++											   tint_g, tint_b, tint_a, bias_r, bias_g, bias_b, bias_a, filter);
++		return;
++	}
++	{
++		const float top = TieCockpitRenderer_LowerMapY(dst_y);
++		dst_h = TieCockpitRenderer_LowerMapY(dst_y + dst_h) - top;
++		dst_y = top;
++	}
+ 	const TieCockpitRendererDrawSpace* space = &cg->pending_space;
+ 	const float origin_x = space->fit_x + s_widget_shift_x;
+ 	if (!tex) {
+@@ -1653,7 +1684,8 @@ static bool TieCockpitRenderer_ChromeKeyMatches(const TieCockpitRenderer* cg,
+ 		   cg->chrome_key.covers_allowed == snap->cockpit.covers_allowed &&
+ 		   cg->chrome_key.coord_w == coord_w && cg->chrome_key.coord_h == coord_h &&
+ 		   cg->chrome_key.rt_w == rt_w && cg->chrome_key.rt_h == rt_h &&
+-		   cg->chrome_key.stretch_x == s_cockpit_stretch_x && cg->chrome_key.spread_px == s_hud_spread_px;
++		   cg->chrome_key.stretch_x == s_cockpit_stretch_x && cg->chrome_key.spread_px == s_hud_spread_px &&
++		   cg->chrome_key.lower_stretch_y == s_lower_stretch_y;
+ }
+ 
+ /* Bake base bitmap + damage cracks + subsystem covers into chrome_rt at
+@@ -1703,6 +1735,7 @@ static bool TieCockpitRenderer_BakeCockpitChrome(TieCockpitRenderer* cg, AeronCo
+ 	cg->chrome_key.rt_h = rt_h;
+ 	cg->chrome_key.stretch_x = s_cockpit_stretch_x;
+ 	cg->chrome_key.spread_px = s_hud_spread_px;
++	cg->chrome_key.lower_stretch_y = s_lower_stretch_y;
+ 	cg->chrome_valid = true;
+ 	return true;
+ }
+@@ -2321,21 +2354,29 @@ static void TieCockpitRenderer_DrawMessageBar(TieCockpitRenderer* cg, AeronComma
+ 	if (!TieFlightHud_MessageBarGeometry(snap, target->target_w, target->target_h, &geometry))
+ 		return;
+ 
++	/* flight.xvt_hud: no strip; the message is centred at the top of the
++	 * screen, as X-Wing vs TIE Fighter shows it, without the time-warp
++	 * readout. */
++	const bool xvt = TieFlightTweaks_XvtHud();
++
+ 	/* Original msg_messagedisplay clears the full framebuffer-width band. */
+ 	float r, g, b;
+-	TieCockpitRenderer_MsgColorToTint(snap, 0x2C, &r, &g, &b);
+-	const float body_color[4] = { r, g, b, 1.0f };
+-	AeronDrawList_AddFill(cg->record_list, 0.0f, geometry.bar_y, (float)target->target_w, geometry.bar_h,
+-						  body_color, AERON_BLIT2D_BLEND_PMA, NULL);
+-	TieCockpitRenderer_MsgColorToTint(snap, 0x2D, &r, &g, &b);
+-	const float separator_color[4] = { r, g, b, 1.0f };
+-	AeronDrawList_AddFill(cg->record_list, 0.0f, geometry.separator_y, (float)target->target_w,
+-						  geometry.separator_h, separator_color, AERON_BLIT2D_BLEND_PMA, NULL);
++	if (!xvt) {
++		TieCockpitRenderer_MsgColorToTint(snap, 0x2C, &r, &g, &b);
++		const float body_color[4] = { r, g, b, 1.0f };
++		AeronDrawList_AddFill(cg->record_list, 0.0f, geometry.bar_y, (float)target->target_w, geometry.bar_h,
++							  body_color, AERON_BLIT2D_BLEND_PMA, NULL);
++		TieCockpitRenderer_MsgColorToTint(snap, 0x2D, &r, &g, &b);
++		const float separator_color[4] = { r, g, b, 1.0f };
++		AeronDrawList_AddFill(cg->record_list, 0.0f, geometry.separator_y, (float)target->target_w,
++							  geometry.separator_h, separator_color, AERON_BLIT2D_BLEND_PMA, NULL);
++	}
+ 
+ 	/* Text retains the original body indent and time-warp column. */
+ 	TieUIText recs[4];
+-	int n_recs = TieCockpitText_BuildmsgBarText(snap, (int)snap->hud.msg_bar.line_top, 2,
+-												(int)snap->hud.msg_bar.line_right, recs,
++	const int top_y = (geometry.classic_h * XVT_MESSAGE_TOP_Y) / 480;
++	int n_recs = TieCockpitText_BuildmsgBarText(snap, xvt ? top_y : (int)snap->hud.msg_bar.line_top, 2,
++												(int)snap->hud.msg_bar.line_right, !xvt, recs,
+ 												(int)(sizeof recs / sizeof recs[0]));
+ 	if (n_recs > 0 && cg->text_renderer) {
+ 		const float atlas_scale = cg->original_font_atlas_scale > 0.0f
+@@ -2349,6 +2390,12 @@ static void TieCockpitRenderer_DrawMessageBar(TieCockpitRenderer* cg, AeronComma
+ 			.space_between_classic = 0.0f,
+ 			.fit = TIE_SCENE2D_TEXT_FIT_FILL,
+ 		};
++		if (xvt && snap->hud.msg_bar.present) {
++			const float w = TieScene2dTextRenderer_MeasureFestringClassic(
++				cg->text_renderer, TIE_FONT_DOMAIN_COCKPIT, recs[0].font_id, &message_space, recs[0].text);
++			const float x = ((float)geometry.classic_w - w) * 0.5f;
++			recs[0].x = (int16_t)(x > 0.0f ? x : 0.0f);
++		}
+ 		TieScene2dTextRenderer_RecordFestringScaled(
+ 			cg->text_renderer, cg->record_list, geometry.classic_w, geometry.classic_h, &message_space, recs,
+ 			n_recs, snap->palette, geometry.text_fit_x, 0.0f, geometry.text_scale_x, geometry.scale_y,
+@@ -2544,9 +2591,9 @@ static void TieCockpitRenderer_DrawPipCompose(TieCockpitRenderer* cg, AeronRende
+ 
+ 	const TieCockpitRendererDrawSpace* space = &cg->pending_space;
+ 	const float px = space->fit_x + dst_x * space->scale_x;
+-	const float py = space->fit_y + dst_y * space->scale_y;
++	const float py = space->fit_y + TieCockpitRenderer_LowerMapY(dst_y) * space->scale_y;
+ 	const float pw = dst_w * space->scale_x;
+-	const float ph = dst_h * space->scale_y;
++	const float ph = (TieCockpitRenderer_LowerMapY(dst_y + dst_h) - TieCockpitRenderer_LowerMapY(dst_y)) * space->scale_y;
+ 	float ndc_x = (px / (float)space->target_w) * 2.0f - 1.0f;
+ 	float ndc_w = (pw / (float)space->target_w) * 2.0f;
+ 	float ndc_y = 1.0f - ((py + ph) / (float)space->target_h) * 2.0f;
+@@ -2864,6 +2911,17 @@ bool TieCockpitRenderer_Prepare(TieCockpitRenderer* cg, AeronCommandBuffer* cmd,
+ 		return false;
+ 	}
+ 	s_cockpit_stretch_x = TieFlightHud_CockpitStretchX(snap, rt_w, rt_h);
++	s_lower_pivot_y = 0.0f;
++	s_lower_stretch_y = 1.0f;
++	{
++		const int cw = snap->cockpit.classic_w, ch = snap->cockpit.classic_h;
++		if (TieFlightTweaks_XvtHud() && snap->cockpit.view_idx != 18 && snap->cockpit.view_idx != 19 &&
++			snap->cockpit.view_name[0] && ((cw == 640 && ch == 480) || (cw == 320 && ch == 200))) {
++			/* Rows 0..216 of 480 hold the canopy and gunsight. */
++			s_lower_pivot_y = (float)ch * 0.45f;
++			s_lower_stretch_y = ((float)ch - s_lower_pivot_y) / ((float)(ch * 19 / 20) - s_lower_pivot_y);
++		}
++	}
+ 	s_widget_shift_x = 0.0f;
+ 	s_hud_spread_px = 0.0f;
+ 	if (TieFlightTweaks_WidescreenHud() && snap->cockpit.view_idx == 19) {
+@@ -3057,6 +3115,7 @@ static bool TieCockpitRenderer_CockpitRecordLists(TieCockpitRenderer* cg, AeronC
+ 				ax = 65535.0f;
+ 			if (ay > 65535.0f)
+ 				ay = 65535.0f;
++			ay = TieCockpitRenderer_LowerMapY(ay);
+ 			instruments_remapped[i].x = (uint16_t)(ax + 0.5f);
+ 			instruments_remapped[i].y = (uint16_t)(ay + 0.5f);
+ 		}
+diff --git a/src/tie_remaster/flight/cockpit/text.c b/src/tie_remaster/flight/cockpit/text.c
+index c38b34d..35c37ea 100644
+--- a/src/tie_remaster/flight/cockpit/text.c
++++ b/src/tie_remaster/flight/cockpit/text.c
+@@ -181,7 +181,7 @@ done:
+ }
+ 
+ int TieCockpitText_BuildmsgBarText(const TieSnapshot* snap, int line_top, int line_left, int line_right,
+-								   TieUIText* out, int cap) {
++								   bool time_warp, TieUIText* out, int cap) {
+ 	int n = 0;
+ 
+ 	/* Body — type/side base color + inline color escapes for the
+@@ -204,7 +204,7 @@ int TieCockpitText_BuildmsgBarText(const TieSnapshot* snap, int line_top, int li
+ 	/* Time-warp "T:<N>x" — engine paints 3 separate runs at the same
+ 	 * cursor; HD packs them in one record with 0xFE+color escapes
+ 	 * between segments (label 0x46, digits 0x4E, 'x' 0x43). */
+-	{
++	if (time_warp) {
+ 		char tbuf[24];
+ 		const uint8_t c_label = TieCockpitText_RemapColor(0x46);
+ 		const uint8_t c_num = TieCockpitText_RemapColor(0x4E);
+@@ -511,20 +511,43 @@ static int TieCockpitText_BuildPanelCmd(struct TieScene2dTextRenderer* text_rend
+ 
+ 	/* Cargo (idx 63) + subsystem focus (idx 65) — colors set by
+ 	 * panel_updatecmd at the paint sites. */
+-	{
+-		const TieHudInstrument* ins = &instruments[63];
+-		const int16_t right_at =
+-			TieCockpitText_ResolveRightAt(layout, 63, (int16_t)ins->x, cmd_text_w_classic);
+-		TieCockpitText_EmitPanelTextRightAligned(text_renderer, space, out, &n, cap, ins, right_at,
+-												 TieCockpitText_ResolveCargoText(h), ins->color,
+-												 COCKPIT_BG_CMD);
+-	}
+-	if (h->target_subsystem_text[0]) {
++	if (h->cmd_orders) {
++		/* flight.xvt_hud starfighter: XvT draws the order word from the left
++		 * of the cargo column and its target right-aligned, free to run left
++		 * up to the word. */
++		const TieHudInstrument* word = &instruments[63];
+ 		const TieHudInstrument* ins = &instruments[65];
+-		const int16_t right_at =
+-			TieCockpitText_ResolveRightAt(layout, 65, (int16_t)ins->x, cmd_text_w_classic);
+-		TieCockpitText_EmitPanelTextRightAligned(text_renderer, space, out, &n, cap, ins, right_at,
+-												 h->target_subsystem_text, ins->color, COCKPIT_BG_CMD);
++		float word_end = (float)word->x;
++		if (TieCockpitCommon_InstrumentActive(word) && h->target_cargo[0]) {
++			TieCockpitText_EmitPanelText(out, &n, cap, (int16_t)word->x, (int16_t)word->y, h->target_cargo,
++										 word->color, COCKPIT_BG_CMD);
++			word_end += TieCockpitText_MeasureClassic(text_renderer, space, h->target_cargo);
++		}
++		if (TieCockpitCommon_InstrumentActive(ins) && h->target_subsystem_text[0]) {
++			const int16_t right_at =
++				TieCockpitText_ResolveRightAt(layout, 65, (int16_t)ins->x, cmd_text_w_classic);
++			float x = right_at - TieCockpitText_MeasureClassic(text_renderer, space, h->target_subsystem_text) - 2;
++			if (x < word_end + 6)
++				x = word_end + 6;
++			TieCockpitText_EmitPanelText(out, &n, cap, (int16_t)x, (int16_t)ins->y, h->target_subsystem_text,
++										 ins->color, COCKPIT_BG_CMD);
++		}
++	} else {
++		{
++			const TieHudInstrument* ins = &instruments[63];
++			const int16_t right_at =
++				TieCockpitText_ResolveRightAt(layout, 63, (int16_t)ins->x, cmd_text_w_classic);
++			TieCockpitText_EmitPanelTextRightAligned(text_renderer, space, out, &n, cap, ins, right_at,
++													 TieCockpitText_ResolveCargoText(h), ins->color,
++													 COCKPIT_BG_CMD);
++		}
++		if (h->target_subsystem_text[0]) {
++			const TieHudInstrument* ins = &instruments[65];
++			const int16_t right_at =
++				TieCockpitText_ResolveRightAt(layout, 65, (int16_t)ins->x, cmd_text_w_classic);
++			TieCockpitText_EmitPanelTextRightAligned(text_renderer, space, out, &n, cap, ins, right_at,
++													 h->target_subsystem_text, ins->color, COCKPIT_BG_CMD);
++		}
+ 	}
+ 
+ 	/* Target name (idx 90) — engine leaves textcolor at label_color
+diff --git a/src/tie_remaster/flight/cockpit/text.h b/src/tie_remaster/flight/cockpit/text.h
+index 3d7684f..ec5ca1c 100644
+--- a/src/tie_remaster/flight/cockpit/text.h
++++ b/src/tie_remaster/flight/cockpit/text.h
+@@ -40,9 +40,10 @@ bool TieCockpitText_Push(TieUIText* buf, int* cnt, int cap, int16_t x, int16_t y
+  * `line_top` / `line_left` / `line_right` are the bar's top edge,
+  * body-text x indent, and time-warp right edge — all in the cockpit
+  * pass's coord frame. Caller has already rescaled from the engine's
+- * 4:3 classic frame onto the layout's reference frame. */
++ * 4:3 classic frame onto the layout's reference frame. 	ime_warp false
++ * leaves out the time-warp readout (flight.xvt_hud). */
+ int TieCockpitText_BuildmsgBarText(const TieSnapshot* snap, int line_top, int line_left, int line_right,
+-								   TieUIText* out, int cap);
++								   bool time_warp, TieUIText* out, int cap);
+ 
+ /* Mission clock (idx 30, panel_updateclock). MM + SS as two records;
+  * the colon between them is part of the cockpit bitmap. View 0 only.
+diff --git a/src/tie_remaster/flight/renderer.c b/src/tie_remaster/flight/renderer.c
+index decc615..21d9d9b 100644
+--- a/src/tie_remaster/flight/renderer.c
++++ b/src/tie_remaster/flight/renderer.c
+@@ -818,7 +818,8 @@ AeronTexture* TieFlightRenderer_PipTexture(const TieFlightRenderer* g) { return
+ /* Return the first flight-RT row occupied by the global message bar. */
+ static int TieFlightRenderer_BloomMessageBarTopRt(const TieFlightRenderer* g, const TieSnapshot* snap) {
+ 	TieFlightHudMessageBarGeometry geometry;
+-	if (!TieFlightHud_MessageBarGeometry(snap, g->rt_w, g->rt_h, &geometry))
++	/* flight.xvt_hud draws no bar; the cockpit fills its rows. */
++	if (TieFlightTweaks_XvtHud() || !TieFlightHud_MessageBarGeometry(snap, g->rt_w, g->rt_h, &geometry))
+ 		return g->rt_h;
+ 	int bar_top_rt = (int)geometry.separator_y;
+ 	if (bar_top_rt < 0)
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+index 901737e..57d5468 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.c
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -6,6 +6,7 @@ static int s_laser_convergence_m = 550;
+ static bool s_xvt_lasers = true;
+ static int s_ai_ion_link = TIE_AI_ION_LINK_ALL;
+ static bool s_xvt_throttle = true;
++static bool s_xvt_hud = true;
+ 
+ bool TieFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
+ 
+@@ -31,4 +32,8 @@ void TieFlightTweaks_SetAiIonLink(int mode) {
+ 
+ bool TieFlightTweaks_XvtThrottle(void) { return s_xvt_throttle; }
+ 
+-void TieFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
+\ No newline at end of file
++void TieFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
++
++bool TieFlightTweaks_XvtHud(void) { return s_xvt_hud; }
++
++void TieFlightTweaks_SetXvtHud(bool enabled) { s_xvt_hud = enabled; }
+\ No newline at end of file
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+index db3260d..8ad16fb 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.h
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -34,5 +34,11 @@ void TieFlightTweaks_SetAiIonLink(int mode);
+  * 20. Applies to every craft. */
+ bool TieFlightTweaks_XvtThrottle(void);
+ void TieFlightTweaks_SetXvtThrottle(bool enabled);
++/* xvt_hud (flight.xvt_hud): X-Wing vs TIE Fighter's cockpit readouts. The CMD
++ * shows a craft's orders and their target, messages sit at the top of the
++ * screen, and the cockpit art runs to the bottom edge without the message
++ * strip and time-compression indicator. */
++bool TieFlightTweaks_XvtHud(void);
++void TieFlightTweaks_SetXvtHud(bool enabled);
+ 
+ #endif
+diff --git a/src/tie_runtime/snapshot/hud_types.h b/src/tie_runtime/snapshot/hud_types.h
+index dc00038..a8209fa 100644
+--- a/src/tie_runtime/snapshot/hud_types.h
++++ b/src/tie_runtime/snapshot/hud_types.h
+@@ -207,7 +207,7 @@ typedef struct TieHudState {
+ 	char mission_clock_text[6];
+ 
+ 	/* Resolved string painted into instrument[65]. Empty = no text. */
+-	char target_subsystem_text[24];
++	char target_subsystem_text[40];
+ 
+ 	/* World-space inputs for aspect-independent target and subsystem boxes. */
+ 	uint16_t target_bound_hwidth;      /* avg of spec_data extents <<mss;
+@@ -223,6 +223,9 @@ typedef struct TieHudState {
+ 
+ 	/* Resolved string painted into instrument[63]. Empty = no text. */
+ 	char target_cargo[24];
++	/* flight.xvt_hud: target_cargo holds a starfighter's order word (drawn
++	 * left-aligned, as XvT does) and target_subsystem_text its order target. */
++	uint8_t cmd_orders;
+ 	/* Cargo painted by panel_updatethreatname at instrument 70. */
+ 	char threat_cargo[24];
+ 

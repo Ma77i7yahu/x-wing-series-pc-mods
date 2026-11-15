@@ -1,0 +1,313 @@
+From f94489e1ea9ed63447078363da545d4478ea5510 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 05:46:59 +1100
+Subject: [PATCH 09/25] Add stretched cockpit art option for widescreen cockpit
+ views
+
+---
+ resources/config.yaml             |  1 +
+ src/xvt_remaster/crt.c            |  5 +++--
+ src/xvt_remaster/crt.h            |  4 ++--
+ src/xvt_remaster/flight.c         |  5 +++--
+ src/xvt_remaster/hud_draw.c       | 20 ++++++++++----------
+ src/xvt_remaster/hud_draw.h       |  3 ++-
+ src/xvt_remaster/hud_renderer.c   | 12 ++++++++++--
+ src/xvt_remaster/preview.c        |  8 ++++++--
+ src/xvt_remaster/render_math.c    | 16 ++++++++++++++--
+ src/xvt_remaster/render_math.h    |  2 ++
+ src/xvt_runtime/config/settings.c |  1 +
+ src/xvt_runtime/config/settings.h |  2 ++
+ 12 files changed, 56 insertions(+), 23 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index bf8b047..b4ae7cb 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -362,6 +362,7 @@ game:
+ render:
+   cockpit_undither: true
+   hud_widescreen: true
++  cockpit_stretch: true
+   msaa_samples: 2
+   temporal_upscaling:
+     mode: "off"
+diff --git a/src/xvt_remaster/crt.c b/src/xvt_remaster/crt.c
+index 0366420..0b25e22 100644
+--- a/src/xvt_remaster/crt.c
++++ b/src/xvt_remaster/crt.c
+@@ -114,7 +114,8 @@ invalid:
+ }
+ 
+ int XvtCrt_PrepareView(const XvtSnapPreview* preview, const XvtSnapCockpitLayout* definition,
+-					   AeronTexture* color, int width, int height, float scale, float ox, float oy) {
++					   AeronTexture* color, int width, int height, float scale_x, float scale, float ox,
++					   float oy) {
+ 	g_color = NULL;
+ 	if (!preview || !color)
+ 		return 1;
+@@ -130,7 +131,7 @@ int XvtCrt_PrepareView(const XvtSnapPreview* preview, const XvtSnapCockpitLayout
+ 		memcmp(g_masks[index].bytes, definition->masks[index], size))
+ 		return 0;
+ 	g_mask = g_masks[index].texture;
+-	float x = r.x * scale + ox, y = r.y * scale + oy, w = r.width * scale, h = r.height * scale;
++	float x = r.x * scale_x + ox, y = r.y * scale + oy, w = r.width * scale_x, h = r.height * scale;
+ 	g_uniform[0] = 2 * x / width - 1;
+ 	g_uniform[1] = 1 - 2 * (y + h) / height;
+ 	g_uniform[2] = 2 * w / width;
+diff --git a/src/xvt_remaster/crt.h b/src/xvt_remaster/crt.h
+index 29f3f32..731b00d 100644
+--- a/src/xvt_remaster/crt.h
++++ b/src/xvt_remaster/crt.h
+@@ -5,8 +5,8 @@
+ extern "C" {
+ #endif
+ int XvtCrt_PrepareView(const XvtSnapPreview* preview, const XvtSnapCockpitLayout* definition,
+-					   AeronTexture* color, int width, int height, float scale, float offset_x,
+-					   float offset_y);
++					   AeronTexture* color, int width, int height, float scale_x, float scale,
++					   float offset_x, float offset_y);
+ void XvtCrt_Draw(AeronRenderPass* pass);
+ void XvtCrt_Shutdown(void);
+ int XvtCrt_PrepareResources(AeronCommandBuffer* cmd, const XvtCockpitResources* resources);
+diff --git a/src/xvt_remaster/flight.c b/src/xvt_remaster/flight.c
+index eada1f5..e355f2e 100644
+--- a/src/xvt_remaster/flight.c
++++ b/src/xvt_remaster/flight.c
+@@ -79,8 +79,9 @@ int XvtRemasterFlight_Prepare(const XvtRenderSnapshot* s, const XvtRenderSnapsho
+ 		return 0;
+ 	}
+ 	g_frame.content_rect = (AeronRectI) { 0, 0, width, height };
+-	if (s->camera.map_mode ||
+-		(s->camera.hud_state != HUD_VIEW_HUD_ONLY && s->camera.hud_state != HUD_VIEW_FULL_SCREEN)) {
++	if (!XvtRenderMath_CockpitStretched(&s->camera) &&
++		(s->camera.map_mode ||
++		 (s->camera.hud_state != HUD_VIEW_HUD_ONLY && s->camera.hud_state != HUD_VIEW_FULL_SCREEN))) {
+ 		/* Match the centered bitmap frame without changing the scene projection. */
+ 		const XvtLayoutTransform* layout = &g_frame.cockpit_layout;
+ 		int w = (int)(layout->source_width * layout->scale + .5f);
+diff --git a/src/xvt_remaster/hud_draw.c b/src/xvt_remaster/hud_draw.c
+index abfad4d..7fac5e3 100644
+--- a/src/xvt_remaster/hud_draw.c
++++ b/src/xvt_remaster/hud_draw.c
+@@ -47,9 +47,9 @@ static XvtSnapRect IntersectRects(XvtSnapRect a, XvtSnapRect b) {
+ int XvtHudDraw_Clip(const XvtHudDraw* draw, XvtSnapRect rect, AeronRectI* out) {
+ 	if (rect.width <= 0 || rect.height <= 0)
+ 		return 0;
+-	int left = (int)floorf(rect.x * draw->scale + draw->offset_x);
++	int left = (int)floorf(rect.x * draw->scale_x + draw->offset_x);
+ 	int top = (int)floorf(rect.y * draw->scale + draw->offset_y);
+-	int right = (int)ceilf((rect.x + rect.width) * draw->scale + draw->offset_x);
++	int right = (int)ceilf((rect.x + rect.width) * draw->scale_x + draw->offset_x);
+ 	int bottom = (int)ceilf((rect.y + rect.height) * draw->scale + draw->offset_y);
+ 	left = left > 0 ? left : 0;
+ 	top = top > 0 ? top : 0;
+@@ -65,8 +65,8 @@ void XvtHudDraw_Fill(const XvtHudDraw* draw, unsigned phase, XvtSnapRect rect, u
+ 		return;
+ 	float rgba[4];
+ 	XvtUi_Color(color, rgba);
+-	AeronDrawList_AddFill(XvtHudDraw_SelectList(draw, phase), rect.x * draw->scale + draw->offset_x,
+-						  rect.y * draw->scale + draw->offset_y, rect.width * draw->scale,
++	AeronDrawList_AddFill(XvtHudDraw_SelectList(draw, phase), rect.x * draw->scale_x + draw->offset_x,
++						  rect.y * draw->scale + draw->offset_y, rect.width * draw->scale_x,
+ 						  rect.height * draw->scale, rgba, AERON_BLIT2D_BLEND_PMA, NULL);
+ }
+ 
+@@ -80,9 +80,9 @@ void XvtHudDraw_TextFill(const XvtHudDraw* draw, const XvtFontAtlas* font, unsig
+ 									 .src_v0 = font->white_uv[1],
+ 									 .src_u1 = font->white_uv[0],
+ 									 .src_v1 = font->white_uv[1],
+-									 .dst_x = rect.x * draw->scale + draw->offset_x,
++									 .dst_x = rect.x * draw->scale_x + draw->offset_x,
+ 									 .dst_y = rect.y * draw->scale + draw->offset_y,
+-									 .dst_w = rect.width * draw->scale,
++									 .dst_w = rect.width * draw->scale_x,
+ 									 .dst_h = rect.height * draw->scale,
+ 									 .blend = AERON_BLIT2D_BLEND_PMA,
+ 									 .filter = AERON_BLIT2D_FILTER_LINEAR };
+@@ -118,9 +118,9 @@ static void AppendAtlasSprite(const XvtHudDraw* draw, const AeronRuntimeAtlas* a
+ 									 .src_v0 = (source->y + sy) / page->height,
+ 									 .src_u1 = (source->x + sx + width) / page->width,
+ 									 .src_v1 = (source->y + sy + height) / page->height,
+-									 .dst_x = x * draw->scale + draw->offset_x,
++									 .dst_x = x * draw->scale_x + draw->offset_x,
+ 									 .dst_y = y * draw->scale + draw->offset_y,
+-									 .dst_w = width * draw->scale,
++									 .dst_w = width * draw->scale_x,
+ 									 .dst_h = height * draw->scale,
+ 									 .tint = { 1, 1, 1, 1 },
+ 									 .blend = AERON_BLIT2D_BLEND_PMA,
+@@ -190,9 +190,9 @@ static void AppendGlyphPlane(const XvtHudDraw* draw, const XvtFontAtlas* font, u
+ 									 .src_v0 = (float)glyph->atlas_y / font->atlas.atlas_h,
+ 									 .src_u1 = (float)(glyph->atlas_x + glyph->atlas_w) / font->atlas.atlas_w,
+ 									 .src_v1 = (float)(glyph->atlas_y + glyph->atlas_h) / font->atlas.atlas_h,
+-									 .dst_x = x * draw->scale + draw->offset_x,
++									 .dst_x = x * draw->scale_x + draw->offset_x,
+ 									 .dst_y = y * draw->scale + draw->offset_y,
+-									 .dst_w = metrics->width * draw->scale,
++									 .dst_w = metrics->width * draw->scale_x,
+ 									 .dst_h = metrics->height * draw->scale,
+ 									 .blend = AERON_BLIT2D_BLEND_PMA,
+ 									 .filter = AERON_BLIT2D_FILTER_LINEAR };
+diff --git a/src/xvt_remaster/hud_draw.h b/src/xvt_remaster/hud_draw.h
+index 9d6e00f..1fdfe17 100644
+--- a/src/xvt_remaster/hud_draw.h
++++ b/src/xvt_remaster/hud_draw.h
+@@ -8,7 +8,8 @@ typedef struct XvtHudDraw {
+ 	const XvtCockpitState* state;
+ 	const XvtHudLayout* layout;
+ 	const XvtHudAssetSet* assets;
+-	float scale, offset_x, offset_y;
++	/* scale_x differs from scale only when stretched cockpit art fills the width. */
++	float scale, scale_x, offset_x, offset_y;
+ 	/* Widescreen HUD: left and right zone elements move outward by this many
+ 	 * output pixels. Zero for layouts drawn as one centered frame. */
+ 	float spread;
+diff --git a/src/xvt_remaster/hud_renderer.c b/src/xvt_remaster/hud_renderer.c
+index e355385..483bf8e 100644
+--- a/src/xvt_remaster/hud_renderer.c
++++ b/src/xvt_remaster/hud_renderer.c
+@@ -13,7 +13,7 @@ typedef struct HudPreparationKey {
+ 	unsigned marker_count;
+ 	XvtSnapTargetBox markers[XVT_SNAP_TARGET_BOXES];
+ 	int width, height;
+-	uint8_t crt_visible, hud_widescreen;
++	uint8_t crt_visible, hud_widescreen, cockpit_stretch;
+ } HudPreparationKey;
+ 
+ static AeronDrawList2D *g_before, *g_after;
+@@ -61,6 +61,7 @@ static HudPreparationKey MakePreparationKey(const XvtCockpitState* state, const
+ 	key.height = height;
+ 	key.crt_visible = crt_visible;
+ 	key.hud_widescreen = (uint8_t)XvtRemasterConfig_Effective()->hud_widescreen;
++	key.cockpit_stretch = (uint8_t)XvtRemasterConfig_Effective()->cockpit_stretch;
+ 	if (view)
+ 		key.view = *view;
+ 	key.marker_count = marker_count;
+@@ -127,6 +128,13 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 						.width = width,
+ 						.height = height };
+ 	XvtHudLayout_Fit(draw.layout, width, height, &draw.scale, &draw.offset_x, &draw.offset_y);
++	draw.scale_x = draw.scale;
++	const XvtRenderSnapshot* snapshot = XvtRenderSnapshot_Current();
++	if (view && snapshot && XvtRenderMath_CockpitStretched(&snapshot->camera) && draw.layout->source_width) {
++		/* Stretched cockpit: the artwork spans the full width at full height. */
++		draw.scale_x = (float)width / draw.layout->source_width;
++		draw.offset_x = 0;
++	}
+ 	draw.spread = SpreadFor(state, view, &draw);
+ 	int panel = PanelEnabled(state, view);
+ 	if (panel) {
+@@ -138,7 +146,7 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 	int crt_visible = state->crt.valid && crt_color;
+ 	XvtHudDraw display = XvtHudDraw_ForRect(&draw, state->crt.destination);
+ 	if (!XvtCrt_PrepareView(&state->crt, &state->definition.layout, crt_visible ? crt_color : NULL, width,
+-							height, draw.scale, display.offset_x, draw.offset_y))
++							height, draw.scale_x, draw.scale, display.offset_x, draw.offset_y))
+ 		goto failed;
+ 	HudPreparationKey key =
+ 		MakePreparationKey(state, markers, marker_count, view, width, height, crt_visible);
+diff --git a/src/xvt_remaster/preview.c b/src/xvt_remaster/preview.c
+index 09b12b6..f75cf8d 100644
+--- a/src/xvt_remaster/preview.c
++++ b/src/xvt_remaster/preview.c
+@@ -239,7 +239,11 @@ static int RenderOne(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s, const
+ 	if (!XvtRenderMath_Layout(p->camera.screen_width, p->camera.screen_height, (float)tw, (float)th, &layout))
+ 		return 0;
+ 	float scale = fminf((float)tw / p->camera.screen_width, (float)th / p->camera.screen_height);
+-	int width = crt ? (int)ceilf(p->destination.width * scale) : PREVIEW_WIDTH;
++	/* A stretched cockpit widens the display; widen its view, not its ship. */
++	float widen = crt && XvtRenderMath_CockpitStretched(&s->camera)
++					  ? ((float)tw / p->camera.screen_width) / scale
++					  : 1.0f;
++	int width = crt ? (int)ceilf(p->destination.width * scale * widen) : PREVIEW_WIDTH;
+ 	int height = crt ? (int)ceilf(p->destination.height * scale) : PREVIEW_HEIGHT;
+ 	if (!Ensure(slot, width, height))
+ 		return 0;
+@@ -256,7 +260,7 @@ static int RenderOne(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s, const
+ 		if (!object)
+ 			return 1;
+ 		XvtRenderView view;
+-		if (!XvtRenderMath_BuildView(&p->camera, p->camera.world_pos, p->destination.width,
++		if (!XvtRenderMath_BuildView(&p->camera, p->camera.world_pos, (int)(p->destination.width * widen + .5f),
+ 									 p->destination.height, &view))
+ 			return 0;
+ 		camera = view.camera;
+diff --git a/src/xvt_remaster/render_math.c b/src/xvt_remaster/render_math.c
+index 400bc1d..bfc469d 100644
+--- a/src/xvt_remaster/render_math.c
++++ b/src/xvt_remaster/render_math.c
+@@ -2,6 +2,8 @@
+ #include "aeron/asset/opt_model.h"
+ #include "aeron/scene/world.h"
+ #include "xvt_remaster/component_animation.h"
++#include "xvt_remaster/config.h"
++#include "xvt/flight/hud/hud.h"
+ #include <math.h>
+ #include <string.h>
+ 
+@@ -203,6 +205,12 @@ int XvtRenderMath_ProjectWorld(const XvtRenderView* view, const int32_t world[3]
+ 	return isfinite(*x) && isfinite(*y);
+ }
+ 
++int XvtRenderMath_CockpitStretched(const XvtSnapCamera* cam) {
++	const XvtRenderSettings* settings = XvtRemasterConfig_Effective();
++	return settings && settings->cockpit_stretch && cam && !cam->map_mode && !cam->external &&
++		   cam->hud_state != HUD_VIEW_HUD_ONLY && cam->hud_state != HUD_VIEW_FULL_SCREEN;
++}
++
+ int XvtRenderMath_BuildMainView(const XvtSnapCamera* cam, const int32_t origin[3], int width, int height,
+ 								XvtRenderView* out) {
+ 	if (!XvtRenderMath_BuildView(cam, origin, width, height, out) || cam->screen_width <= 0 ||
+@@ -215,8 +223,12 @@ int XvtRenderMath_BuildMainView(const XvtSnapCamera* cam, const int32_t origin[3
+ 	AeronSceneCamera* c = &out->camera;
+ 	c->h_half_rad = atanf(width / (2 * focal));
+ 	c->v_half_rad = atanf(height / (2 * focal * aspect));
+-	/* Map the original viewport's projection center into the fitted cockpit frame. */
+-	float cx = (width - cam->screen_width * scale) / 2 + (cam->viewport.x + cam->center_x) * scale;
++	/* Map the original viewport's projection center into the fitted cockpit
++	 * frame, or across the full width when the cockpit art is stretched. The
++	 * projection itself keeps square pixels either way. */
++	float cx = XvtRenderMath_CockpitStretched(cam)
++				   ? (cam->viewport.x + cam->center_x) * ((float)width / cam->screen_width)
++				   : (width - cam->screen_width * scale) / 2 + (cam->viewport.x + cam->center_x) * scale;
+ 	float cy = (height - cam->screen_height * scale) / 2 +
+ 			   (cam->viewport.y + cam->center_y + cam->projection_offset_y) * scale;
+ 	c->proj_x_offset = 2 * cx / width - 1;
+diff --git a/src/xvt_remaster/render_math.h b/src/xvt_remaster/render_math.h
+index 3da4914..736f6ef 100644
+--- a/src/xvt_remaster/render_math.h
++++ b/src/xvt_remaster/render_math.h
+@@ -17,6 +17,8 @@ typedef struct XvtLayoutTransform {
+ 
+ int XvtRenderMath_BuildView(const XvtSnapCamera* camera, const int32_t origin[3], int width, int height,
+ 							XvtRenderView* out);
++/* True when the stretched-cockpit option fills the width with cockpit art. */
++int XvtRenderMath_CockpitStretched(const XvtSnapCamera* camera);
+ int XvtRenderMath_BuildMainView(const XvtSnapCamera* camera, const int32_t origin[3], int width, int height,
+ 								XvtRenderView* out);
+ int XvtRenderMath_ProjectWorld(const XvtRenderView* view, const int32_t world[3], float* x, float* y,
+diff --git a/src/xvt_runtime/config/settings.c b/src/xvt_runtime/config/settings.c
+index edaa7ea..34e149f 100644
+--- a/src/xvt_runtime/config/settings.c
++++ b/src/xvt_runtime/config/settings.c
+@@ -39,6 +39,7 @@ static const XvtSettingField g_fields[] = {
+ 	SETTING_INT("render.msaa_samples", render.msaa_samples, 1, 8),
+ 	SETTING_BOOL("render.cockpit_undither", render.cockpit_undither),
+ 	SETTING_BOOL("render.hud_widescreen", render.hud_widescreen),
++	SETTING_BOOL("render.cockpit_stretch", render.cockpit_stretch),
+ 	SETTING_FLOAT("render.temporal_upscaling.sharpness", render.temporal_sharpness, 0, 1),
+ 	SETTING_BOOL("render.motion_blur.camera_blur", render.motion_blur.camera_blur),
+ 	SETTING_BOOL("render.motion_blur.pause_keep_blur", render.motion_blur.pause_keep_blur),
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index ac65809..2df6818 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -69,6 +69,8 @@ typedef struct XvtRenderSettings {
+ 	int cockpit_undither;
+ 	/* Widescreen: spread the cockpit-off HUD to the screen edges. */
+ 	int hud_widescreen;
++	/* Widescreen: stretch the cockpit art across the full width. */
++	int cockpit_stretch;
+ 	XvtSceneSettings scene;
+ 	int msaa_samples;
+ 	AeronTemporalMode temporal_mode;

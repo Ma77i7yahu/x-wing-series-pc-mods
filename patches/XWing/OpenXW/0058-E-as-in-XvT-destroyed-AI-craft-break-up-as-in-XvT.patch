@@ -1,0 +1,310 @@
+From 0396e175dbcceea76d662ce277d08ee3f56cec8f Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 11 Nov 2026 05:14:34 +1100
+Subject: [PATCH 58/59] E as in XvT; destroyed AI craft break up as in XvT
+
+E (OpenXvT flight.c FLIGHT_KEY_E): from the slot after the current target,
+wrapping, the first craft flying normally (object kind 0) with working
+systems whose AI is attacking the player (maneuver 12 or 23); none keeps
+the target.
+
+game.xvt_breakup ("Destroyed Craft", default on), XvT collide 0x41FC50:
+AI craft with a fuselage always break up (X-Wing blew a quarter up at
+once): a wing on a random side comes off and the wreck recoils half its
+deflection and tumbles 1-11 s. Craft without a fuselage tumble 8-15 s with
+a random roll direction. Hits from large craft or on a stopped craft still
+explode at once. The player's own death is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ resources/config.yaml                    |   4 +
+ src/xw/flight/object/collide.c           | 102 +++++++++++++++++++++++
+ src/xw/flight/player/user.c              |  28 +++++--
+ src/xw_app/settings/game_page.c          |   2 +
+ src/xw_runtime/config/flight_tweaks.c    |   5 ++
+ src/xw_runtime/config/flight_tweaks.h    |   5 ++
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ 9 files changed, 142 insertions(+), 8 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index a58d127..412a03c 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -313,6 +313,10 @@ game:
+   # or warheads even with the ship's shields up (as in TIE Fighter and X-Wing Alliance).
+   # A destroyed turret stops firing; the last shield generator takes the shields with it.
+   xvt_components: true
++  # Destroyed AI craft break up as in X-Wing vs TIE Fighter: fighters always lose a
++  # wing and tumble for 1-11 s before exploding (X-Wing blows some up at once);
++  # starships and freighters tumble 8-15 s.
++  xvt_breakup: true
+   # Flight messages stay up half as long (2 s instead of 4; 6 s instead of 12),
+   # never less than 1.5 s.
+   short_messages: true
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index 06afe8e..2ff0ed3 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -1645,6 +1645,8 @@ static int16_t collide_xvtionhit(CraftData* craft, uint16_t sourceObjectType) {
+ }
+ 
+ /* XvT: a player craft whose system strength is used up loses every remaining system. */
++static int16_t collide_xvtbreakup(uint16_t victimObjIdx, uint16_t sourceObjectType, int16_t playGenericImpactSound);
++
+ static void collide_xvtiondisableall(CraftData* craft) {
+ 	for (uint16_t subsystemIndex = 0; subsystemIndex < XW_PLAYER_SUBSYSTEM_COUNT; ++subsystemIndex) {
+ 		uint8_t subsystemMask = g_subsystemIdToFlag[subsystemIndex];
+@@ -1969,6 +1971,11 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		}
+ 	}
+ 	victimObjectType = g_objectTable[victimObjIdx].objectType;
++#ifdef XW_MODERN
++	if (XwFlightTweaks_XvtBreakup() && !XwFlightTypes_Dos() && victimObjIdx != g_playerFlightState.objectIndex &&
++		g_missionRuntimeState.provingGroundsActive == 0)
++		return collide_xvtbreakup(victimObjIdx, sourceObjectType, playGenericImpactSound);
++#endif
+ 	if ((uint16_t)g_modelTypeTable[victimObjectType].maxBoundsExtent > COLLIDE_CRAFT_LARGE_EXTENT) {
+ 		uint16_t craftType = g_curCraft->craftTypeIndex;
+ 		uint16_t rollRate = (math2_getrandom() & COLLIDE_TUMBLE_RANDOM_MASK) + COLLIDE_TUMBLE_MIN;
+@@ -2122,6 +2129,101 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 	return playGenericImpactSound;
+ }
+ 
++#ifdef XW_MODERN
++/* XvT ModelMesh_HasFuselage / MeshComponentType: fuselage 3, wings 2 and 20. */
++enum { COLLIDE_XVT_MESH_WING = 2, COLLIDE_XVT_MESH_FUSELAGE = 3, COLLIDE_XVT_MESH_WING_20 = 20 };
++
++/* game.xvt_breakup: XvT collide_damagecraft's destruction of a craft no player flies (0x41FC50 tail). */
++static int16_t collide_xvtbreakup(uint16_t victimObjIdx, uint16_t sourceObjectType, int16_t playGenericImpactSound) {
++	ObjectRecord* victim = &g_objectTable[victimObjIdx];
++	uint16_t victimObjectType = victim->objectType;
++	int meshCount = XwFlightTypes_ComponentCount(victimObjectType);
++	uint16_t maxTumbleAngle = g_craftTypeDefs[g_curCraft->craftTypeIndex].maxTumbleAngle;
++	bool fuselage = false;
++	for (int mesh = 0; mesh < meshCount; ++mesh)
++		if (ModelMesh_GetCachedObjectTypeMeshType(victimObjectType, mesh) == COLLIDE_XVT_MESH_FUSELAGE)
++			fuselage = true;
++	if (!fuselage) {
++		/* XvT also takes the flight group's craft explosion time when set; X-Wing missions have none. */
++		uint16_t rollRate = (math2_getrandom() & COLLIDE_TUMBLE_RANDOM_MASK) + COLLIDE_TUMBLE_MIN;
++		while (rollRate > maxTumbleAngle)
++			rollRate >>= 1;
++		if ((uint16_t)math2_getrandom() < COLLIDE_ANGLE_SIGN_BIT)
++			rollRate = (uint16_t)-(int16_t)rollRate;
++		victim->rollImpulseRate = (int16_t)rollRate;
++		victim->lifetimeTicks = XW_SIMULATION_TICKS_PER_SECOND *
++								((math2_getrandom() & COLLIDE_LARGE_LIFETIME_RANDOM_MASK) + COLLIDE_LARGE_LIFETIME_MIN);
++		g_curCraft->objectKind = XW_CRAFT_OBJECT_KIND_3;
++		return playGenericImpactSound;
++	}
++	if ((uint16_t)g_modelTypeTable[sourceObjectType].maxBoundsExtent > COLLIDE_CRAFT_LARGE_EXTENT ||
++		victim->speed == 0) {
++		victim->lifetimeTicks = 1;
++		fsfx_triggersfx(COLLIDE_CRAFT_EXPLOSION_SOUND, victimObjIdx);
++		g_curCraft->objectKind = XW_CRAFT_OBJECT_KIND_4;
++		return 0;
++	}
++	/* XvT only blows player craft up at once; every AI craft breaks up. A wing on a random side comes off. */
++	uint16_t detachedYawOffset = 0;
++	int16_t detachedRollRate = 0;
++	int side = 0;
++	if (meshCount > 1) {
++		int mesh;
++		side = math2_getrandom() & 1;
++		for (mesh = 0; mesh < meshCount; ++mesh) {
++			int type = ModelMesh_GetCachedObjectTypeMeshType(victimObjectType, mesh);
++			if (g_curCraft->componentState[mesh] == 0 &&
++				(type == COLLIDE_XVT_MESH_WING || type == COLLIDE_XVT_MESH_WING_20)) {
++				int centerX = ModelMesh_GetCenterX(victimObjectType, mesh);
++				if (side ? centerX < 0 : centerX > 0)
++					break;
++			}
++		}
++		if (mesh < meshCount) {
++			uint16_t componentObject = create_createcomponent(victimObjIdx, (char)mesh);
++			if (componentObject != XW_OBJECT_SLOT_UNAVAILABLE) {
++				int16_t wingYawOffset;
++				detachedRollRate = (int16_t)((math2_getrandom() & CREATE_DETACH_ROLL_MASK) + CREATE_DETACH_MIN_ROLL);
++				wingYawOffset = (int16_t)((math2_getrandom() & CREATE_DETACH_YAW_MASK) + COLLIDE_COMPONENT_YAW_MIN);
++				detachedYawOffset = (uint16_t)wingYawOffset;
++				if (side) {
++					wingYawOffset = (int16_t)-wingYawOffset;
++					detachedRollRate = (int16_t)-detachedRollRate;
++				}
++				g_objectTable[componentObject].rollImpulseRate = detachedRollRate;
++				g_objectTable[componentObject].yaw += wingYawOffset;
++				g_objectTable[componentObject].orientMatrixDirty = 1;
++				g_objectTable[componentObject].moveVectorDirty = 1;
++				g_objectTable[componentObject].secondaryAnimationState = XW_OBJECT_ANIMATION_BREAKUP;
++				g_curCraft->componentState[mesh] = CREATE_DETACH_STATE;
++				fsfx_triggersfx(COLLIDE_COMPONENT_DETACH_SOUND, victimObjIdx);
++				playGenericImpactSound = 0;
++			}
++		}
++	}
++	{
++		uint16_t rollRate = (math2_getrandom() & COLLIDE_TUMBLE_RANDOM_MASK) + COLLIDE_TUMBLE_MIN;
++		while (rollRate > maxTumbleAngle)
++			rollRate >>= 1;
++		if ((uint16_t)detachedRollRate < COLLIDE_ANGLE_SIGN_BIT)
++			rollRate = (uint16_t)-(int16_t)rollRate;
++		victim->rollImpulseRate = (int16_t)rollRate;
++	}
++	/* The wreck recoils half the wing's deflection, away from it. */
++	if (detachedYawOffset != 0) {
++		int16_t recoil = (int16_t)(detachedYawOffset >> 1);
++		victim->yaw += side ? recoil : (int16_t)-recoil;
++		victim->orientMatrixDirty = 1;
++		victim->moveVectorDirty = 1;
++	}
++	g_curCraft->objectKind = XW_CRAFT_OBJECT_KIND_3;
++	victim->lifetimeTicks =
++		XW_SIMULATION_TICKS_PER_SECOND * ((math2_getrandom() & 3) + (math2_getrandom() & 7) + 1);
++	g_curCraft->componentState[meshCount] = CREATE_DETACH_STATE;
++	return playGenericImpactSound;
++}
++#endif
++
+ // FUNCTION: XW 0x405190
+ void collide_makeobjectexplosion(uint16_t objectIndex, uint8_t explosionObjectType) {
+ #ifdef XW_MODERN
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index b657820..9bb63b9 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -19,6 +19,7 @@
+ #include "xw/audio/hilevel.h"
+ #include "xw/audio/lolevel.h"
+ #include "xw/flight/ai/pai.h"
++#include "xw/flight/ai/paiorder.h"
+ #include "xw/flight/death_star.h"
+ #include "xw/flight/fediskio.h"
+ #include "xw/flight/feinput.h"
+@@ -333,16 +334,29 @@ static int user_isplayerattacker(uint16_t index) {
+ 		   (craft->objectKind == XW_CRAFT_OBJECT_KIND_0 || craft->objectKind == XW_CRAFT_OBJECT_KIND_6);
+ }
+ 
++/* XvT's E (OpenXvT flight.c FLIGHT_KEY_E): from the slot after the current target, wrapping, the first craft
++ * flying normally (object kind 0: not destroyed, leaving or still arriving from hyperspace) with working
++ * systems whose AI is attacking the player (maneuver 12 or 23, the same numbers in X-Wing). XvT checks no IFF.
++ * None: the target stays. */
+ static uint16_t user_nextattacker(void) {
+-	uint16_t current = g_playerFlightState.currentTargetObjectIdx;
+-	if (!user_isplayerattacker(current))
++	if (XwFlightTypes_Dos())
+ 		return (uint16_t)user_findclosestattacker();
+-	for (uint16_t step = 1; step < XW_CRAFT_OBJECT_COUNT; ++step) {
+-		uint16_t index = (uint16_t)((current + step) % XW_CRAFT_OBJECT_COUNT);
+-		if (user_isplayerattacker(index))
+-			return index;
++	uint16_t candidate = g_playerFlightState.currentTargetObjectIdx;
++	for (uint16_t remaining = XW_CRAFT_OBJECT_COUNT; remaining != 0; --remaining) {
++		if (++candidate >= XW_CRAFT_OBJECT_COUNT)
++			candidate = 0;
++		const ObjectRecord* object = &g_objectTable[candidate];
++		if (object->objectType == XW_OBJ_NONE || candidate == g_playerFlightState.objectIndex ||
++			object->genusId == XW_GENUS_EXPLOSION_EFFECT || object->familyId != XW_OBJECT_FAMILY_CRAFT)
++			continue;
++		const CraftData* craft = object->instanceData;
++		if (!craft || craft->workingSubsystems == 0 || craft->objectKind != XW_CRAFT_OBJECT_KIND_0)
++			continue;
++		if (craft->aiTargetRef == g_playerFlightState.objectIndex &&
++			(craft->aiManeuverId == PAIORDER_MANEUVER_ATTACK || craft->aiManeuverId == PAIORDER_MANEUVER_ATTACK_ALTERNATE))
++			return candidate;
+ 	}
+-	return current;
++	return XW_PLAYER_NO_TARGET;
+ }
+ 
+ /* Leaves the target view; the caller has already pointed the camera focus back at the player. */
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index 5705f06..8cb004a 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -127,6 +127,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing", "XvT (Targetable)" }, 2);
+ 	if (XwProfile_HasMission() && draft->xvt_components != XwFlightTweaks_XvtComponents())
+ 		AeronUi_Help(ui, "Component changes apply to craft that arrive after the change.");
++	AeronUi_Selector(ui, "Destroyed Craft", &draft->xvt_breakup,
++					 (const char* const[]) { "X-Wing", "XvT (Always Break Up)" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+ 					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "Twist Roll", &draft->xwa_roll,
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 72bbfd4..9aea750 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -17,6 +17,7 @@ static bool s_xvt_engine_wash = true;
+ static bool s_ion_disable_only = true;
+ static bool s_xvt_ions = true;
+ static bool s_xvt_components = true;
++static bool s_xvt_breakup = true;
+ static bool s_short_messages = true;
+ static bool s_xvt_damage_display = true;
+ static bool s_skip_empty_warheads = true;
+@@ -50,6 +51,10 @@ bool XwFlightTweaks_XvtComponents(void) { return s_xvt_components; }
+ 
+ void XwFlightTweaks_SetXvtComponents(bool enabled) { s_xvt_components = enabled; }
+ 
++bool XwFlightTweaks_XvtBreakup(void) { return s_xvt_breakup; }
++
++void XwFlightTweaks_SetXvtBreakup(bool enabled) { s_xvt_breakup = enabled; }
++
+ bool XwFlightTweaks_XvtEngineWash(void) { return s_xvt_engine_wash; }
+ 
+ void XwFlightTweaks_SetXvtEngineWash(bool enabled) { s_xvt_engine_wash = enabled; }
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index a7a43ae..9f285af 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -86,6 +86,11 @@ void XwFlightTweaks_SetXvtIons(bool enabled);
+ /* game.xvt_components: X-Wing vs TIE Fighter's starship components (xw_runtime/runtime/xvt_components.h). */
+ bool XwFlightTweaks_XvtComponents(void);
+ void XwFlightTweaks_SetXvtComponents(bool enabled);
++/* game.xvt_breakup: destroyed AI craft break up as in X-Wing vs TIE Fighter (collide 0x41FC50): fighters
++ * always lose a wing and tumble 1-11 s (X-Wing blows a quarter of them up at once), craft without a
++ * fuselage (starships, freighters) tumble 8-15 s with a random roll direction. */
++bool XwFlightTweaks_XvtBreakup(void);
++void XwFlightTweaks_SetXvtBreakup(bool enabled);
+ /* game.short_messages: flight messages stay up half as long (2 s, 3.5 s or 6 s by kind instead of 4, 7 or
+  * 12), and never less than 1.5 s while others wait. */
+ bool XwFlightTweaks_ShortMessages(void);
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 387dfa4..872b053 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -43,6 +43,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
+ 	XwFlightTweaks_SetXvtIons(settings->xvt_ions != 0);
+ 	XwFlightTweaks_SetXvtComponents(settings->xvt_components != 0);
++	XwFlightTweaks_SetXvtBreakup(settings->xvt_breakup != 0);
+ 	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
+ 	XwFlightTweaks_SetXvtDamageDisplay(settings->xvt_damage_display != 0);
+ 	XwFlightTweaks_SetSkipEmptyWarheads(settings->skip_empty_warheads != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index fec69ab..cd945bc 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -120,6 +120,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
+ 	SETTING_BOOL("game.xvt_ions", xvt_ions),
+ 	SETTING_BOOL("game.xvt_components", xvt_components),
++	SETTING_BOOL("game.xvt_breakup", xvt_breakup),
+ 	SETTING_BOOL("game.short_messages", short_messages),
+ 	SETTING_BOOL("game.xvt_damage_display", xvt_damage_display),
+ 	SETTING_BOOL("game.skip_empty_warheads", skip_empty_warheads),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 10067c6..a363c44 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -41,7 +41,7 @@ typedef struct XwSettings {
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+ 	int short_messages, xvt_damage_display, xvt_control_sounds, skip_empty_warheads, xvt_recharge, xwa_roll;
+-	int xvt_ions, xvt_components;
++	int xvt_ions, xvt_components, xvt_breakup;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;

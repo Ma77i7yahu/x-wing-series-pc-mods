@@ -1,0 +1,543 @@
+From 9c140ba901cf94bde150c851b302196db06f9a1c Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 06:41:10 +1100
+Subject: [PATCH 04/18] XWA-style lasers and ion cannons linking for the player
+ and AI (flight.ai_ion_link, Game page option)
+
+---
+ resources/config.yaml                 |  4 ++
+ src/tie/create.c                      |  5 ++
+ src/tie/laser.c                       | 77 ++++++++++++++++++++-------
+ src/tie/laser.h                       |  9 ++++
+ src/tie/msg.c                         | 19 ++++++-
+ src/tie/msg.h                         |  4 ++
+ src/tie/paifight.c                    | 20 +++++++
+ src/tie/panel.c                       | 10 +++-
+ src/tie/user.c                        | 22 ++++++++
+ src/tie_app/application.c             |  1 +
+ src/tie_app/config/app_config.c       | 24 +++++++--
+ src/tie_app/config/app_config.h       |  2 +
+ src/tie_app/settings/flight_options.c |  5 +-
+ src/tie_app/settings/settings.c       | 10 ++++
+ src/tie_runtime/hooks/flight_tweaks.c |  9 +++-
+ src/tie_runtime/hooks/flight_tweaks.h |  6 +++
+ 16 files changed, 199 insertions(+), 28 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 86da54d..e1980b5 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -46,6 +46,10 @@ flight:
+   # X-Wing vs TIE Fighter laser cannons: faster recycling and twice the bolt
+   # speed (same range), for every craft.
+   xvt_lasers: true
++  # AI craft with lasers and ion cannons (Assault Gunboat, TIE Defender, Y-Wing,
++  # B-Wing...) fire both together, X-Wing Alliance style. Disable orders keep
++  # the original ions-only behaviour. off, friendly (Imperial side only) or all.
++  ai_ion_link: all
+   models:
+     source: original
+     smooth_angle_degrees: 90
+diff --git a/src/tie/create.c b/src/tie/create.c
+index 4c304ca..ba43d25 100644
+--- a/src/tie/create.c
++++ b/src/tie/create.c
+@@ -15,6 +15,7 @@
+ #include "tie/fscript.h"
+ #include "tie/fsfx.h"
+ #include "tie/fview.h"
++#include "tie/laser.h"
+ #include "tie/math2.h"
+ #include "tie/mission.h"
+ #include "tie/modelbounds.h"
+@@ -1041,6 +1042,10 @@ uint16_t create_createcraft(void) {
+ 	craftptr->skill_value = skilltranslate[fgskill];
+ 
+ 	/* Laser banks. */
++#ifdef TIE_MODERN
++	if (obj_slot == pstate.object_idx)
++		laser_setplayerbankslinked(false);
++#endif
+ 	craftptr->laser_group_cnt = 0;
+ 	laser_total = 0;
+ 	for (bank = 0; bank < 2; bank++) {
+diff --git a/src/tie/laser.c b/src/tie/laser.c
+index 2dfa60e..96f603f 100644
+--- a/src/tie/laser.c
++++ b/src/tie/laser.c
+@@ -474,6 +474,54 @@ void laser_chargeshields(uint16_t shooter_obj_idx, uint16_t shield_side, int16_t
+ 		shields[shield_side] = cap;
+ }
+ 
++#ifdef TIE_MODERN
++/* X-Wing Alliance style "lasers and ion cannons fire linked": one trigger fires both
++ * cannon banks, each fully linked. Entered with the link key after "fire linked";
++ * the next press goes back to single fire. Reset when the player's craft is created. */
++static bool s_player_banks_linked;
++
++bool laser_canlinkcannonbanks(const CraftData* craft) {
++	return craft && craft->laser_group_cnt >= 2 && craft->laser_type[0] && craft->laser_type[1];
++}
++
++bool laser_playerbankslinked(void) {
++	return s_player_banks_linked && !pstate.player_weapon_mode && laser_canlinkcannonbanks(pstate.player_craft);
++}
++
++void laser_setplayerbankslinked(bool linked) { s_player_banks_linked = linked; }
++#endif
++
++/* Fires one player cannon bank if its cooldown allows; force_linked fires every cannon in it. */
++static void laser_fireplayerbank(uint16_t bank, bool force_linked) {
++	int16_t cd;
++
++	cd = (int16_t)pstate.player_craft->laser_cooldown[bank];
++	if (cd) {
++		cd -= (int16_t)frameticks;
++		if (cd < 0)
++			cd = 0;
++	}
++	if (cd < (int16_t)frameticks) {
++		if (cd)
++			pstate.player_craft->laser_cooldown[bank] -= frameticks;
++		else
++			pstate.player_craft->laser_cooldown[bank] = 0;
++
++		if (pstate.player_craft->status_flags & 0x10) {
++			uint8_t saved_mode = pstate.player_craft->laser_owner_player[bank];
++			if (force_linked)
++				pstate.player_craft->laser_owner_player[bank] = 3;
++			laser_firelasersystem(pstate.object_idx, bank);
++			pstate.player_craft->laser_owner_player[bank] = saved_mode;
++			pstate.player_craft->laser_cooldown[bank] += frameticks;
++		} else {
++			argtable[0] = (uint16_t)(bank + 29);
++			argtable[1] = 25;
++			msg_messageprintf(MSG_SYSTEM_STATUS);
++		}
++	}
++}
++
+ /* ================================================================== */
+ /* laser_fireplayerweapon                                              */
+ /* ================================================================== */
+@@ -482,27 +530,16 @@ void laser_fireplayerweapon(void) {
+ 	int16_t cd;
+ 
+ 	if (!pstate.player_weapon_mode) {
+-		cd = (int16_t)pstate.player_craft->laser_cooldown[pstate.player_weapon_group];
+-		if (cd) {
+-			cd -= (int16_t)frameticks;
+-			if (cd < 0)
+-				cd = 0;
+-		}
+-		if (cd < (int16_t)frameticks) {
+-			if (cd)
+-				pstate.player_craft->laser_cooldown[pstate.player_weapon_group] -= frameticks;
+-			else
+-				pstate.player_craft->laser_cooldown[pstate.player_weapon_group] = 0;
+-
+-			if (pstate.player_craft->status_flags & 0x10) {
+-				laser_firelasersystem(pstate.object_idx, pstate.player_weapon_group);
+-				pstate.player_craft->laser_cooldown[pstate.player_weapon_group] += frameticks;
+-			} else {
+-				argtable[0] = (uint16_t)(pstate.player_weapon_group + 29);
+-				argtable[1] = 25;
+-				msg_messageprintf(MSG_SYSTEM_STATUS);
+-			}
++#ifdef TIE_MODERN
++		if (laser_playerbankslinked()) {
++			laser_fireplayerbank(pstate.player_weapon_group, true);
++			/* The cannon-system-offline message was already shown by the first bank. */
++			if (pstate.player_craft->status_flags & 0x10)
++				laser_fireplayerbank((uint16_t)(pstate.player_weapon_group ^ 1), true);
++			return;
+ 		}
++#endif
++		laser_fireplayerbank(pstate.player_weapon_group, false);
+ 	} else {
+ 		/* Missile mode. */
+ 		cd = (int16_t)pstate.player_craft->missile_state[pstate.player_weapon_group];
+diff --git a/src/tie/laser.h b/src/tie/laser.h
+index afb3e9b..42c4218 100644
+--- a/src/tie/laser.h
++++ b/src/tie/laser.h
+@@ -1,8 +1,10 @@
+ #ifndef TIE_LASER_H
+ #define TIE_LASER_H
+ 
++#include "tie/tie.h"
+ #include "tie_runtime/species_id.h"
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ #ifdef __cplusplus
+@@ -166,6 +168,13 @@ void laser_firerocketsystem(uint16_t shooter_obj_idx, uint16_t group_idx);
+  */
+ void laser_fireplayerweapon(void);
+ 
++#ifdef TIE_MODERN
++/* X-Wing Alliance style "lasers and ion cannons fire linked" for the player. */
++bool laser_canlinkcannonbanks(const CraftData* craft);
++bool laser_playerbankslinked(void);
++void laser_setplayerbankslinked(bool linked);
++#endif
++
+ /*
+  * laser_weaponsfire -- per-frame entry called by tie_doframe. Drives
+  * missile lock gauge, beam weapon drain/targeting, per-second status
+diff --git a/src/tie/msg.c b/src/tie/msg.c
+index 78b52e0..b9ffb56 100644
+--- a/src/tie/msg.c
++++ b/src/tie/msg.c
+@@ -14,6 +14,7 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ // GLOBAL: TIE95 0xC5850
+@@ -195,6 +196,17 @@ void msg_messagedisplay(void) {
+ 
+ /* --- msg_messageprintf -- */
+ 
++#ifdef TIE_MODERN
++/* Replacement text for the next msg_messageprintf call; it keeps template_id's message type. */
++static const char* s_msg_text_override;
++
++void msg_messagetext(uint16_t type_template_id, const char* text) {
++	s_msg_text_override = text;
++	msg_messageprintf(type_template_id);
++	s_msg_text_override = NULL;
++}
++#endif
++
+ // FUNCTION: TIE95 0x330CC
+ void msg_messageprintf(uint16_t template_id) {
+ 	/* Retail queue and history share this record. */
+@@ -221,7 +233,12 @@ void msg_messageprintf(uint16_t template_id) {
+ 
+ 	/* Walk the template string, expanding '*' and '&N' opcodes into body[]. */
+ #ifdef TIE_MODERN
+-	if (template_id == MSG_PAUSED)
++	char override_tpl[72];
++	if (s_msg_text_override) {
++		override_tpl[0] = messagetable[template_id][0];
++		snprintf(override_tpl + 1, sizeof override_tpl - 1, "%s", s_msg_text_override);
++		tpl = (const uint8_t*)override_tpl;
++	} else if (template_id == MSG_PAUSED)
+ 		tpl = (const uint8_t*)"\006Mission paused. Press your pause key or button to continue.";
+ 	else
+ #endif
+diff --git a/src/tie/msg.h b/src/tie/msg.h
+index 2c0ca8d..dcff8cf 100644
+--- a/src/tie/msg.h
++++ b/src/tie/msg.h
+@@ -50,6 +50,10 @@ void msg_messagedisplay(void);
+  * (messagecnt++). For msg_type in {1, 2} (radio/event) and when not in
+  * replay view, also append to messagehistory ring. */
+ void msg_messageprintf(uint16_t template_id);
++#ifdef TIE_MODERN
++/* msg_messageprintf with custom text in place of the template body; keeps the template's type. */
++void msg_messagetext(uint16_t type_template_id, const char* text);
++#endif
+ 
+ /* Shift messagequeue[0..messagecnt] to [1..messagecnt+1], bump messagecnt.
+  * No-op when the current slot has age != 0 or display_count >= 2. */
+diff --git a/src/tie/paifight.c b/src/tie/paifight.c
+index 2ee565f..aea1d86 100644
+--- a/src/tie/paifight.c
++++ b/src/tie/paifight.c
+@@ -12,7 +12,9 @@
+ #include "tie/shipext.h"
+ #include "tie/tie.h"
+ #include "tie/trig2.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ 
++#include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+@@ -56,6 +58,20 @@ int32_t shooterz;
+ // GLOBAL: TIE98 0x5FCE30
+ uint8_t escortfg;
+ 
++#ifdef TIE_MODERN
++/* XWA-style: the active AI craft fires its ion cannons with its lasers
++ * (flight.ai_ion_link). Disable orders (19) keep the original ions only. */
++static bool paifight_ionlinkwithlasers(void) {
++	int mode = TieFlightTweaks_AiIonLink();
++	if (mode == TIE_AI_ION_LINK_OFF)
++		return false;
++	if (mode == TIE_AI_ION_LINK_FRIENDLY)
++		return pstate.object_idx < NUM_OBJECTS &&
++			   objects[ai.active_obj_idx].side == objects[pstate.object_idx].side;
++	return true;
++}
++#endif
++
+ // FUNCTION: TIE95 0x36A90
+ int16_t paifight_scanfortargetorder(void) {
+ 	/* Plan slot 9 -- target-acquire step. Bails when the craft's mode
+@@ -654,6 +670,10 @@ int16_t paifight_fightershootorder(void) {
+ 						owner_val = 0;
+ 				} else if (order_ldr == 19)
+ 					owner_val = burst_tier;
++#ifdef TIE_MODERN
++				else if (paifight_ionlinkwithlasers())
++					owner_val = burst_tier;
++#endif
+ 				else
+ 					owner_val = 0;
+ 			} else
+diff --git a/src/tie/panel.c b/src/tie/panel.c
+index 665ae66..813c9a3 100644
+--- a/src/tie/panel.c
++++ b/src/tie/panel.c
+@@ -1496,8 +1496,16 @@ void panel_updatelasers(void) {
+ 		if (charge <= 0 || !(pstate.player_craft->status_flags & 0x10)) {
+ 			status = 0;
+ 			lever = 0;
+-		} else if (!pstate.player_weapon_mode && pstate.player_weapon_group == bank) {
++		} else if (!pstate.player_weapon_mode && (pstate.player_weapon_group == bank
++#ifdef TIE_MODERN
++												   || laser_playerbankslinked()
++#endif
++														   )) {
++#ifdef TIE_MODERN
++			switch (laser_playerbankslinked() ? 3 : pstate.player_craft->laser_owner_player[bank]) {
++#else
+ 			switch (pstate.player_craft->laser_owner_player[bank]) {
++#endif
+ 				case 3:
+ 					status = 3;
+ 					break;
+diff --git a/src/tie/user.c b/src/tie/user.c
+index 8565523..b1ab1c4 100644
+--- a/src/tie/user.c
++++ b/src/tie/user.c
+@@ -1166,6 +1166,28 @@ void user_inputforplane(void) {
+ #ifdef TIE_MODERN
+ 				/* PORT: an unknown warhead type leaves this unset in the original. */
+ 				warhead_msg = 0;
++				/* XWA-style cycle: ... -> fire linked -> lasers and ion cannons linked -> single fire. */
++				if (!pstate.player_weapon_mode && laser_playerbankslinked()) {
++					laser_setplayerbankslinked(false);
++					pstate.player_craft->laser_owner_player[pstate.player_weapon_group] = 1;
++					pstate.player_craft->laser_first_slot[pstate.player_weapon_group] =
++						spec_data[pstate.player_spec_num].laser_start[pstate.player_weapon_group];
++					msg_messageprintf(MSG_CANNON_SINGLE);
++					fsfx_triggersfx(0x21u, 0xFFFF);
++					break;
++				}
++				if (!pstate.player_weapon_mode && laser_canlinkcannonbanks(pstate.player_craft) &&
++					(spec_data[pstate.player_spec_num].laser_count[pstate.player_weapon_group] == 1 ||
++					 pstate.player_craft->laser_owner_player[pstate.player_weapon_group] == 3)) {
++					bool has_ions = pstate.player_craft->laser_type[0] == 141 ||
++									pstate.player_craft->laser_type[1] == 141;
++					laser_setplayerbankslinked(true);
++					pstate.player_craft->laser_owner_player[pstate.player_weapon_group] = 3;
++					msg_messagetext(MSG_CANNON_LINKED,
++									has_ions ? "Lasers and ion cannons [fire linked" : "All cannons [fire linked");
++					fsfx_triggersfx(0x21u, 0xFFFF);
++					break;
++				}
+ #endif
+ 				if (!pstate.player_weapon_mode) {
+ 					if (spec_data[pstate.player_spec_num].laser_count[pstate.player_weapon_group] != 1) {
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index 6aaab82..0b3e8a7 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -186,6 +186,7 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieFlightTweaks_SetWidescreenHud(app_config.requested.widescreen_hud);
+ 		TieFlightTweaks_SetLaserConvergenceMetres(app_config.requested.laser_convergence_m);
+ 		TieFlightTweaks_SetXvtLasers(app_config.requested.xvt_lasers);
++		TieFlightTweaks_SetAiIonLink(app_config.requested.ai_ion_link);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index 5f139c5..122ea2e 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -1,6 +1,7 @@
+ #include "tie_app/config/app_config.h"
+ #include "tie_app/config/controller_config.h"
+ #include "tie_app/config/keyboard_config.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ 
+ #include "aeron/log.h"
+ 
+@@ -182,7 +183,7 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+ 				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
+-				  "laser_convergence", "xvt_lasers", "models");
++				  "laser_convergence", "xvt_lasers", "ai_ion_link", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -541,6 +542,17 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 							  capacity) ||
+ 		!TieAppConfig_ReadBool(document, "flight.xvt_lasers", &out->xvt_lasers, error, capacity))
+ 		return false;
++	const char* ai_ion_link = AeronConfigFile_GetString(document, "flight.ai_ion_link", NULL);
++	if (!ai_ion_link)
++		return TieAppConfig_ConfigError(error, capacity, "missing flight.ai_ion_link");
++	if (strcmp(ai_ion_link, "off") == 0)
++		out->ai_ion_link = TIE_AI_ION_LINK_OFF;
++	else if (strcmp(ai_ion_link, "friendly") == 0)
++		out->ai_ion_link = TIE_AI_ION_LINK_FRIENDLY;
++	else if (strcmp(ai_ion_link, "all") == 0)
++		out->ai_ion_link = TIE_AI_ION_LINK_ALL;
++	else
++		return TieAppConfig_ConfigError(error, capacity, "invalid flight.ai_ion_link '%s'", ai_ion_link);
+ 	const char* mouse_mode = AeronConfigFile_GetString(document, "input.mouse_mode", NULL);
+ 	if (!mouse_mode)
+ 		return TieAppConfig_ConfigError(error, capacity, "missing input.mouse_mode");
+@@ -777,6 +789,7 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.widescreen_hud = config->widescreen_hud,
+ 		.laser_convergence_m = config->laser_convergence_m,
+ 		.xvt_lasers = config->xvt_lasers,
++		.ai_ion_link = config->ai_ion_link,
+ 	};
+ }
+ 
+@@ -816,7 +829,7 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		 options->update_rate != TIE_FLIGHT_UPDATE_RATE_TIE95 &&
+ 		 options->update_rate != TIE_FLIGHT_UPDATE_RATE_UNLOCKED) ||
+ 		(unsigned int)options->player_engine_sound_volume_percent > 100u ||
+-		(unsigned int)options->laser_convergence_m > 5000u)
++		(unsigned int)options->laser_convergence_m > 5000u || (unsigned int)options->ai_ion_link > 2u)
+ 		return TieAppConfig_ConfigError(error, capacity, "invalid live flight settings");
+ 	if (!AeronConfigFile_Clone(state->user_document, &candidate, &aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "frontend.aspect_correct_legacy_scenes",
+@@ -839,7 +852,12 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		!AeronConfigFile_SetBool(candidate, "flight.widescreen_hud", options->widescreen_hud, &aeron_error) ||
+ 		!AeronConfigFile_SetInt(candidate, "flight.laser_convergence", options->laser_convergence_m,
+ 								&aeron_error) ||
+-		!AeronConfigFile_SetBool(candidate, "flight.xvt_lasers", options->xvt_lasers, &aeron_error)) {
++		!AeronConfigFile_SetBool(candidate, "flight.xvt_lasers", options->xvt_lasers, &aeron_error) ||
++		!AeronConfigFile_SetString(candidate, "flight.ai_ion_link",
++								   options->ai_ion_link == TIE_AI_ION_LINK_OFF		  ? "off"
++								   : options->ai_ion_link == TIE_AI_ION_LINK_FRIENDLY ? "friendly"
++																					  : "all",
++								   &aeron_error)) {
+ 		AeronConfigFile_Destroy(candidate);
+ 		return TieAppConfig_LogAeronError(&aeron_error, error, capacity);
+ 	}
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index c110445..03af222 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -52,6 +52,7 @@ typedef struct TieAppLiveFlightOptions {
+ 	bool widescreen_hud;
+ 	int laser_convergence_m; /* 0 fires parallel */
+ 	bool xvt_lasers;
++	int ai_ion_link; /* TIE_AI_ION_LINK_* */
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -96,6 +97,7 @@ typedef struct TieAppConfig {
+ 	bool widescreen_hud;
+ 	int laser_convergence_m;
+ 	bool xvt_lasers;
++	int ai_ion_link;
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index 08649c8..83261ca 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -20,7 +20,7 @@ static bool TieFlightOptions_FlightOptionsValid(const TieAppLiveFlightOptions* o
+ 			options->update_rate == TIE_FLIGHT_UPDATE_RATE_TIE95 ||
+ 			options->update_rate == TIE_FLIGHT_UPDATE_RATE_UNLOCKED) &&
+ 		   (unsigned int)options->player_engine_sound_volume_percent <= 100u &&
+-		   (unsigned int)options->laser_convergence_m <= 5000u;
++		   (unsigned int)options->laser_convergence_m <= 5000u && (unsigned int)options->ai_ion_link <= 2u;
+ }
+ 
+ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* left,
+@@ -32,7 +32,8 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->player_engine_sound_volume_percent == right->player_engine_sound_volume_percent &&
+ 		   left->widescreen == right->widescreen && left->cockpit_stretch == right->cockpit_stretch &&
+ 		   left->widescreen_hud == right->widescreen_hud &&
+-		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers;
++		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers &&
++		   left->ai_ion_link == right->ai_ion_link;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index 7942773..f4ec8c9 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -183,6 +183,7 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 	TieFlightTweaks_SetWidescreenHud(requested->widescreen_hud);
+ 	TieFlightTweaks_SetLaserConvergenceMetres(requested->laser_convergence_m);
+ 	TieFlightTweaks_SetXvtLasers(requested->xvt_lasers);
++	TieFlightTweaks_SetAiIonLink(requested->ai_ion_link);
+ 	return true;
+ }
+ 
+@@ -788,6 +789,15 @@ static void TieSettings_GamePage(AeronUiContext* ui) {
+ 		tweaks.xvt_lasers = laser_style != 0;
+ 		TieSettings_SetFlightTweaks(&tweaks);
+ 	}
++	static const char* const ion_link_labels[] = { "Off", "Friendly Only", "All Craft" };
++	int ion_link = tweaks.ai_ion_link;
++	if (AeronUi_Selector(ui, "AI Laser & Ion Linking", &ion_link, ion_link_labels, 3)) {
++		tweaks.ai_ion_link = ion_link;
++		TieSettings_SetFlightTweaks(&tweaks);
++	}
++	AeronUi_Help(ui, ion_link == TIE_AI_ION_LINK_OFF
++						 ? "Original: AI craft fire lasers, and ion cannons only on disable orders."
++						 : "AI Gunboats, Defenders, Y-Wings, B-Wings etc. fire ions with lasers (ions only to disable).");
+ }
+ 
+ /* Follows OpenXW's mouse page with TIE's button behavior. */
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+index ec2bcf9..c19e188 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.c
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -4,6 +4,7 @@ static bool s_cockpit_stretch = true;
+ static bool s_widescreen_hud = true;
+ static int s_laser_convergence_m = 550;
+ static bool s_xvt_lasers = true;
++static int s_ai_ion_link = TIE_AI_ION_LINK_ALL;
+ 
+ bool TieFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
+ 
+@@ -19,4 +20,10 @@ void TieFlightTweaks_SetLaserConvergenceMetres(int metres) { s_laser_convergence
+ 
+ bool TieFlightTweaks_XvtLasers(void) { return s_xvt_lasers; }
+ 
+-void TieFlightTweaks_SetXvtLasers(bool enabled) { s_xvt_lasers = enabled; }
+\ No newline at end of file
++void TieFlightTweaks_SetXvtLasers(bool enabled) { s_xvt_lasers = enabled; }
++
++int TieFlightTweaks_AiIonLink(void) { return s_ai_ion_link; }
++
++void TieFlightTweaks_SetAiIonLink(int mode) {
++	s_ai_ion_link = mode < TIE_AI_ION_LINK_OFF || mode > TIE_AI_ION_LINK_ALL ? TIE_AI_ION_LINK_OFF : mode;
++}
+\ No newline at end of file
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+index 2693041..c65dd9b 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.h
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -22,5 +22,11 @@ void TieFlightTweaks_SetLaserConvergenceMetres(int metres);
+  * the speed for half the lifetime (same range). Applies to every craft. */
+ bool TieFlightTweaks_XvtLasers(void);
+ void TieFlightTweaks_SetXvtLasers(bool enabled);
++/* ai_ion_link (flight.ai_ion_link): AI craft with lasers and ion cannons fire
++ * both together, X-Wing Alliance style. Disable orders keep ions only.
++ * TIE_AI_ION_LINK_OFF / _FRIENDLY (Imperial side only) / _ALL. */
++enum { TIE_AI_ION_LINK_OFF = 0, TIE_AI_ION_LINK_FRIENDLY = 1, TIE_AI_ION_LINK_ALL = 2 };
++int TieFlightTweaks_AiIonLink(void);
++void TieFlightTweaks_SetAiIonLink(int mode);
+ 
+ #endif

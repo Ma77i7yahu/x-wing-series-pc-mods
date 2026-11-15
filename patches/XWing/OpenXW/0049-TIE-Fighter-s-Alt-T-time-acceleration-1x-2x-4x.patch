@@ -1,0 +1,204 @@
+From 9a326f50fb88ffd83fb19c536be5fb292227d4a9 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 07:32:51 +1100
+Subject: [PATCH 49/59] TIE Fighter's Alt+T time acceleration (1x/2x/4x)
+
+Live flight renders one frame in every 2 or 4 and runs the others back to
+back (flight_sim returns CONTINUE so the host does not present or wait).
+Reset to 1x when the player craft is created. Not recorded in films.
+---
+ resources/config.yaml                 |  3 +++
+ src/xw/flight/object/create.c         |  2 ++
+ src/xw/flight/player/user.h           |  2 ++
+ src/xw_runtime/input/actions.c        |  2 ++
+ src/xw_runtime/input/actions.h        |  1 +
+ src/xw_runtime/runtime/flight_frame.c | 32 ++++++++++++++++++++++++++-
+ src/xw_runtime/runtime/flight_frame.h |  7 ++++++
+ src/xw_runtime/runtime/flight_input.c | 11 +++++++++
+ src/xw_runtime/runtime/flight_sim.c   |  4 ++++
+ 9 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index c438339..7c83f84 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -230,6 +230,9 @@ input:
+       - {key: "M", modifiers: [alt]}
+     toggle_sound:
+       - {key: "S", modifiers: [alt]}
++    # TIE Fighter's time acceleration: 1x, 2x, 4x.
++    cycle_time_acceleration:
++      - {key: "T", modifiers: [alt]}
+   controllers: []
+   gamepad_defaults:
+     axes:
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index fe8649b..c8872ea 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -15,6 +15,7 @@
+ #include "xw_dos94/assets/models.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
++#include "xw_runtime/runtime/flight_frame.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/runtime/port.h"
+ #endif
+@@ -3894,6 +3895,7 @@ void create_createmission(void) {
+ #ifdef XW_MODERN
+ 	user_closecraftlist();
+ 	user_closedamagedisplay();
++	XwFlightFrame_ResetTimeAcceleration();
+ #endif
+ 	g_hyperspaceflag = 0;
+ 	g_hyperspaceAbortAndCollisionsAllowed = 1;
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index b79e3df..3fa581b 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -58,6 +58,8 @@ enum {
+ 	USER_KEY_DAMAGE_DISPLAY = 239,
+ 	/* Modern addition: X-Wing vs TIE Fighter's Shift+' transfers all laser energy to the shields. */
+ 	USER_KEY_ALL_LASERS_TO_SHIELDS = 240,
++	/* Modern addition: TIE Fighter's Alt+T time acceleration (1x, 2x, 4x). Handled before recording. */
++	USER_KEY_TIME_ACCELERATION = 241,
+ };
+ 
+ #ifdef XW_MODERN
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index 828ca28..e956bea 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -105,6 +105,8 @@ static const struct {
+ 	{ "frame_rate", "Frame rate display", XW_INPUT_ACTION_CATEGORY_SYSTEM, 0 },
+ 	{ "toggle_music", "Toggle music", XW_INPUT_ACTION_CATEGORY_SYSTEM, 140 },
+ 	{ "toggle_sound", "Toggle sound effects", XW_INPUT_ACTION_CATEGORY_SYSTEM, 146 },
++	/* Not in X-Wing: TIE Fighter's Alt+T (USER_KEY_TIME_ACCELERATION). */
++	{ "cycle_time_acceleration", "Cycle time acceleration", XW_INPUT_ACTION_CATEGORY_SYSTEM, 241 },
+ };
+ 
+ XwInputAction XwInputActions_FromName(const char* name) {
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index dc114a4..5743603 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -96,6 +96,7 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_FRAME_RATE,
+ 	XW_INPUT_ACTION_TOGGLE_MUSIC,
+ 	XW_INPUT_ACTION_TOGGLE_SOUND,
++	XW_INPUT_ACTION_TIME_ACCELERATION,
+ 	XW_INPUT_ACTION_COUNT
+ } XwInputAction;
+ 
+diff --git a/src/xw_runtime/runtime/flight_frame.c b/src/xw_runtime/runtime/flight_frame.c
+index acbac02..1281d2e 100644
+--- a/src/xw_runtime/runtime/flight_frame.c
++++ b/src/xw_runtime/runtime/flight_frame.c
+@@ -39,6 +39,36 @@
+ 
+ static XwFlightFrame s_frame;
+ static XwFlightFrame* s_inputFrame = &s_frame;
++/* TIE Fighter's acceleratedtimesetting / acceleratedtimectr. */
++static unsigned s_timeAcceleration = 1, s_timeAccelerationCounter;
++
++unsigned XwFlightFrame_CycleTimeAcceleration(void) {
++	s_timeAcceleration *= 2;
++	if (s_timeAcceleration > 4)
++		s_timeAcceleration = 1;
++	s_timeAccelerationCounter = 0;
++	return s_timeAcceleration;
++}
++
++void XwFlightFrame_ResetTimeAcceleration(void) { s_timeAcceleration = 1, s_timeAccelerationCounter = 0; }
++
++int XwFlightFrame_SkippedRender(const XwFlightFrame* frame) {
++	return frame->phase == XW_FRAME_IDLE && !frame->rendered && s_timeAcceleration > 1 && g_replayviewmode == 0 &&
++		   g_missionRuntimeState.flightExitRequested == 0;
++}
++
++/* As TIE Fighter: render once per setting, and let the skipped frames' time carry the next step at once. */
++static int TimeAccelerationSkipsRender(void) {
++	if (s_timeAcceleration <= 1)
++		return 0;
++	if (s_timeAccelerationCounter == 0) {
++		s_timeAccelerationCounter = s_timeAcceleration - 1;
++		return 0;
++	}
++	--s_timeAccelerationCounter;
++	g_flightAccumulatedTicks += g_elapsedTicks;
++	return 1;
++}
+ 
+ static int FrameQuitRequested(void) {
+ 	if (!g_quitRequested)
+@@ -194,7 +224,7 @@ int XwFlightFrame_TickState(XwFlightFrame* frame) {
+ 				XwFlightMode_UpdateScreen();
+ 				frame->rendered = 1;
+ 			}
+-		} else {
++		} else if (!TimeAccelerationSkipsRender()) {
+ 			XwFlightMode_UpdateScreen();
+ 			frame->rendered = 1;
+ 			if (FrameQuitRequested())
+diff --git a/src/xw_runtime/runtime/flight_frame.h b/src/xw_runtime/runtime/flight_frame.h
+index b0b0d76..c960117 100644
+--- a/src/xw_runtime/runtime/flight_frame.h
++++ b/src/xw_runtime/runtime/flight_frame.h
+@@ -40,6 +40,13 @@ void XwFlightFrame_UpdateInput(void);
+ /* Cancel only after clearing child tasks and cancelling the input owner. */
+ void XwFlightFrame_Cancel(void);
+ 
++/* Not in X-Wing: TIE Fighter's Alt+T time acceleration. Cycles 1x -> 2x -> 4x -> 1x and returns the new
++ * setting. Live flight renders one frame in every setting and runs the others back to back. */
++unsigned XwFlightFrame_CycleTimeAcceleration(void);
++void XwFlightFrame_ResetTimeAcceleration(void);
++/* The finished frame was simulated without a render; its owner should run the next one at once. */
++int XwFlightFrame_SkippedRender(const XwFlightFrame* frame);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xw_runtime/runtime/flight_input.c b/src/xw_runtime/runtime/flight_input.c
+index a18fce5..1ee283d 100644
+--- a/src/xw_runtime/runtime/flight_input.c
++++ b/src/xw_runtime/runtime/flight_input.c
+@@ -277,6 +277,17 @@ int XwFlightInput_Tick(XwFlightInput* state) {
+ 				case USER_KEY_VERSION:
+ 					msg_messageprintf(XW_MSG_VERSION_BANNER);
+ 					break;
++				case USER_KEY_TIME_ACCELERATION: {
++					/* TIE Fighter's Alt+T. Live only, so films neither record nor replay it. */
++					static const char* const kText[] = { "\005Time is normal",
++														 "\005Time accelerated to \0072X\005 normal time",
++														 "\005Time accelerated to \0074X\005 normal time" };
++					unsigned setting = XwFlightFrame_CycleTimeAcceleration();
++					msg_messagetext(XW_MSG_MISSION_RESUMED, kText[setting / 2]);
++					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					g_currentActionKey = 0;
++					break;
++				}
+ 				default:
+ 					break;
+ 			}
+diff --git a/src/xw_runtime/runtime/flight_sim.c b/src/xw_runtime/runtime/flight_sim.c
+index 7295cb3..f655369 100644
+--- a/src/xw_runtime/runtime/flight_sim.c
++++ b/src/xw_runtime/runtime/flight_sim.c
+@@ -609,6 +609,8 @@ static LandruTaskStepResult sim_step(void* self) {
+ 				return LANDRU_TASK_STEP_YIELD;
+ 			if (XwFlightLoading_Active())
+ 				sim_prepare_renderer(state, state->phase);
++			else if (XwFlightFrame_SkippedRender(&state->frame))
++				return LANDRU_TASK_STEP_CONTINUE;
+ 			return LANDRU_TASK_STEP_FRAME_COMPLETE;
+ 		}
+ 		sim_hyperspace_end(state);
+@@ -646,6 +648,8 @@ static LandruTaskStepResult sim_step(void* self) {
+ 				return LANDRU_TASK_STEP_YIELD;
+ 			if (XwFlightLoading_Active())
+ 				sim_prepare_renderer(state, state->phase);
++			else if (XwFlightFrame_SkippedRender(&state->frame))
++				return LANDRU_TASK_STEP_CONTINUE;
+ 			return LANDRU_TASK_STEP_FRAME_COMPLETE;
+ 		}
+ 		state->phase = SIM_POST_FLIGHT;

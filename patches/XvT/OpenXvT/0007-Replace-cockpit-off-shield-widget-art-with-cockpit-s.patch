@@ -1,0 +1,386 @@
+From 0e468376c16b769fdc647d83025ae1fe495b64c2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:38:06 +1100
+Subject: [PATCH 07/25] Replace cockpit-off shield widget art with cockpit
+ shield arcs, keeping percentages
+
+---
+ src/xvt_remaster/hud_assets.c      | 60 +++++++++++++++++++++-----
+ src/xvt_remaster/hud_assets.h      |  3 +-
+ src/xvt_remaster/hud_draw.c        | 11 +++--
+ src/xvt_remaster/hud_draw.h        |  5 +++
+ src/xvt_remaster/hud_instruments.c | 67 +++++++++++++++++++++++++++++-
+ src/xvt_remaster/hud_instruments.h |  3 ++
+ src/xvt_remaster/hud_layout.c      | 19 ++++++++-
+ src/xvt_remaster/hud_layout.h      |  9 +++-
+ src/xvt_remaster/hud_panes.c       | 16 ++++++-
+ src/xvt_remaster/hud_renderer.c    |  1 +
+ 10 files changed, 172 insertions(+), 22 deletions(-)
+
+diff --git a/src/xvt_remaster/hud_assets.c b/src/xvt_remaster/hud_assets.c
+index c2d029d..74b59a0 100644
+--- a/src/xvt_remaster/hud_assets.c
++++ b/src/xvt_remaster/hud_assets.c
+@@ -37,8 +37,8 @@ static void ReleaseGroup(CockpitAssetGroup* group) {
+ 			g_current = NULL;
+ 		if (group->owns_base[view]) {
+ 			Aeron_RuntimeAtlasRelease(&set->base);
+-			for (unsigned zone = 0; zone < XVT_HUD_ZONE_COUNT; ++zone)
+-				Aeron_ImageFreeCoverage(&set->base_coverage[zone]);
++			for (unsigned frame = 0; frame < XVT_HUD_BASE_FRAMES; ++frame)
++				Aeron_ImageFreeCoverage(&set->base_coverage[frame]);
+ 			free(set->base_zones);
+ 		}
+ 		free(set);
+@@ -275,7 +275,7 @@ static int CompareElementArea(const void* a, const void* b) {
+  * text inside frames), the rest are placed by which third holds their center.
+  * owner receives each pixel's zone + 1 and regions each element box's zone + 1. */
+ static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t* owner, uint8_t* regions,
+-						   int16_t* console_top) {
++						   int16_t* console_top, int widget_x, int widget_y, uint8_t* widget_zone) {
+ 	size_t pixels = (size_t)width * height;
+ 	int32_t* labels = calloc(pixels, sizeof *labels);
+ 	int32_t* stack = malloc(pixels * sizeof *stack);
+@@ -351,6 +351,39 @@ static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t*
+ 					element->top * 2 > height && (!*console_top || element->top < *console_top))
+ 					*console_top = (int16_t)element->top;
+ 			}
++			/* The shield widget is the largest modest element boxing the hull
++			 * icon, plus smaller same-zone elements touching it (its readout
++			 * frames). Its pixels move to their own frame. */
++			const BaseElement* widget = NULL;
++			long long widget_area = 0;
++			for (unsigned index = 0; widget_x >= 0 && index < count; ++index) {
++				const BaseElement* element = &elements[index];
++				long long area = (long long)(element->right - element->left + 1) * (element->bottom - element->top + 1);
++				if (widget_x >= element->left && widget_x <= element->right && widget_y >= element->top &&
++					widget_y <= element->bottom && area * 16 < (long long)pixels && area > widget_area) {
++					widget = element;
++					widget_area = area;
++				}
++			}
++			if (widget) {
++				int left = widget->left - 3, top = widget->top - 3, right = widget->right + 3,
++					bottom = widget->bottom + 3;
++				uint8_t zone = widget->zone;
++				*widget_zone = (uint8_t)(zone - 1);
++				uint8_t* member = calloc(count + 1, 1);
++				ok = member != NULL;
++				for (unsigned index = 0; ok && index < count; ++index) {
++					const BaseElement* element = &elements[index];
++					long long area =
++						(long long)(element->right - element->left + 1) * (element->bottom - element->top + 1);
++					member[index + 1] = element->zone == zone && area <= widget_area && element->left <= right &&
++										element->right >= left && element->top <= bottom && element->bottom >= top;
++				}
++				for (size_t pixel = 0; ok && pixel < pixels; ++pixel)
++					if (member[labels[pixel]])
++						owner[pixel] = XVT_HUD_BASE_WIDGET + 1;
++				free(member);
++			}
+ 		} else if (ok)
+ 			memset(owner, 0, pixels);
+ 		free(order);
+@@ -362,7 +395,8 @@ static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t*
+ 	return ok;
+ }
+ 
+-static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
++/* widget_x/y (or -1) is a point on the cockpit-off shield widget's hull icon. */
++static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set, int widget_x, int widget_y) {
+ 	if (!set->base_asset_id)
+ 		return 1;
+ 	const XvtOriginal2d* source = XvtRemasterAssets_FindDecodedImage(set->base_asset_id);
+@@ -387,12 +421,13 @@ static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
+ 	options.debug_name = "xvt.cockpit.base";
+ 	size_t pixels = (size_t)bitmap.width * bitmap.height;
+ 	uint8_t* owner = rgba ? malloc(pixels) : NULL;
+-	uint8_t* zoned = owner ? malloc(pixels * 4 * XVT_HUD_ZONE_COUNT) : NULL;
++	uint8_t* zoned = owner ? malloc(pixels * 4 * XVT_HUD_BASE_FRAMES) : NULL;
+ 	set->base_zones = zoned ? calloc(pixels, 1) : NULL;
+-	int ok = set->base_zones && AssignBaseZones(rgba, bitmap.width, bitmap.height, owner, set->base_zones,
+-												&set->base_console_top);
+-	AeronRuntimeAtlasFrame frames[XVT_HUD_ZONE_COUNT];
+-	for (unsigned zone = 0; ok && zone < XVT_HUD_ZONE_COUNT; ++zone) {
++	int ok = set->base_zones &&
++			 AssignBaseZones(rgba, bitmap.width, bitmap.height, owner, set->base_zones, &set->base_console_top,
++							 widget_x, widget_y, &set->base_widget_zone);
++	AeronRuntimeAtlasFrame frames[XVT_HUD_BASE_FRAMES];
++	for (unsigned zone = 0; ok && zone < XVT_HUD_BASE_FRAMES; ++zone) {
+ 		uint8_t* frame = zoned + pixels * 4 * zone;
+ 		for (size_t pixel = 0; pixel < pixels; ++pixel) {
+ 			if (owner[pixel] == zone + 1)
+@@ -405,7 +440,7 @@ static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
+ 	}
+ 	set->base_zones_width = (uint16_t)bitmap.width;
+ 	set->base_zones_height = (uint16_t)bitmap.height;
+-	ok = ok && Aeron_RuntimeAtlasBuild(&set->base, cmd, frames, XVT_HUD_ZONE_COUNT, &options);
++	ok = ok && Aeron_RuntimeAtlasBuild(&set->base, cmd, frames, XVT_HUD_BASE_FRAMES, &options);
+ 	free(zoned);
+ 	free(owner);
+ 	free(rgba);
+@@ -521,9 +556,12 @@ int XvtHudAssets_PrepareResources(AeronCommandBuffer* cmd, const XvtCockpitResou
+ 			set->base_zones_width = shared->base_zones_width;
+ 			set->base_zones_height = shared->base_zones_height;
+ 			set->base_console_top = shared->base_console_top;
++			set->base_widget_zone = shared->base_widget_zone;
+ 		} else {
+ 			g_pending->owns_base[view] = 1;
+-			if (!BuildBase(cmd, set)) {
++			const XvtHudSpriteBinding* hull = &layout->sprites[XVT_HUD_HULL];
++			int widget = view == HUD_VIEW_HUD_ONLY && hull->part_count;
++			if (!BuildBase(cmd, set, widget ? hull->x + 4 : -1, widget ? hull->y + 4 : -1)) {
+ 				ok = 0;
+ 				break;
+ 			}
+diff --git a/src/xvt_remaster/hud_assets.h b/src/xvt_remaster/hud_assets.h
+index c4708f0..dc926ce 100644
+--- a/src/xvt_remaster/hud_assets.h
++++ b/src/xvt_remaster/hud_assets.h
+@@ -15,7 +15,8 @@ typedef struct XvtHudAssetSet {
+ 	AeronRuntimeAtlas base, parts;
+ 	/* The base artwork is split into left, center and right atlas frames by
+ 	 * connected element, so widescreen layouts can move each side as a unit. */
+-	AeronImageCoverage base_coverage[XVT_HUD_ZONE_COUNT];
++	AeronImageCoverage base_coverage[XVT_HUD_BASE_FRAMES];
++	uint8_t base_widget_zone;
+ 	/* Per-pixel zone (0 = unassigned) covering each element's bounding box. */
+ 	uint8_t* base_zones;
+ 	uint16_t base_zones_width, base_zones_height;
+diff --git a/src/xvt_remaster/hud_draw.c b/src/xvt_remaster/hud_draw.c
+index 30f35ba..abfad4d 100644
+--- a/src/xvt_remaster/hud_draw.c
++++ b/src/xvt_remaster/hud_draw.c
+@@ -164,13 +164,16 @@ void XvtHudDraw_Base(const XvtHudDraw* draw) {
+ 	const AeronRuntimeAtlas* atlas = &draw->assets->base;
+ 	if (!atlas->layout.frame_count)
+ 		return;
+-	for (unsigned zone = 0; zone < XVT_HUD_ZONE_COUNT && zone < (unsigned)atlas->layout.frame_count; ++zone) {
+-		XvtHudDraw zoned = InZone(draw, zone);
+-		const AeronImageCoverage* coverage = &draw->assets->base_coverage[zone];
++	for (unsigned frame = 0; frame < XVT_HUD_BASE_FRAMES && frame < (unsigned)atlas->layout.frame_count; ++frame) {
++		if (frame == XVT_HUD_BASE_WIDGET && draw->shields_replaced)
++			continue;
++		XvtHudDraw zoned =
++			InZone(draw, frame == XVT_HUD_BASE_WIDGET ? draw->assets->base_widget_zone : frame);
++		const AeronImageCoverage* coverage = &draw->assets->base_coverage[frame];
+ 		for (unsigned index = 0; index < coverage->count; ++index) {
+ 			const AeronImageCoverageRect* rect = &coverage->rects[index];
+ 			int x = draw->layout->mirrored ? draw->layout->source_width - rect->x - rect->width : rect->x;
+-			AppendAtlasSprite(&zoned, atlas, zone, x, rect->y, rect->x, rect->y, rect->width, rect->height,
++			AppendAtlasSprite(&zoned, atlas, frame, x, rect->y, rect->x, rect->y, rect->width, rect->height,
+ 							  draw->layout->mirrored, 0, 0, XVT_COCKPIT_BEFORE_CRT);
+ 		}
+ 	}
+diff --git a/src/xvt_remaster/hud_draw.h b/src/xvt_remaster/hud_draw.h
+index c01ed8f..9d6e00f 100644
+--- a/src/xvt_remaster/hud_draw.h
++++ b/src/xvt_remaster/hud_draw.h
+@@ -18,6 +18,11 @@ typedef struct XvtHudDraw {
+ 	/* When nonzero, mid-screen message panes sit just above this source row
+ 	 * (the console top) instead of near the aiming reticle. */
+ 	int message_floor;
++	/* Cockpit shield arcs replace the cockpit-off widget art and hull icon;
++	 * the fore/aft shield percentages move by shield_text_dy[side]. */
++	int shields_replaced, shield_text_dy[2];
++	/* Offset from forward-cockpit shield coordinates to the widget position. */
++	int shield_dx, shield_dy;
+ 	int width, height;
+ } XvtHudDraw;
+ 
+diff --git a/src/xvt_remaster/hud_instruments.c b/src/xvt_remaster/hud_instruments.c
+index 9d91eac..84b1fb0 100644
+--- a/src/xvt_remaster/hud_instruments.c
++++ b/src/xvt_remaster/hud_instruments.c
+@@ -90,7 +90,24 @@ void XvtHudInstruments_DrawWidgets(const XvtHudDraw* draw) {
+ 							XVT_COCKPIT_BEFORE_CRT);
+ 		}
+ 	}
+-	DrawIndicator(draw, XVT_HUD_HULL, &systems->hull_indicator);
++	if (draw->shields_replaced) {
++		/* Cockpit arcs and icon drawn as one unit at the widget's position. */
++		const XvtHudSpriteBinding* hull = &draw->layout->sprites[XVT_HUD_HULL];
++		XvtHudDraw widget = XvtHudDraw_ForPoint(draw, hull->x, hull->y);
++		for (unsigned side = 0; side < 2; ++side) {
++			const XvtCockpitShield* shield = &systems->shields[side];
++			if (!shield->visible)
++				continue;
++			XvtHudDraw_Part(&widget, XVT_HUD_PANEL_SHIELD + side * 2, shield->primary_level, draw->shield_dx,
++							draw->shield_dy, XVT_COCKPIT_BEFORE_CRT);
++			XvtHudDraw_Part(&widget, XVT_HUD_PANEL_SHIELD + side * 2 + 1, shield->overcharge_level,
++							draw->shield_dx, draw->shield_dy, XVT_COCKPIT_BEFORE_CRT);
++		}
++		if (systems->hull_indicator.visible)
++			XvtHudDraw_Part(&widget, XVT_HUD_PANEL_HULL, systems->hull_indicator.state, draw->shield_dx,
++							draw->shield_dy, XVT_COCKPIT_BEFORE_CRT);
++	} else
++		DrawIndicator(draw, XVT_HUD_HULL, &systems->hull_indicator);
+ 	DrawIndicator(draw, XVT_HUD_BEAM_ENABLED, &systems->beam_enabled);
+ 	if (systems->beam_visible)
+ 		for (unsigned segment = 0; segment < 9; ++segment)
+@@ -326,6 +343,54 @@ int XvtHudInstruments_PanelBottom(const XvtHudDraw* draw) {
+ 	return bottom + (int)(3 * draw->layout->source_width / 640.0f + .5f);
+ }
+ 
++void XvtHudInstruments_PlaceShields(XvtHudDraw* draw) {
++	draw->shields_replaced = 0;
++	draw->shield_text_dy[0] = draw->shield_text_dy[1] = 0;
++	const XvtCockpitState* state = draw->state;
++	const XvtHudSpriteBinding* hull = &draw->layout->sprites[XVT_HUD_HULL];
++	int hull_w, hull_h, arc_w, arc_h;
++	if (!draw->assets || !draw->assets->base_coverage[XVT_HUD_BASE_WIDGET].count ||
++		!PartBounds(draw, XVT_HUD_HULL, &hull_w, &hull_h) ||
++		!PartBounds(draw, XVT_HUD_PANEL_HULL, &arc_w, &arc_h))
++		return;
++	/* Bounds of the cockpit arcs and icon in forward-cockpit coordinates. */
++	int box[4] = { 32767, 32767, -32768, -32768 };
++	for (unsigned role = XVT_HUD_PANEL_SHIELD; role <= XVT_HUD_PANEL_HULL; ++role) {
++		int width, height;
++		const XvtHudSpriteBinding* binding = &draw->layout->sprites[role];
++		if (!PartBounds(draw, (XvtHudSpriteRole)role, &width, &height))
++			return;
++		IncludeRect(box, binding->x, binding->y, binding->x + width, binding->y + height);
++	}
++	const XvtHudSpriteBinding* icon = &draw->layout->sprites[XVT_HUD_PANEL_HULL];
++	int center_x = hull->x + hull_w / 2, center_y = hull->y + hull_h / 2;
++	draw->shield_dx = center_x - (icon->x + arc_w / 2);
++	draw->shield_dy = center_y - (icon->y + arc_h / 2);
++	/* Keep the lower percentage on screen below the arcs; the upper one moves
++	 * above them. */
++	const XvtCockpitTextField* fore = &state->text_fields[XVT_COCKPIT_TEXT_SHIELD_FORE];
++	const XvtCockpitTextField* aft = &state->text_fields[XVT_COCKPIT_TEXT_SHIELD_AFT];
++	int upper = fore->bounds.y <= aft->bounds.y ? 0 : 1;
++	const XvtCockpitTextField* fields[2] = { fore, aft };
++	const XvtCockpitTextField* low = fields[!upper];
++	const XvtCockpitTextField* high = fields[upper];
++	if (low->caption.visible) {
++		int limit = draw->layout->source_height - low->bounds.height - 1;
++		int bottom = box[3] + draw->shield_dy;
++		if (bottom > limit)
++			draw->shield_dy -= bottom - limit;
++		bottom = box[3] + draw->shield_dy;
++		if (low->bounds.y < bottom + 1)
++			draw->shield_text_dy[!upper] = bottom + 1 - low->bounds.y;
++	}
++	if (high->caption.visible) {
++		int top = box[1] + draw->shield_dy;
++		if (high->bounds.y + high->bounds.height > top - 1)
++			draw->shield_text_dy[upper] = top - 1 - (high->bounds.y + high->bounds.height);
++	}
++	draw->shields_replaced = 1;
++}
++
+ void XvtHudInstruments_DrawCrtMarker(const XvtHudDraw* draw) {
+ 	const XvtSnapPreview* crt = &draw->state->crt;
+ 	XvtRenderView view;
+diff --git a/src/xvt_remaster/hud_instruments.h b/src/xvt_remaster/hud_instruments.h
+index 804d113..dcbc71a 100644
+--- a/src/xvt_remaster/hud_instruments.h
++++ b/src/xvt_remaster/hud_instruments.h
+@@ -13,4 +13,7 @@ void XvtHudInstruments_DrawMouseStick(const XvtHudDraw* draw, const XvtRenderVie
+ int XvtHudInstruments_DrawPanel(const XvtHudDraw* draw);
+ /* First source row below the strip. */
+ int XvtHudInstruments_PanelBottom(const XvtHudDraw* draw);
++/* Decide whether cockpit shield arcs replace the cockpit-off shield widget,
++ * and place the arcs and shield percentages. */
++void XvtHudInstruments_PlaceShields(XvtHudDraw* draw);
+ #endif
+diff --git a/src/xvt_remaster/hud_layout.c b/src/xvt_remaster/hud_layout.c
+index e36a112..c4cc641 100644
+--- a/src/xvt_remaster/hud_layout.c
++++ b/src/xvt_remaster/hud_layout.c
+@@ -130,8 +130,8 @@ static int CompileSystems(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 		   BindFrames(layout, state, XVT_HUD_CRITICAL_WARNING, 50, 2, -1, 1);
+ }
+ 
+-/* Bind the forward cockpit's laser charge bars for the
+- * cockpit-off panel strip. Craft whose cockpit lacks them simply omit them. */
++/* Bind the forward cockpit's laser charge bars, shield arcs and hull icon for
++ * the widescreen cockpit-off view. Craft whose cockpit lacks them omit them. */
+ static void CompilePanel(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 	for (unsigned slot = 0; slot < state->view.laser_slots; ++slot) {
+ 		const XvtSnapHudElement* charge = &state->definition.layout.elements[3 + slot];
+@@ -149,6 +149,21 @@ static void CompilePanel(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 		if (binding->mirrored)
+ 			binding->step_x = -binding->step_x;
+ 	}
++	/* Graphic shield arcs exist only where the cockpit does not use text. */
++	if (!(state->systems.installed_hud_features & XVT_COCKPIT_FEATURE_SHIELDS) ||
++		state->definition.layout.elements[35].color_index == UINT16_MAX ||
++		state->definition.layout.elements[37].color_index == UINT16_MAX)
++		return;
++	uint16_t parts = layout->part_count;
++	int ok = 1;
++	for (unsigned layer = 0; ok && layer < 4; ++layer)
++		ok = BindFadedFrames(layout, state, XVT_HUD_PANEL_SHIELD + layer, 35 + layer, 0);
++	if (ok)
++		ok = BindFrames(layout, state, XVT_HUD_PANEL_HULL, 39, 4, -1, 1);
++	if (!ok) {
++		layout->part_count = parts;
++		memset(&layout->sprites[XVT_HUD_PANEL_SHIELD], 0, 5 * sizeof layout->sprites[0]);
++	}
+ }
+ 
+ static void CompileAnchors(XvtHudLayout* layout, const XvtCockpitState* state) {
+diff --git a/src/xvt_remaster/hud_layout.h b/src/xvt_remaster/hud_layout.h
+index 92911a6..547cd98 100644
+--- a/src/xvt_remaster/hud_layout.h
++++ b/src/xvt_remaster/hud_layout.h
+@@ -33,10 +33,17 @@ typedef enum XvtHudSpriteRole {
+ 	/* Forward-cockpit laser charge bars reused by the widescreen cockpit-off
+ 	 * panel strip. */
+ 	XVT_HUD_PANEL_CHARGE = XVT_HUD_CMD_ARMAMENT + 4,
+-	XVT_HUD_SPRITE_ROLE_COUNT = XVT_HUD_PANEL_CHARGE + XVT_HUD_WEAPON_SLOTS
++	/* Forward-cockpit shield arcs and hull icon replacing the cockpit-off
++	 * view's text shield display. */
++	XVT_HUD_PANEL_SHIELD = XVT_HUD_PANEL_CHARGE + XVT_HUD_WEAPON_SLOTS,
++	XVT_HUD_PANEL_HULL = XVT_HUD_PANEL_SHIELD + 4,
++	XVT_HUD_SPRITE_ROLE_COUNT
+ } XvtHudSpriteRole;
+ 
+ typedef enum XvtHudZone { XVT_HUD_ZONE_LEFT, XVT_HUD_ZONE_CENTER, XVT_HUD_ZONE_RIGHT, XVT_HUD_ZONE_COUNT } XvtHudZone;
++/* Base artwork atlas frames: one per zone, then the cockpit-off shield widget
++ * (drawn in its own zone unless replaced by the cockpit shield arcs). */
++enum { XVT_HUD_BASE_WIDGET = XVT_HUD_ZONE_COUNT, XVT_HUD_BASE_FRAMES };
+ 
+ typedef enum XvtHudPartColor {
+ 	XVT_HUD_PART_ORIGINAL,
+diff --git a/src/xvt_remaster/hud_panes.c b/src/xvt_remaster/hud_panes.c
+index 8278cf0..fac0fc0 100644
+--- a/src/xvt_remaster/hud_panes.c
++++ b/src/xvt_remaster/hud_panes.c
+@@ -13,8 +13,20 @@ int XvtHudPanes_DrawReadouts(const XvtHudDraw* draw, unsigned phase) {
+ 		if (phase == XVT_COCKPIT_AFTER_CRT &&
+ 			(field == XVT_COCKPIT_TEXT_NETWORK_PING || field == XVT_COCKPIT_TEXT_NETWORK_LAG))
+ 			continue;
+-		if (state->text_fields[field].caption.phase == phase &&
+-			!XvtHudText_DrawField(draw, &state->text_fields[field]))
++		if (state->text_fields[field].caption.phase != phase)
++			continue;
++		if (draw->shields_replaced &&
++			(field == XVT_COCKPIT_TEXT_SHIELD_FORE || field == XVT_COCKPIT_TEXT_SHIELD_AFT)) {
++			/* Percentages clear the cockpit shield arcs drawn in the widget. */
++			XvtCockpitTextField moved = state->text_fields[field];
++			int dy = draw->shield_text_dy[field == XVT_COCKPIT_TEXT_SHIELD_AFT];
++			moved.bounds.y = (int16_t)(moved.bounds.y + dy);
++			moved.y = (int16_t)(moved.y + dy);
++			if (!XvtHudText_DrawField(draw, &moved))
++				return 0;
++			continue;
++		}
++		if (!XvtHudText_DrawField(draw, &state->text_fields[field]))
+ 			return 0;
+ 	}
+ 	const XvtCockpitNumber* numbers[] = { &state->readouts.speed,
+diff --git a/src/xvt_remaster/hud_renderer.c b/src/xvt_remaster/hud_renderer.c
+index a885dcd..e355385 100644
+--- a/src/xvt_remaster/hud_renderer.c
++++ b/src/xvt_remaster/hud_renderer.c
+@@ -133,6 +133,7 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 		draw.message_top = XvtHudInstruments_PanelBottom(&draw);
+ 		draw.message_shift = draw.message_top;
+ 		draw.message_floor = draw.assets ? draw.assets->base_console_top : 0;
++		XvtHudInstruments_PlaceShields(&draw);
+ 	}
+ 	int crt_visible = state->crt.valid && crt_color;
+ 	XvtHudDraw display = XvtHudDraw_ForRect(&draw, state->crt.destination);

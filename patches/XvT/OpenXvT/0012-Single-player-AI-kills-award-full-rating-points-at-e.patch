@@ -1,0 +1,48 @@
+From edcf480cb53a2716f64b7bc0168b461527c08aed Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 06:33:50 +1100
+Subject: [PATCH 12/25] Single-player: AI kills award full rating points at
+ every rank
+
+---
+ src/xvt/flight/mission/mission.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/xvt/flight/mission/mission.c b/src/xvt/flight/mission/mission.c
+index 7c9ce1a..18a5137 100644
+--- a/src/xvt/flight/mission/mission.c
++++ b/src/xvt/flight/mission/mission.c
+@@ -173,6 +173,17 @@ uint8_t g_flightRuntimeStateInitialized = 1;
+ // GLOBAL: XVT 0x9A8C04
+ uint16_t g_flightFrameStepMirror = 0;
+ 
++#ifdef XVT_MODERN
++/* True when no other networked human is in the session. */
++static int Mission_IsSinglePlayer(void) {
++	int remote = 0;
++	for (int player = 0; player < (int)(sizeof g_players / sizeof g_players[0]); ++player)
++		if (player != g_localPlayer && g_players[player].network.directPlayId != 0)
++			++remote;
++	return remote == 0;
++}
++#endif
++
+ // FLAGS: /O2 /G5
+ // FUNCTION: XVT 0x415A40
+ uint16_t Mission_GetFlightGroupSpecialCargoOutcome8(unsigned int flightGroupIdx, uint16_t specialCargoCraft) {
+@@ -2481,6 +2492,15 @@ void Mission_CreditDestructionDamageContributors(uint16_t sourceObjIdx, uint16_t
+ 															  .fg.groupAI];
+ 					else
+ 						awardRating = g_players[creditedOwner].pilotRating;
++#ifdef XVT_MODERN
++					/* Single-player: AI pilots rate no lower than the player, so their
++					 * kills keep earning full promotion points at every rank instead
++					 * of the capped "worse" points that stall progress once the
++					 * player outranks the AI (rating 11) by more than four. */
++					if (creditedOwner == -1 && Mission_IsSinglePlayer() &&
++						awardRating < g_players[playerIndex].pilotRating)
++						awardRating = g_players[playerIndex].pilotRating;
++#endif
+ 
+ 					{
+ 						int ratingFactor = awardRating - g_players[playerIndex].pilotRating;

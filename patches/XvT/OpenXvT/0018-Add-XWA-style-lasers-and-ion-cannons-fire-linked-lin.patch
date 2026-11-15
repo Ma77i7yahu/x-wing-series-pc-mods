@@ -1,0 +1,294 @@
+From 85a6f6f1b24a94d2387c63969804a2b5248495ff Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 05:29:02 +1100
+Subject: [PATCH 18/25] Add XWA-style lasers and ion cannons fire linked (link
+ key after fire linked)
+
+---
+ src/xvt/flight/flight.c                       |  32 +++++-
+ src/xvt/flight/hud/hud.c                      |   6 +-
+ src/xvt/flight/hud/msg.c                      |  13 +++
+ src/xvt/flight/hud/msg.h                      |   1 +
+ src/xvt/flight/object/laser.c                 | 102 ++++++++++++------
+ src/xvt/flight/object/laser.h                 |   3 +
+ .../snapshot/cockpit_instruments.c            |   6 +-
+ 7 files changed, 124 insertions(+), 39 deletions(-)
+
+diff --git a/src/xvt/flight/flight.c b/src/xvt/flight/flight.c
+index d1c730f..35f0572 100644
+--- a/src/xvt/flight/flight.c
++++ b/src/xvt/flight/flight.c
+@@ -37,6 +37,7 @@
+ #include "xvt/flight/mission/mission.h"
+ #include "xvt/flight/object/collide.h"
+ #include "xvt/flight/object/damage.h"
++#include "xvt/flight/object/laser.h"
+ #include "xvt/flight/object/object.h"
+ #include "xvt/flight/player/flight_player.h"
+ #include "xvt/flight/player/player.h"
+@@ -4039,8 +4040,35 @@ void Flight_ProcessPlayerActions(int playerIdx) {
+ 			}
+ 			case FLIGHT_KEY_X:
+ 				if (g_players[playerIdx].selectedWeaponMode == 0) {
+-					if (g_modelDefs[GetModelIndexFromType(g_objectTable[objectIndex].objectType)]
+-							.laserGroupSlotCount[g_players[playerIdx].selectedWarhead] != 1) {
++					int bankSlotCount = g_modelDefs[GetModelIndexFromType(g_objectTable[objectIndex].objectType)]
++											.laserGroupSlotCount[g_players[playerIdx].selectedWarhead];
++					/* XWA-style cycle: ... -> fire linked -> lasers and ions linked -> single fire. */
++					if (laser_PlayerCannonBanksLinked(playerIdx, craft)) {
++						laser_SetPlayerCannonBanksLinked(playerIdx, 0);
++						craft->laserState.linkMode[g_players[playerIdx].selectedWarhead] = 1;
++						craft->laserState.nextSlot[g_players[playerIdx].selectedWarhead] =
++							g_modelDefs[GetModelIndexFromType(g_objectTable[objectIndex].objectType)]
++								.laserGroupFirstSlot[g_players[playerIdx].selectedWarhead];
++						msg_emitInFlightMessage(IFMSG_005_CANNONS_SET_TO_SINGLE_FIRE, playerIdx);
++					} else if (laser_CanLinkCannonBanks(craft) &&
++							   (bankSlotCount == 1 ||
++								craft->laserState.linkMode[g_players[playerIdx].selectedWarhead] == 3)) {
++						laser_SetPlayerCannonBanksLinked(playerIdx, 1);
++						craft->laserState.linkMode[g_players[playerIdx].selectedWarhead] = 3;
++						const uint8_t* bankWeaponTypes =
++							g_modelDefs[GetModelIndexFromType(g_objectTable[objectIndex].objectType)]
++								.laserGroupWeaponType;
++						int hasIons = 0;
++						for (int bank = 0; bank < 2; ++bank) {
++							if (bankWeaponTypes[bank] == PROJECTILE_OBJECT_TYPE_ION_LASER ||
++								bankWeaponTypes[bank] == PROJECTILE_OBJECT_TYPE_ION_TURBO_LASER)
++								hasIons = 1;
++						}
++						msg_emitInFlightText(IFMSG_007_CANNONS_FIRE_LINKED,
++											 hasIons ? "Lasers and ion cannons [fire linked"
++													 : "All cannons [fire linked",
++											 playerIdx);
++					} else if (bankSlotCount != 1) {
+ 						uint16_t linkMode =
+ 							craft->laserState.linkMode[g_players[playerIdx].selectedWarhead] + 1;
+ 						if (linkMode > 3)
+diff --git a/src/xvt/flight/hud/hud.c b/src/xvt/flight/hud/hud.c
+index 8d5fb71..057f67d 100644
+--- a/src/xvt/flight/hud/hud.c
++++ b/src/xvt/flight/hud/hud.c
+@@ -34,6 +34,7 @@
+ #include "xvt/flight/mission/mission.h"
+ #include "xvt/flight/object/collide.h"
+ #include "xvt/flight/object/damage.h"
++#include "xvt/flight/object/laser.h"
+ #include "xvt/flight/object/object.h"
+ #include "xvt/flight/player/player.h"
+ #include "xvt/flight/proving_grounds.h"
+@@ -2962,9 +2963,10 @@ void Hud_DrawReticle3D(void) {
+ 
+ 		lockState = 0;
+ 		if (charge > 0 && (craft->workingSubsystems & CRAFT_SUBSYSTEM_FLAG_CANNONS) != 0) {
++			int banksLinked = laser_PlayerCannonBanksLinked(g_localPlayer, craft);
+ 			if (g_players[g_localPlayer].selectedWeaponMode == 0 &&
+-				g_players[g_localPlayer].selectedWarhead == laserBank) {
+-				switch (craft->laserState.linkMode[laserBank]) {
++				(g_players[g_localPlayer].selectedWarhead == laserBank || banksLinked)) {
++				switch (banksLinked ? 3 : craft->laserState.linkMode[laserBank]) {
+ 					case 0:
+ 					case 4:
+ 						readyState = 0;
+diff --git a/src/xvt/flight/hud/msg.c b/src/xvt/flight/hud/msg.c
+index d047623..d3430ad 100644
+--- a/src/xvt/flight/hud/msg.c
++++ b/src/xvt/flight/hud/msg.c
+@@ -97,6 +97,15 @@ void msg_writeMessageLogFile(void) {
+ 	}
+ }
+ 
++/* Replacement text for the next msg_emitInFlightMessage call; it keeps the pane of messageId. */
++static const char* s_msgTextOverride;
++
++void msg_emitInFlightText(InFlightMessageId paneMessageId, const char* text, int playerIdx) {
++	s_msgTextOverride = text;
++	msg_emitInFlightMessage(paneMessageId, playerIdx);
++	s_msgTextOverride = NULL;
++}
++
+ // FUNCTION: XVT 0x450650
+ void msg_emitInFlightMessage(InFlightMessageId messageId, int playerIdx) {
+ 	HudInFlightMessageRecord message;
+@@ -150,6 +159,10 @@ void msg_emitInFlightMessage(InFlightMessageId messageId, int playerIdx) {
+ 		templateCursor = (const uint8_t*)"Mission paused. Press your pause key or button to continue.";
+ 	}
+ #endif
++	if (s_msgTextOverride) {
++		message.text[textLength++] = (char)paneType;
++		templateCursor = (const uint8_t*)s_msgTextOverride;
++	}
+ 	while (*templateCursor != '\0' && textLength < sizeof(message.text)) {
+ 		if (*templateCursor == '*') {
+ 			++templateCursor;
+diff --git a/src/xvt/flight/hud/msg.h b/src/xvt/flight/hud/msg.h
+index 5c98307..1edde65 100644
+--- a/src/xvt/flight/hud/msg.h
++++ b/src/xvt/flight/hud/msg.h
+@@ -640,6 +640,7 @@ enum {
+ 
+ void msg_writeMessageLogFile(void);
+ void msg_emitInFlightMessage(InFlightMessageId messageId, int playerIdx);
++void msg_emitInFlightText(InFlightMessageId paneMessageId, const char* text, int playerIdx);
+ void msg_reportfgcreation(uint16_t flightGroupIndex, uint16_t modelIndex);
+ void msg_addMessagePtr(uint16_t slot, const void* value);
+ void msg_emitCraftMessage(uint16_t objIdx, CraftData* craft, int16_t msgTemplateId);
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index cde6c7a..3d34fe5 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -744,6 +744,67 @@ uint16_t laser_GetProjectileLifetimeTicks(int projectileObjectType) {
+ 	return wholeSecondsTicks;
+ }
+ 
++/* XWA-style "lasers and ions linked": one trigger fires both cannon banks, each fully linked.
++ * Entered with the link key after "fire linked"; the next press goes back to single fire. */
++static uint8_t s_playerCannonBanksLinked[8];
++
++int laser_CanLinkCannonBanks(const CraftData* craft) {
++	enum { GUNNER_LASER_MOUNT_TYPE = 2 };
++	int bank;
++
++	if (craft->cannonClassCount < 2)
++		return 0;
++	for (bank = 0; bank < 2; ++bank) {
++		if (craft->laserState.projectileTypeId[bank] == 0 ||
++			g_modelDefs[craft->modelIndex].laserGroupMountType[bank] == GUNNER_LASER_MOUNT_TYPE)
++			return 0;
++	}
++	return 1;
++}
++
++int laser_PlayerCannonBanksLinked(int playerIdx, const CraftData* craft) {
++	return playerIdx >= 0 && playerIdx < 8 && s_playerCannonBanksLinked[playerIdx] != 0 &&
++		   g_players[playerIdx].selectedWeaponMode == 0 && laser_CanLinkCannonBanks(craft);
++}
++
++void laser_SetPlayerCannonBanksLinked(int playerIdx, int linked) {
++	if (playerIdx >= 0 && playerIdx < 8)
++		s_playerCannonBanksLinked[playerIdx] = (uint8_t)(linked != 0);
++}
++
++/* Fires one cannon bank for a player if its cooldown allows; forceLinked fires every cannon in it. */
++static void laser_FirePlayerCannonBank(int playerIdx, CraftData* craft, int bank, int forceLinked) {
++	enum { SYSTEM_NAME_MESSAGE_ARG = 87, LASER_SYSTEM_NAME_BASE = 92 };
++	int16_t cooldown = craft->laserState.fireCooldownTicks[bank];
++
++	if (g_laserFireTimestampTrackingEnabled != 0) {
++		int lockstepTimestamp = g_players[playerIdx].lockstepTimestamp;
++		if (cooldown != 0) {
++			if (craft->laserState.lastFireTimestamp[bank] < lockstepTimestamp) {
++				cooldown = 0;
++				craft->laserState.lastFireTimestamp[bank] = lockstepTimestamp;
++			} else {
++				cooldown = (int16_t)(2 * g_elapsedTicks);
++			}
++		} else {
++			craft->laserState.lastFireTimestamp[bank] = lockstepTimestamp;
++		}
++	}
++	if ((int16_t)(g_elapsedTicks + (g_elapsedTicks >> 1)) <= cooldown)
++		return;
++	if ((craft->workingSubsystems & CRAFT_SUBSYSTEM_FLAG_CANNONS) != 0) {
++		uint8_t savedLinkMode = craft->laserState.linkMode[bank];
++		if (forceLinked)
++			craft->laserState.linkMode[bank] = 3;
++		laser_firelasersystem(g_players[playerIdx].objectIndex, bank);
++		craft->laserState.linkMode[bank] = savedLinkMode;
++	} else if (playerIdx == g_localPlayer) {
++		g_msgArgTable[1] = SYSTEM_NAME_MESSAGE_ARG;
++		g_msgArgTable[0] = (uint16_t)(bank + LASER_SYSTEM_NAME_BASE);
++		msg_emitInFlightMessage(IFMSG_086_ARG_SYSTEM_IS_ARG, playerIdx);
++	}
++}
++
+ // FUNCTION: XVT 0x405890
+ void laser_fireplayerweapon(int playerIdx) {
+ 	enum {
+@@ -765,40 +826,15 @@ void laser_fireplayerweapon(int playerIdx) {
+ 		return;
+ 	}
+ 	if (g_players[playerIdx].selectedWeaponMode == 0) {
+-		int selectedWeapon;
+-		int16_t cooldown;
++		int selectedWeapon = g_players[playerIdx].selectedWarhead;
+ 
+-		selectedWeapon = g_players[playerIdx].selectedWarhead;
+-		cooldown = craft->laserState.fireCooldownTicks[selectedWeapon];
+-		if (g_laserFireTimestampTrackingEnabled != 0) {
+-			int lockstepTimestamp;
+-
+-			lockstepTimestamp = g_players[playerIdx].lockstepTimestamp;
+-			if (cooldown != 0) {
+-				int lastFireTimestamp;
+-
+-				lastFireTimestamp = craft->laserState.lastFireTimestamp[selectedWeapon];
+-				if (lastFireTimestamp < lockstepTimestamp) {
+-					cooldown = 0;
+-					craft->laserState.lastFireTimestamp[selectedWeapon] = lockstepTimestamp;
+-				} else {
+-					cooldown = (int16_t)(2 * g_elapsedTicks);
+-				}
+-			} else {
+-				craft->laserState.lastFireTimestamp[selectedWeapon] = lockstepTimestamp;
+-			}
+-		}
+-		if ((int16_t)(g_elapsedTicks + (g_elapsedTicks >> 1)) > cooldown) {
+-			if ((craft->workingSubsystems & CRAFT_SUBSYSTEM_FLAG_CANNONS) != 0) {
+-				laser_firelasersystem(g_players[playerIdx].objectIndex, g_players[playerIdx].selectedWarhead);
+-			} else if (playerIdx == g_localPlayer) {
+-				int16_t selectedWarhead;
+-
+-				selectedWarhead = g_players[playerIdx].selectedWarhead;
+-				g_msgArgTable[1] = SYSTEM_NAME_MESSAGE_ARG;
+-				g_msgArgTable[0] = (uint16_t)(selectedWarhead + LASER_SYSTEM_NAME_BASE);
+-				msg_emitInFlightMessage(IFMSG_086_ARG_SYSTEM_IS_ARG, playerIdx);
+-			}
++		if (laser_PlayerCannonBanksLinked(playerIdx, craft)) {
++			laser_FirePlayerCannonBank(playerIdx, craft, selectedWeapon, 1);
++			/* The S-foil warning was already shown by the first bank. */
++			if (craft->sFoilState == 0)
++				laser_FirePlayerCannonBank(playerIdx, craft, selectedWeapon ^ 1, 1);
++		} else {
++			laser_FirePlayerCannonBank(playerIdx, craft, selectedWeapon, 0);
+ 		}
+ 		return;
+ 	}
+diff --git a/src/xvt/flight/object/laser.h b/src/xvt/flight/object/laser.h
+index cd4af7a..c2c89a3 100644
+--- a/src/xvt/flight/object/laser.h
++++ b/src/xvt/flight/object/laser.h
+@@ -86,6 +86,9 @@ extern int g_laserFireTimestampTrackingEnabled;
+ void laser_weaponsfire(void);
+ uint16_t laser_GetProjectileLifetimeTicks(int projectileObjectType);
+ void laser_fireplayerweapon(int playerIdx);
++int laser_CanLinkCannonBanks(const CraftData* craft);
++int laser_PlayerCannonBanksLinked(int playerIdx, const CraftData* craft);
++void laser_SetPlayerCannonBanksLinked(int playerIdx, int linked);
+ void laser_firelasersystem(int objectIndex, int laserSystemIndex);
+ void laser_firerocketsystem(int objectIndex, unsigned int launcherIndex);
+ int laser_firemissile(int objectIndex, int weaponSlotIndex, int projectileTypeId, unsigned int launcherIndex);
+diff --git a/src/xvt_runtime/snapshot/cockpit_instruments.c b/src/xvt_runtime/snapshot/cockpit_instruments.c
+index 640e311..162dc4e 100644
+--- a/src/xvt_runtime/snapshot/cockpit_instruments.c
++++ b/src/xvt_runtime/snapshot/cockpit_instruments.c
+@@ -6,6 +6,7 @@
+ #include "xvt/flight/flight_display.h"
+ #include "xvt/flight/hud/flight_text.h"
+ #include "xvt/flight/object/damage.h"
++#include "xvt/flight/object/laser.h"
+ #include "xvt/flight/object/object.h"
+ #include "xvt/flight/player/player.h"
+ #include "xvt/math/math2.h"
+@@ -277,9 +278,10 @@ static void BuildLaserSlots(XvtCockpitState* state, const CraftData* craft, int
+ 
+ 		unsigned ready = 0, selected = 0;
+ 		if (charge > 0 && cannons) {
+-			if (player->selectedWeaponMode == 0 && player->selectedWarhead == slot->bank) {
++			int banksLinked = laser_PlayerCannonBanksLinked(g_localPlayer, craft);
++			if (player->selectedWeaponMode == 0 && (player->selectedWarhead == slot->bank || banksLinked)) {
+ 				unsigned next = craft->laserState.nextSlot[slot->bank];
+-				switch (craft->laserState.linkMode[slot->bank]) {
++				switch (banksLinked ? 3 : craft->laserState.linkMode[slot->bank]) {
+ 					case 1:
+ 						ready = next == index ? 3 : 1;
+ 						break;

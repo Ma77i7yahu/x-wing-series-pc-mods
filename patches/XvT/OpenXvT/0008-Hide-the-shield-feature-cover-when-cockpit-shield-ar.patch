@@ -1,0 +1,25 @@
+From fc958329e4037efee182a002b6a4198d6e1d75a9 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:48:34 +1100
+Subject: [PATCH 08/25] Hide the shield feature cover when cockpit shield arcs
+ replace it
+
+---
+ src/xvt_remaster/hud_instruments.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/xvt_remaster/hud_instruments.c b/src/xvt_remaster/hud_instruments.c
+index 84b1fb0..f5730d1 100644
+--- a/src/xvt_remaster/hud_instruments.c
++++ b/src/xvt_remaster/hud_instruments.c
+@@ -13,7 +13,9 @@ static void DrawIndicator(const XvtHudDraw* draw, XvtHudSpriteRole role,
+ void XvtHudInstruments_DrawCovers(const XvtHudDraw* draw) {
+ 	const XvtCockpitSystems* systems = &draw->state->systems;
+ 	for (unsigned index = 0; index < 13; ++index)
+-		if (systems->feature_covers[index].visible)
++		/* The shield cover frames the text display the arcs replace. */
++		if (systems->feature_covers[index].visible &&
++			!(draw->shields_replaced && (1u << index) == XVT_COCKPIT_FEATURE_SHIELDS))
+ 			XvtHudDraw_Part(draw, XVT_HUD_FEATURE_COVER + index, systems->feature_covers[index].state == 13,
+ 							0, 0, XVT_COCKPIT_BEFORE_CRT);
+ 	DrawIndicator(draw, XVT_HUD_UNAVAILABLE_SHIELDS, &systems->unavailable_shields);

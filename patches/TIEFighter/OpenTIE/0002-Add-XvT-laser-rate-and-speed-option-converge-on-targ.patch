@@ -1,0 +1,242 @@
+From 7ba4df6393d3c767fe5423d83cfc728d23044588 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Fri, 9 Oct 2026 21:34:51 +1100
+Subject: [PATCH 02/18] Add XvT laser rate and speed option; converge on
+ targets from 20 m
+
+---
+ resources/config.yaml                 |  5 ++++-
+ src/tie/laser.c                       | 19 +++++++++++++++++--
+ src/tie_app/application.c             |  1 +
+ src/tie_app/config/app_config.c       |  9 ++++++---
+ src/tie_app/config/app_config.h       |  2 ++
+ src/tie_app/settings/flight_options.c |  3 ++-
+ src/tie_app/settings/settings.c       |  7 +++++++
+ src/tie_runtime/hooks/flight_tweaks.c |  5 +++++
+ src/tie_runtime/hooks/flight_tweaks.h |  5 +++++
+ 9 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index f608ab5..86da54d 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -40,9 +40,12 @@ flight:
+   # Move the cockpit-off radars and indicators out toward the screen edges.
+   widescreen_hud: true
+   # X-Wing Alliance style cannon convergence: on the current target when it is
+-  # ahead (0.1-2.5 km), otherwise this many metres ahead; parallel with no
++  # ahead (0.02-2.5 km), otherwise this many metres ahead; parallel with no
+   # target selected. 0 = always parallel.
+   laser_convergence: 550
++  # X-Wing vs TIE Fighter laser cannons: faster recycling and twice the bolt
++  # speed (same range), for every craft.
++  xvt_lasers: true
+   models:
+     source: original
+     smooth_angle_degrees: 90
+diff --git a/src/tie/laser.c b/src/tie/laser.c
+index 6f56b13..2dfa60e 100644
+--- a/src/tie/laser.c
++++ b/src/tie/laser.c
+@@ -629,6 +629,12 @@ void laser_firelasersystem(uint16_t shooter_obj_idx, uint16_t group_idx) {
+ 			pstate.player_laser_fired += shots_fired;
+ 	}
+ 
++#ifdef TIE_MODERN
++	if (TieFlightTweaks_XvtLasers()) {
++		craftptr->laser_cooldown[group_idx] = (uint16_t)(47 * shots_fired + 2); /* XvT 0x4065D0 */
++		return;
++	}
++#endif
+ 	craftptr->laser_cooldown[group_idx] = (uint16_t)(78 * shots_fired + 2);
+ }
+ 
+@@ -747,7 +753,7 @@ uint16_t laser_firemissile(uint16_t shooter_obj_idx, uint16_t weapon_slot_idx, u
+ /* X-Wing Alliance style convergence: aim a player's cannon bolt from its
+  * hardpoint at a point straight ahead of the craft instead of parallel to the
+  * nose. The point lies at the current target's range along the nose while the
+- * target is within about 30 degrees and 0.1-2.5 km ahead, otherwise at
++ * target is within about 30 degrees and 0.02-2.5 km ahead, otherwise at
+  * flight.laser_convergence metres. With no target selected the bolt keeps the
+  * original parallel path. */
+ static void laser_convergeplayerbolt(const FlightObject* shooter, FlightObject* bolt, int32_t length) {
+@@ -778,7 +784,7 @@ static void laser_convergeplayerbolt(const FlightObject* shooter, FlightObject*
+ 		const int64_t dx = tx - shooter->world_x, dy = ty - shooter->world_y, dz = tz - shooter->world_z;
+ 		const int64_t along = (dx * shooter->fwd_x + dy * shooter->fwd_y + dz * shooter->fwd_z) >> 15;
+ 		const double range = sqrt((double)dx * dx + (double)dy * dy + (double)dz * dz);
+-		if (along >= UNITS_PER_KM / 10 && along <= UNITS_PER_KM * 5 / 2 && range > 0.0 &&
++		if (along >= UNITS_PER_KM / 50 && along <= UNITS_PER_KM * 5 / 2 && range > 0.0 &&
+ 			(double)along * 32768.0 >= COS_30_Q15 * range)
+ 			distance = along;
+ 	}
+@@ -864,6 +870,15 @@ uint16_t laser_createprojectile(uint16_t shooter_obj_idx, uint16_t hp_idx, uint1
+ 	if (radius < projectileweight[projectile_type - WEAPON_SPECIES_BASE])
+ 		objects[slot].collision_radius = (int16_t)projectileweight[projectile_type - WEAPON_SPECIES_BASE];
+ 	objects[slot].death_timer = (int16_t)(236 * projectilelife[projectile_type - WEAPON_SPECIES_BASE]);
++#ifdef TIE_MODERN
++	/* XvT's laser cannon bolts (species 137..142) fly twice as fast for half as long. */
++	if (TieFlightTweaks_XvtLasers() && projectile_type - WEAPON_SPECIES_BASE < 6) {
++		objects[slot].current_speed =
++			(int16_t)(shooter->current_speed + 2 * projectilevelocity[projectile_type - WEAPON_SPECIES_BASE]);
++		warheads[slot - NUM_CRAFTS].min_speed = (uint16_t)objects[slot].current_speed;
++		objects[slot].death_timer = (int16_t)(118 * projectilelife[projectile_type - WEAPON_SPECIES_BASE]);
++	}
++#endif
+ 
+ 	world_x = shooter->world_x;
+ 	world_y = shooter->world_y;
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index f3b577f..6aaab82 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -185,6 +185,7 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieFlightTweaks_SetCockpitStretch(app_config.requested.cockpit_stretch);
+ 		TieFlightTweaks_SetWidescreenHud(app_config.requested.widescreen_hud);
+ 		TieFlightTweaks_SetLaserConvergenceMetres(app_config.requested.laser_convergence_m);
++		TieFlightTweaks_SetXvtLasers(app_config.requested.xvt_lasers);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index ca3eccb..5f139c5 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -182,7 +182,7 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+ 				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
+-				  "laser_convergence", "models");
++				  "laser_convergence", "xvt_lasers", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -538,7 +538,8 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 		!TieAppConfig_ReadBool(document, "flight.cockpit_stretch", &out->cockpit_stretch, error, capacity) ||
+ 		!TieAppConfig_ReadBool(document, "flight.widescreen_hud", &out->widescreen_hud, error, capacity) ||
+ 		!TieAppConfig_ReadInt(document, "flight.laser_convergence", 0, 5000, &out->laser_convergence_m, error,
+-							  capacity))
++							  capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.xvt_lasers", &out->xvt_lasers, error, capacity))
+ 		return false;
+ 	const char* mouse_mode = AeronConfigFile_GetString(document, "input.mouse_mode", NULL);
+ 	if (!mouse_mode)
+@@ -775,6 +776,7 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.cockpit_stretch = config->cockpit_stretch,
+ 		.widescreen_hud = config->widescreen_hud,
+ 		.laser_convergence_m = config->laser_convergence_m,
++		.xvt_lasers = config->xvt_lasers,
+ 	};
+ }
+ 
+@@ -836,7 +838,8 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		!AeronConfigFile_SetBool(candidate, "flight.cockpit_stretch", options->cockpit_stretch, &aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "flight.widescreen_hud", options->widescreen_hud, &aeron_error) ||
+ 		!AeronConfigFile_SetInt(candidate, "flight.laser_convergence", options->laser_convergence_m,
+-								&aeron_error)) {
++								&aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.xvt_lasers", options->xvt_lasers, &aeron_error)) {
+ 		AeronConfigFile_Destroy(candidate);
+ 		return TieAppConfig_LogAeronError(&aeron_error, error, capacity);
+ 	}
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index e9eef55..c110445 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -51,6 +51,7 @@ typedef struct TieAppLiveFlightOptions {
+ 	bool cockpit_stretch;
+ 	bool widescreen_hud;
+ 	int laser_convergence_m; /* 0 fires parallel */
++	bool xvt_lasers;
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -94,6 +95,7 @@ typedef struct TieAppConfig {
+ 	bool cockpit_stretch;
+ 	bool widescreen_hud;
+ 	int laser_convergence_m;
++	bool xvt_lasers;
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index 3a848d1..08649c8 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -32,7 +32,7 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->player_engine_sound_volume_percent == right->player_engine_sound_volume_percent &&
+ 		   left->widescreen == right->widescreen && left->cockpit_stretch == right->cockpit_stretch &&
+ 		   left->widescreen_hud == right->widescreen_hud &&
+-		   left->laser_convergence_m == right->laser_convergence_m;
++		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+@@ -41,6 +41,7 @@ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* opt
+ 	options->widescreen = options->widescreen != 0;
+ 	options->cockpit_stretch = options->cockpit_stretch != 0;
+ 	options->widescreen_hud = options->widescreen_hud != 0;
++	options->xvt_lasers = options->xvt_lasers != 0;
+ }
+ 
+ bool TieFlightOptions_Configure(const TieAppLiveFlightOptions* requested, TieFlightOptionsApplyFn apply,
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index a25add7..7942773 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -182,6 +182,7 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 	TieFlightTweaks_SetCockpitStretch(requested->cockpit_stretch);
+ 	TieFlightTweaks_SetWidescreenHud(requested->widescreen_hud);
+ 	TieFlightTweaks_SetLaserConvergenceMetres(requested->laser_convergence_m);
++	TieFlightTweaks_SetXvtLasers(requested->xvt_lasers);
+ 	return true;
+ }
+ 
+@@ -781,6 +782,12 @@ static void TieSettings_GamePage(AeronUiContext* ui) {
+ 		TieSettings_SetFlightTweaks(&tweaks);
+ 	}
+ 	AeronUi_Help(ui, "Lasers converge on the target ahead, or at this distance; parallel with no target.");
++	static const char* const laser_styles[] = { "TIE Fighter", "X-Wing vs TIE Fighter" };
++	int laser_style = tweaks.xvt_lasers;
++	if (AeronUi_Selector(ui, "Laser Rate and Speed", &laser_style, laser_styles, 2)) {
++		tweaks.xvt_lasers = laser_style != 0;
++		TieSettings_SetFlightTweaks(&tweaks);
++	}
+ }
+ 
+ /* Follows OpenXW's mouse page with TIE's button behavior. */
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+index 947906c..ec2bcf9 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.c
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -3,6 +3,7 @@
+ static bool s_cockpit_stretch = true;
+ static bool s_widescreen_hud = true;
+ static int s_laser_convergence_m = 550;
++static bool s_xvt_lasers = true;
+ 
+ bool TieFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
+ 
+@@ -15,3 +16,7 @@ void TieFlightTweaks_SetWidescreenHud(bool enabled) { s_widescreen_hud = enabled
+ int TieFlightTweaks_LaserConvergenceMetres(void) { return s_laser_convergence_m; }
+ 
+ void TieFlightTweaks_SetLaserConvergenceMetres(int metres) { s_laser_convergence_m = metres > 0 ? metres : 0; }
++
++bool TieFlightTweaks_XvtLasers(void) { return s_xvt_lasers; }
++
++void TieFlightTweaks_SetXvtLasers(bool enabled) { s_xvt_lasers = enabled; }
+\ No newline at end of file
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+index 1016770..2693041 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.h
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -17,5 +17,10 @@ bool TieFlightTweaks_WidescreenHud(void);
+ void TieFlightTweaks_SetWidescreenHud(bool enabled);
+ int TieFlightTweaks_LaserConvergenceMetres(void);
+ void TieFlightTweaks_SetLaserConvergenceMetres(int metres);
++/* xvt_lasers (flight.xvt_lasers): laser cannons cycle and fly as in X-Wing vs
++ * TIE Fighter: 47 instead of 78 cooldown ticks per shot, and bolts at twice
++ * the speed for half the lifetime (same range). Applies to every craft. */
++bool TieFlightTweaks_XvtLasers(void);
++void TieFlightTweaks_SetXvtLasers(bool enabled);
+ 
+ #endif

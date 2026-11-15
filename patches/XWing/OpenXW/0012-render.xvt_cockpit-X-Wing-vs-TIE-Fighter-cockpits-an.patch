@@ -1,0 +1,1139 @@
+From 898a4ac3dfde05421f9db6af0074f2ba8829e9b5 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 16:42:46 +1100
+Subject: [PATCH 12/59] render.xvt_cockpit: X-Wing vs TIE Fighter cockpits and
+ cockpit-off HUD
+
+1998 flight draws XvT's cockpit art (Balance of Power CP640 <craft>.int and
+view LFDs, copied into resources/xvt_cockpit by the packaging script) for the
+X-Wing, Y-Wing, A-Wing and B-Wing, in every cockpit view including the
+cockpit-off HUD (X12HUD and so on).
+
+- X-Wing's instruments keep their own state and sprites and move to where
+  XvT's layout has the same role (laser charge/ready, warheads, shields,
+  hull, power, s-foils, gunsight marks), paired left to right within each
+  role. Other elements and panes move with their nearest mapped element.
+  X-Wing's large damage overlays are not drawn.
+- The XvT-style CMD fills XvT's CMD screen (no backdrop), with speed and
+  throttle on its bottom row; the throttle bar and speed pane are hidden.
+  The clock and max speed go to XvT's speed/throttle readout boxes.
+- Messages move from the 1998 bottom strip to under the radars, without
+  the strip background.
+- Cockpit off: the forward panel keeps updating; shields wrap XvT's HUD
+  hull icon, power bars go to the screen edges, warheads and clock to the
+  lower right boxes. The widescreen HUD splits the art at x 182/456 so the
+  CMD block stays whole.
+- Video settings toggle "XvT Cockpit and HUD" (needs the XvT targeting
+  computer).
+---
+ CMakeLists.txt                           |   1 +
+ resources/config.yaml                    |   3 +
+ src/xw/flight/hud/panel.c                |   8 +
+ src/xw_app/settings/video_page.c         |   1 +
+ src/xw_remaster/hud_draw.h               |   2 +
+ src/xw_remaster/hud_instruments.c        |  20 +-
+ src/xw_remaster/hud_readout.c            |  26 +-
+ src/xw_remaster/hud_renderer.c           |  78 ++-
+ src/xw_remaster/xvt_cockpit.c            | 633 +++++++++++++++++++++++
+ src/xw_remaster/xvt_cockpit.h            |  25 +
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   4 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   1 +
+ 15 files changed, 788 insertions(+), 21 deletions(-)
+ create mode 100644 src/xw_remaster/xvt_cockpit.c
+ create mode 100644 src/xw_remaster/xvt_cockpit.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a2c810d..7282701 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -924,6 +924,7 @@ set(XW_REMASTER_SOURCES
+     src/xw_remaster/hud_draw.c
+     src/xw_remaster/hud_instruments.c
+     src/xw_remaster/hud_readout.c
++    src/xw_remaster/xvt_cockpit.c
+     src/xw_remaster/hud_renderer.c
+     src/xw_remaster/target_view.c
+     src/xw_remaster/undither.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index aa58039..01c94dd 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -307,6 +307,9 @@ render:
+   # hull and systems, a live 3D model of the target, its orders and range. Also shown
+   # with the cockpit off.
+   xvt_targeting_computer: true
++  # X-Wing vs TIE Fighter cockpits and cockpit-off HUD (1998 flight, X/Y/A/B-Wing), from the
++  # Balance of Power art copied at packaging time. Needs the XvT targeting computer.
++  xvt_cockpit: true
+   msaa_samples: 2
+   temporal_upscaling:
+     mode: "off"
+diff --git a/src/xw/flight/hud/panel.c b/src/xw/flight/hud/panel.c
+index 7abe5fb..bbb66c0 100644
+--- a/src/xw/flight/hud/panel.c
++++ b/src/xw/flight/hud/panel.c
+@@ -11,6 +11,7 @@
+ #include "xw_dos94/flight/hud/panel.h"
+ #include "xw_dos94/flight/hud/replay.h"
+ #include "xw_dos94/render/display.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_camera.h"
+ #include "xw_runtime/runtime/flight_panel.h"
+ #include "xw_runtime/runtime/flight_types.h"
+@@ -279,6 +280,13 @@ void panel_updatepanel(void) {
+ 	if (g_playerFlightState.hudSuppressed == 0) {
+ 		if (g_flightCamera.hudStateLive == 0)
+ 			panel_updateforwardpanel();
++#ifdef XW_MODERN
++		/* render.xvt_cockpit: XvT's cockpit-off HUD shows shields, power, warheads and the clock, so the
++		 * forward panel keeps updating; the modern renderer moves its instruments onto the HUD. */
++		else if (g_flightCamera.hudStateLive == USER_TARGET_ANNOUNCEMENT_HUD_STATE && XwFlightTweaks_XvtCockpit() &&
++				 !XwFlightTypes_Dos())
++			panel_updateforwardpanel();
++#endif
+ 		else if (g_flightCamera.hudStateLive == USER_TARGET_ANNOUNCEMENT_HUD_STATE)
+ 			panel_updatefullforward();
+ 	}
+diff --git a/src/xw_app/settings/video_page.c b/src/xw_app/settings/video_page.c
+index 95ad5cc..aae5993 100644
+--- a/src/xw_app/settings/video_page.c
++++ b/src/xw_app/settings/video_page.c
+@@ -77,6 +77,7 @@ static void FlightControls(AeronUiContext* ui, XwSettings* draft) {
+ 	AeronUi_Toggle(ui, "Stretch Cockpit to Widescreen", &draft->cockpit_stretch);
+ 	AeronUi_Toggle(ui, "Widescreen Cockpit-Off HUD", &draft->hud_widescreen);
+ 	AeronUi_Toggle(ui, "XvT Targeting Computer", &draft->xvt_targeting_computer);
++	AeronUi_Toggle(ui, "XvT Cockpit and HUD", &draft->xvt_cockpit);
+ 	static const char* const quality[] = { "Off", "Low", "High" };
+ 	AeronUi_Selector(ui, "SSAO Quality", &r->scene.ssao.ssao_quality, quality, 3);
+ 	ShadowControl(ui, &r->scene.shadows);
+diff --git a/src/xw_remaster/hud_draw.h b/src/xw_remaster/hud_draw.h
+index baa33a8..656f61d 100644
+--- a/src/xw_remaster/hud_draw.h
++++ b/src/xw_remaster/hud_draw.h
+@@ -15,6 +15,8 @@ typedef struct XwHudDraw {
+ 	/* Set while drawing pane records: the whole pane moves by pane_shift. */
+ 	bool in_pane;
+ 	float pane_shift;
++	/* render.xvt_cockpit: XvT art is drawn and instruments move to XvT's positions. */
++	bool xvt;
+ } XwHudDraw;
+ 
+ /* Edge HUD shift for a pane whose contents span classic x0..x1. */
+diff --git a/src/xw_remaster/hud_instruments.c b/src/xw_remaster/hud_instruments.c
+index 4d44f2a..75ef3e4 100644
+--- a/src/xw_remaster/hud_instruments.c
++++ b/src/xw_remaster/hud_instruments.c
+@@ -1,4 +1,5 @@
+ #include "xw_remaster/hud_draw.h"
++#include "xw_remaster/xvt_cockpit.h"
+ #include <math.h>
+ 
+ static bool Part(const XwHudDraw* d, unsigned index, int x, int y, unsigned key, bool mirror) {
+@@ -9,6 +10,8 @@ static bool Part(const XwHudDraw* d, unsigned index, int x, int y, unsigned key,
+ 	const XwHudImage* image = XwHudAssets_Image(image_key);
+ 	if (!image)
+ 		return false;
++	if (d->xvt && image->bitmap.width * image->bitmap.height > XW_XVT_COCKPIT_OVERLAY_PIXELS)
++		return true;
+ 	XwSnapRect rect = { mirror ? x - image->bitmap.width + 1 : x, y, image->bitmap.width,
+ 						image->bitmap.height };
+ 	return XwHudDraw_Image(d, image_key, rect,
+@@ -57,21 +60,28 @@ bool XwHudDraw_Instruments(const XwHudDraw* d) {
+ 	const XwSnapCockpit* c = &d->snapshot->cockpit;
+ 	for (unsigned i = 0; i < XW_SNAP_WIDGETS; ++i) {
+ 		const XwSnapWidget* w = &c->widgets[i];
+-		const XwCockpitElement* e = &d->definition->elements[i];
++		XwCockpitElement e = d->definition->elements[i];
+ 		if (!w->visible)
+ 			continue;
++		if (d->xvt) {
++			int dx, dy;
++			if (!XwXvtCockpit_Element(d, i, &dx, &dy))
++				continue;
++			e.x += dx;
++			e.y += dy;
++		}
+ 		if (w->kind == XW_SNAP_WIDGET_SPRITE) {
+-			if (!Part(d, e->sprite + w->value, e->x, e->y, e->selector, false))
++			if (!Part(d, e.sprite + w->value, e.x, e.y, e.selector, false))
+ 				return false;
+ 		} else if (w->kind == XW_SNAP_WIDGET_GAUGE || w->kind == XW_SNAP_WIDGET_LASER) {
+ 			for (unsigned j = 0; j < w->segments; ++j) {
+ 				unsigned state = j < w->value ? w->filled_state : w->empty_state;
+-				if (!Part(d, e->sprite + state, e->x + j * w->step_x, e->y - j * w->step_y, 253,
+-						  w->kind == XW_SNAP_WIDGET_LASER && e->selector != 0))
++				if (!Part(d, e.sprite + state, e.x + j * w->step_x, e.y - j * w->step_y, 253,
++						  w->kind == XW_SNAP_WIDGET_LASER && e.selector != 0))
+ 					return false;
+ 			}
+ 		} else if (w->kind == XW_SNAP_WIDGET_THROTTLE)
+-			Throttle(d, e, w);
++			Throttle(d, &e, w);
+ 	}
+ 	const XwSnapRadar* r = &c->radar;
+ 	if (r->front_visible)
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index a65f741..6955f19 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -3,6 +3,7 @@
+  * the target, its orders and range. */
+ #include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/target_view.h"
++#include "xw_remaster/xvt_cockpit.h"
+ #include <aeron/asset/pnl.h>
+ #include <aeron/log.h>
+ #include <aeron/vfs.h>
+@@ -133,15 +134,28 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		if (font->font.glyphs[i].height > glyph_h)
+ 			glyph_h = font->font.glyphs[i].height;
+ 	float line = glyph_h + 2.0f;
+-	const XwSnapRect* box = &r->cmd;
++	XwSnapRect xvt_box;
++	bool xvt = d->xvt && XwXvtCockpit_CmdRect(s, &xvt_box);
++	const XwSnapRect* box = xvt ? &xvt_box : &r->cmd;
+ 	bool cockpit_off = s->camera.hud_state == XW_SNAP_VIEW_FULL_FORWARD;
+ 
+-	/* Cover X-Wing's own CMD artwork; with the cockpit off, a translucent panel at the same place. */
+-	Fill(&pen, box->x, box->y, box->width, box->height, BACKDROP, cockpit_off ? 0.55f : 1.0f);
++	float top = box->y + 1, bottom = box->y + box->height;
++	if (xvt) {
++		/* XvT's CMD screen is part of its art. Its bottom row shows speed and throttle. */
++		char speed[16], throttle[24], value[16];
++		XwXvtCockpit_PaneText(s, XW_SNAP_PANE_SPEED, value, sizeof value);
++		snprintf(speed, sizeof speed, "SPD %s", value[0] ? value : "0");
++		const XwSnapWidget* lever = &s->cockpit.widgets[22];
++		unsigned columns = d->definition->width == 320 ? 38 : 74;
++		snprintf(throttle, sizeof throttle, "THR %u%%", lever->visible ? (lever->value * 100 + columns / 2) / columns : 0);
++		bottom -= line;
++		Text(&pen, box->x + 3, bottom, speed, VALUE, box->width / 2 - 3);
++		Text(&pen, box->x + box->width - 3 - Measure(&pen, throttle), bottom, throttle, VALUE, box->width / 2);
++	} else
++		/* Cover X-Wing's own CMD artwork; with the cockpit off, a translucent panel at the same place. */
++		Fill(&pen, box->x, box->y, box->width, box->height, BACKDROP, cockpit_off ? 0.55f : 1.0f);
+ 	if (!r->target_valid)
+ 		return true;
+-
+-	float top = box->y + 1, bottom = box->y + box->height;
+ 	Centered(&pen, box, top,
+ 			 r->target_name, r->target_relation == 0 ? FRIENDLY : r->target_relation == 1 ? HOSTILE : OTHER);
+ 	char shd[16], hull[16], sys[16], stats[64];
+@@ -448,4 +462,4 @@ bool XwHudThreat_Draw(const XwHudDraw* d) {
+ 		Labelled(&pen, x, y + 3 * line, width, "TIME REMAINING:", THREAT_BLUE, remaining, THREAT_GREEN);
+ 	}
+ 	return true;
+-}
++}
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 2670db4..78a5920 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -3,6 +3,7 @@
+ #include "xw_remaster/hud_draw.h"
+ #include "xw_remaster/hud_readout.h"
+ #include "xw_remaster/target_view.h"
++#include "xw_remaster/xvt_cockpit.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include <aeron/aeron.h>
+ #include <math.h>
+@@ -18,6 +19,7 @@ typedef struct HudKey {
+ 	int widescreen_hud; /* int keeps the memcmp key free of padding. */
+ 	int cmd_active;     /* render.xvt_targeting_computer replaces the CMD panes. */
+ 	int threat_active;  /* view_target: XvT's threat display replaces the HUD. */
++	int xvt_cockpit;    /* render.xvt_cockpit: XvT art for this view. */
+ 	XwSnapReadout readout;
+ 	const AeronTexture* target_view;
+ } HudKey;
+@@ -39,8 +41,38 @@ static int Compare(const void* a, const void* b) {
+ 
+ static bool InRange(XwSnapRange r, unsigned i) { return i >= r.first && i - r.first < r.count; }
+ 
++/* render.xvt_cockpit: where each pane goes on XvT's art. */
++typedef struct PanePlace {
++	int dx, dy;
++	bool hidden, plain;
++} PanePlace;
++
++static void PanePlaces(const XwHudDraw* draw, PanePlace places[XW_SNAP_HUD_PANES]) {
++	memset(places, 0, XW_SNAP_HUD_PANES * sizeof *places);
++	if (!draw->xvt)
++		return;
++	const XwSnapCockpit* c = &draw->snapshot->cockpit;
++	for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
++		const XwSnapHudPane* pane = &c->panes[p];
++		int x = INT32_MAX, y = INT32_MAX;
++		for (unsigned i = 0; i < pane->glyphs.count; ++i) {
++			const XwSnapGlyph* g = &c->glyphs[pane->glyphs.first + i];
++			x = g->x < x ? g->x : x;
++			y = g->y < y ? g->y : y;
++		}
++		for (unsigned i = 0; i < pane->sprites.count; ++i) {
++			const XwSnapRect* r = &c->sprites[pane->sprites.first + i].destination;
++			x = r->x < x ? r->x : x;
++			y = r->y < y ? r->y : y;
++		}
++		places[p].hidden =
++			!XwXvtCockpit_Pane(draw, p, x, y, &places[p].dx, &places[p].dy, &places[p].plain);
++	}
++}
++
+ /* render.hud_widescreen: each pane moves to the screen edge as a whole, judged by its contents' extent. */
+-static void PaneShifts(const XwHudDraw* draw, float shifts[XW_SNAP_HUD_PANES]) {
++static void PaneShifts(const XwHudDraw* draw, const PanePlace places[XW_SNAP_HUD_PANES],
++					   float shifts[XW_SNAP_HUD_PANES]) {
+ 	const XwSnapCockpit* c = &draw->snapshot->cockpit;
+ 	for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
+ 		const XwSnapHudPane* pane = &c->panes[p];
+@@ -60,7 +92,9 @@ static void PaneShifts(const XwHudDraw* draw, float shifts[XW_SNAP_HUD_PANES]) {
+ 			x0 = fminf(x0, r->x);
+ 			x1 = fmaxf(x1, r->x + r->width);
+ 		}
+-		shifts[p] = x1 > x0 && p != XW_SNAP_PANE_READY_MESSAGE ? XwHudDraw_PaneShift(draw, x0, x1) : 0;
++		shifts[p] = x1 > x0 && p != XW_SNAP_PANE_READY_MESSAGE
++						? XwHudDraw_PaneShift(draw, x0 + places[p].dx, x1 + places[p].dx)
++						: 0;
+ 	}
+ }
+ 
+@@ -74,7 +108,9 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 	const XwSnapCockpit* c = &draw->snapshot->cockpit;
+ 	Ordered order[XW_SNAP_HUD_GLYPHS + XW_SNAP_HUD_PAINT + XW_SNAP_HUD_SPRITES];
+ 	float shifts[XW_SNAP_HUD_PANES];
+-	PaneShifts(draw, shifts);
++	PanePlace places[XW_SNAP_HUD_PANES];
++	PanePlaces(draw, places);
++	PaneShifts(draw, places, shifts);
+ 	unsigned n = 0;
+ 	for (unsigned i = 0; i < c->glyph_count; ++i)
+ 		order[n++] = (Ordered) { c->glyphs[i].order, i, 0 };
+@@ -88,30 +124,48 @@ static bool Panes(XwHudDraw* draw, bool skip_cmd) {
+ 		unsigned index = order[i].index;
+ 		draw->pane_shift = 0;
+ 		bool skip = false;
++		PanePlace place = { 0 };
+ 		for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
+ 			XwSnapRange r = order[i].kind == 0	 ? c->panes[p].glyphs
+ 							: order[i].kind == 1 ? c->panes[p].paint
+ 												 : c->panes[p].sprites;
+ 			if (InRange(r, index)) {
+ 				draw->pane_shift = shifts[p];
+-				skip = skip_cmd && CmdPane(p);
++				place = places[p];
++				skip = (skip_cmd && CmdPane(p)) || place.hidden || (place.plain && order[i].kind == 1);
+ 				break;
+ 			}
+ 		}
+ 		if (skip)
+ 			continue;
+ 		if (order[i].kind == 0) {
+-			if (!XwHudDraw_Glyph(draw, &c->glyphs[index]))
++			XwSnapGlyph g = c->glyphs[index];
++			g.x += place.dx;
++			g.y += place.dy;
++			g.clip.x += place.dx;
++			g.clip.y += place.dy;
++			if (place.plain)
++				g.background_enabled = 0;
++			if (!XwHudDraw_Glyph(draw, &g))
+ 				return false;
+ 		} else if (order[i].kind == 1) {
+ 			const XwSnapHudPaint* p = &c->paint[index];
+-			XwHudDraw_Fill(draw, (XwSnapRect) { p->x0, p->y0, p->x1 - p->x0, p->y1 - p->y0 }, p->clip,
++			XwSnapRect clip = p->clip;
++			clip.x += place.dx;
++			clip.y += place.dy;
++			XwHudDraw_Fill(draw,
++						   (XwSnapRect) { p->x0 + place.dx, p->y0 + place.dy, p->x1 - p->x0, p->y1 - p->y0 }, clip,
+ 						   p->color, false);
+ 		} else {
+ 			const XwSnapHudSprite* s = &c->sprites[index];
++			XwSnapRect destination = s->destination, clip = s->clip;
++			destination.x += place.dx;
++			destination.y += place.dy;
++			clip.x += place.dx;
++			clip.y += place.dy;
+ 			if (!XwHudDraw_Image(
+ 					draw, (XwHudImageKey) { s->image, s->frame, s->transparent_color, XW_HUD_IMAGE_PART },
+-					s->destination, s->clip, s->mirrored))
++					destination, clip, s->mirrored))
+ 				return false;
+ 		}
+ 	}
+@@ -143,7 +197,8 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .stretch_x = XwRenderMath_CockpitStretchX(&snapshot->camera, width, height),
+ 				   .widescreen_hud = XwFlightTweaks_WidescreenHud(),
+ 				   .cmd_active = XwHudCmd_Active(snapshot),
+-				   .threat_active = XwHudThreat_Active(snapshot) };
++				   .threat_active = XwHudThreat_Active(snapshot),
++				   .xvt_cockpit = XwXvtCockpit_Active(snapshot) };
+ 	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+@@ -163,7 +218,8 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		return false;
+ 	XwHudDraw draw = { .list = list,
+ 					   .snapshot = snapshot,
+-					   .definition = XwCockpitAssets_Definition(c->definition) };
++					   .definition = XwCockpitAssets_Definition(c->definition),
++					   .xvt = key.xvt_cockpit != 0 };
+ 	if (!draw.definition ||
+ 		!XwRenderMath_Layout(c->screen_width, c->screen_height, width, height, &draw.layout))
+ 		return false;
+@@ -183,7 +239,8 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 	if (key.threat_active)
+ 		XwHudThreat_Draw(&draw);
+ 	else {
+-		if (!XwHudDraw_Base(&draw) || !XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
++		if (!(draw.xvt ? XwXvtCockpit_DrawBase(&draw) : XwHudDraw_Base(&draw)) ||
++			!XwHudDraw_Instruments(&draw) || !Panes(&draw, key.cmd_active))
+ 			return false;
+ 		if (key.cmd_active)
+ 			XwHudCmd_Draw(&draw);
+@@ -251,6 +308,7 @@ void XwHudRenderer_Shutdown(void) {
+ 	list = NULL;
+ 	XwHudAssets_Shutdown();
+ 	XwHudThreat_Shutdown();
++	XwXvtCockpit_Shutdown();
+ 	ready = valid = false;
+ 	memset(&prepared, 0, sizeof prepared);
+ }
+diff --git a/src/xw_remaster/xvt_cockpit.c b/src/xw_remaster/xvt_cockpit.c
+new file mode 100644
+index 0000000..715e640
+--- /dev/null
++++ b/src/xw_remaster/xvt_cockpit.c
+@@ -0,0 +1,633 @@
++/* render.xvt_cockpit: X-Wing vs TIE Fighter cockpits for 1998 flight.
++ *
++ * The 1998 cockpits were cut down from XvT's (the message strip takes the bottom of the screen) and some were
++ * rearranged. X-Wing's instruments keep their own state and sprites and move to where XvT's cockpit has the
++ * same instrument; anything else moves with its nearest instrument. The cockpit-off HUD (view 19) takes XvT's
++ * HUD art, with the shields, power bars, warheads and clock moved to where XvT's HUD has them.
++ *
++ * Art and layouts are the Balance of Power CP640 files (<craft>.int, the view LFDs), copied into RESOURCE
++ * xvt_cockpit by the packaging script. The .int holds 28 view descriptors (36 bytes), 288 element records
++ * (12 bytes: forward cockpit 0-143, cockpit-off HUD 144-287) and the panel sprite file name. */
++#include "xw_remaster/xvt_cockpit.h"
++#include "xw_runtime/config/flight_tweaks.h"
++#include <aeron/aeron.h>
++#include <aeron/asset/lfd.h>
++#include <aeron/asset/pnl.h>
++#include <aeron/log.h>
++#include <aeron/vfs.h>
++#include <ctype.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++	DESCRIPTORS = 28,
++	DESCRIPTOR_BYTES = 36,
++	ELEMENTS = 288,
++	ELEMENT_BYTES = 12,
++	HUD_BASE = 144, /* XvT's cockpit-off HUD element set. */
++	VIEW_NONE = 18,
++	VIEW_HUD = 19,
++	MESSAGE_Y = 100,    /* Messages move from the 1998 bottom strip to just under the radars. */
++	MESSAGE_STRIP_Y = 456,
++	ART_CACHE = 24
++};
++
++/* X-Wing (and XvT) element and pane indices used here. */
++enum {
++	EL_SHIELD_FIRST = 15,
++	EL_SHIELD_LAST = 20, /* Front, front overcharge, rear, rear overcharge, distribution, hull. */
++	EL_HULL = 20,
++	EL_THROTTLE = 22,
++	EL_ENGINE_POWER = 28,
++	EL_SHIELD_POWER = 30,
++	EL_WARHEAD_COUNT = 13,
++	EL_CLOCK = 32,
++	EL_MAX_SPEED = 27,
++	XVT_HULL = 39,
++	XVT_ENGINE_POWER = 42,
++	XVT_CLOCK = 121 /* XvT's speed readout; in the cockpit-off HUD set, its lower right box. */
++};
++
++typedef struct Descriptor {
++	uint8_t enabled;
++	char lfd[10];
++	XwSnapRect viewport;
++	int16_t projection_offset_y;
++} Descriptor;
++
++typedef struct Element {
++	int16_t x, y, selector, color;
++} Element;
++
++typedef struct Craft {
++	char name[8]; /* "xwing", "ywing", "awing", "bwing". */
++	bool loaded;
++	Descriptor views[DESCRIPTORS];
++	Element elements[ELEMENTS];
++} Craft;
++
++typedef struct Art {
++	char name[10];
++	uint32_t palette_hash;
++	AeronTexture* texture;
++	uint64_t used;
++} Art;
++
++static Craft g_craft;
++static char g_failed[8];
++static Art g_art[ART_CACHE];
++static uint64_t g_use;
++
++static uint16_t U16(const uint8_t* p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++/* The X-Wing cockpit base names its craft: XWING12.LFD and so on. */
++static bool CraftName(const XwRenderSnapshot* s, char out[8]) {
++	const XwCockpitDefinition* d = XwCockpitAssets_Definition(s->cockpit.definition);
++	const XwRenderSource* source = d ? XwRenderAssets_Source(d->views[0].image) : NULL;
++	if (!source)
++		return false;
++	const char* base = source->path;
++	for (const char* p = source->path; *p; ++p)
++		if (*p == '/' || *p == '\\')
++			base = p + 1;
++	static const char* const known[] = { "XWING", "YWING", "AWING", "BWING" };
++	for (unsigned i = 0; i < 4; ++i)
++		if (!strncasecmp(base, known[i], 5)) {
++			for (unsigned c = 0; c < 5; ++c)
++				out[c] = (char)tolower((unsigned char)known[i][c]);
++			out[5] = 0;
++			return true;
++		}
++	return false;
++}
++
++static bool LoadCraft(const char* name) {
++	if (g_craft.loaded && !strcmp(g_craft.name, name))
++		return true;
++	if (!strcmp(g_failed, name))
++		return false;
++	memset(&g_craft, 0, sizeof g_craft);
++	char path[64];
++	snprintf(path, sizeof path, "xvt_cockpit/%s.int", name);
++	uint8_t* bytes = NULL;
++	size_t size = 0;
++	if (!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 16, &bytes, &size) ||
++		size < DESCRIPTORS * DESCRIPTOR_BYTES + ELEMENTS * ELEMENT_BYTES) {
++		free(bytes);
++		Aeron_LogWarn("xw.hud", "XvT cockpit layout %s is missing; the 1998 cockpit stays", path);
++		snprintf(g_failed, sizeof g_failed, "%s", name);
++		return false;
++	}
++	for (unsigned i = 0; i < DESCRIPTORS; ++i) {
++		const uint8_t* p = bytes + i * DESCRIPTOR_BYTES;
++		Descriptor* d = &g_craft.views[i];
++		d->enabled = p[0];
++		memcpy(d->lfd, p + 1, 9);
++		d->lfd[9] = 0;
++		d->viewport = (XwSnapRect) { U16(p + 10), U16(p + 12), U16(p + 14), U16(p + 16) };
++		d->projection_offset_y = (int16_t)U16(p + 18);
++	}
++	for (unsigned i = 0; i < ELEMENTS; ++i) {
++		const uint8_t* p = bytes + DESCRIPTORS * DESCRIPTOR_BYTES + i * ELEMENT_BYTES;
++		g_craft.elements[i] = (Element) { (int16_t)U16(p), (int16_t)U16(p + 2), (int16_t)U16(p + 4),
++										  (int16_t)U16(p + 6) };
++	}
++	free(bytes);
++	snprintf(g_craft.name, sizeof g_craft.name, "%s", name);
++	g_craft.loaded = true;
++	return true;
++}
++
++/* XvT's view aliases: 0x80+n shares view n's art, 0xC0+n mirrors it. */
++static bool Resolve(unsigned view, unsigned* resource, bool* mirrored) {
++	if (view >= DESCRIPTORS || view == VIEW_NONE)
++		return false;
++	unsigned enabled = g_craft.views[view].enabled;
++	*mirrored = enabled >= 0xC0;
++	*resource = enabled >= 0xC0 ? enabled - 0xC0 : enabled >= 0x80 ? enabled - 0x80 : view;
++	return enabled && *resource < DESCRIPTORS && g_craft.views[*resource].lfd[0];
++}
++
++bool XwXvtCockpit_Active(const XwRenderSnapshot* s) {
++	char name[8];
++	unsigned resource;
++	bool mirrored;
++	return XwFlightTweaks_XvtCockpit() && XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 &&
++		   s->hud_valid && !s->camera.replay_mode && !s->cockpit.suppressed && CraftName(s, name) &&
++		   LoadCraft(name) && Resolve(s->cockpit.view, &resource, &mirrored);
++}
++
++/* FlightSw_CopyViewportSpanMaskRle runs at 640 wide: positive parity is the world opening. */
++static int MaskRun(const uint8_t** cursor, const uint8_t* end) {
++	if (*cursor == end)
++		return -1;
++	unsigned value = *(*cursor)++;
++	if (value)
++		return (int)value;
++	if (*cursor == end)
++		return -1;
++	unsigned extension = *(*cursor)++;
++	if (extension == 255)
++		return 511;
++	if (extension)
++		return 256 + (int)extension;
++	if (*cursor == end)
++		return -1;
++	return 511 + (uint8_t)(*(*cursor)++ + 1);
++}
++
++static void ApplyMask(AeronIndexedFrame* frame, const AeronLfdEntry* mask, XwSnapRect rect) {
++	if (rect.x < 0 || rect.y < 0 || rect.x + rect.width > frame->width || rect.y + rect.height > frame->height)
++		return;
++	const uint8_t *p = mask->data, *end = p + mask->size;
++	for (int y = 0; y < rect.height && p != end; ++y) {
++		int8_t state = (int8_t)*p++;
++		for (int x = 0; x < rect.width;) {
++			int run = MaskRun(&p, end);
++			if (run <= 0)
++				return;
++			int visible = run < rect.width - x ? run : rect.width - x;
++			if (state >= 0)
++				memset(frame->coverage + (size_t)(rect.y + y) * frame->width + rect.x + x, 0, (size_t)visible);
++			x += visible;
++			state = (int8_t)-state;
++		}
++	}
++}
++
++static uint32_t Hash(const uint32_t colors[256]) {
++	uint32_t h = 2166136261u;
++	for (unsigned i = 0; i < 256; ++i)
++		h = (h ^ colors[i]) * 16777619u;
++	return h;
++}
++
++/* Cockpit colors 0-63 come from the view's PLTT; the rest are the flight palette, as in XvT. */
++static AeronTexture* Texture(const char* lfd_name, XwSnapRect aperture, const uint32_t flight[256]) {
++	uint32_t colors[256];
++	memcpy(colors, flight, sizeof colors);
++	char path[64];
++	snprintf(path, sizeof path, "xvt_cockpit/%s.lfd", lfd_name);
++	for (char* c = path; *c; ++c)
++		*c = (char)tolower((unsigned char)*c);
++	uint8_t* bytes = NULL;
++	size_t size = 0;
++	AeronLfd lfd = { 0 };
++	if (!AeronVfs_ReadAll(Aeron_GetVfs(), AERON_VFS_ROOT_RESOURCE, path, 1 << 22, &bytes, &size) ||
++		!AeronLfd_Parse(bytes, size, &lfd, NULL)) {
++		free(bytes);
++		return NULL;
++	}
++	const AeronLfdEntry* panl = AeronLfd_Find(&lfd, AERON_LFD_FOURCC('P', 'A', 'N', 'L'));
++	const AeronLfdEntry* pltt = AeronLfd_Find(&lfd, AERON_LFD_FOURCC('P', 'L', 'T', 'T'));
++	const AeronLfdEntry* mask = AeronLfd_Find(&lfd, AERON_LFD_FOURCC('M', 'A', 'S', 'K'));
++	if (pltt && pltt->size >= 2)
++		for (unsigned i = pltt->data[0]; i <= pltt->data[1] && i < 256 && 2 + (i - pltt->data[0]) * 3 + 2 < pltt->size;
++			 ++i) {
++			const uint8_t* rgb = pltt->data + 2 + (i - pltt->data[0]) * 3;
++			uint32_t argb = 0xff000000u;
++			for (unsigned c = 0; c < 3; ++c) {
++				unsigned v = rgb[c] >> 2; /* Six-bit VGA DAC values. */
++				argb |= (uint32_t)((v << 2) | (v >> 4)) << (16 - 8 * c);
++			}
++			colors[i] = argb;
++		}
++	AeronIndexedFrame frame = { 0 };
++	AeronTexture* texture = NULL;
++	if (panl && AeronPnl_DecodeIndexed(panl->data, panl->size, 0, -1, &frame, NULL)) {
++		if (mask)
++			ApplyMask(&frame, mask, aperture);
++		size_t pixels = (size_t)frame.width * frame.height;
++		uint8_t* rgba = malloc(pixels * 4);
++		if (rgba) {
++			for (size_t i = 0; i < pixels; ++i) {
++				uint32_t argb = colors[frame.indices[i]];
++				bool covered = frame.coverage[i] != 0;
++				rgba[i * 4 + 0] = covered ? (uint8_t)(argb >> 16) : 0;
++				rgba[i * 4 + 1] = covered ? (uint8_t)(argb >> 8) : 0;
++				rgba[i * 4 + 2] = covered ? (uint8_t)argb : 0;
++				rgba[i * 4 + 3] = covered ? 255 : 0;
++			}
++			AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
++			texture = cmd ? Aeron_CreateTexture(&(AeronTextureDesc) {
++								.width = frame.width,
++								.height = frame.height,
++								.format = AERON_TEXTURE_FORMAT_RGBA8_SRGB,
++								.usage = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
++								.debug_name = "xw.xvt_cockpit" })
++						  : NULL;
++			if (!texture || !Aeron_UploadTextureDataCmd(cmd, &(AeronTextureUploadDesc) {
++															 .texture = texture,
++															 .width = frame.width,
++															 .height = frame.height,
++															 .raw_data = rgba,
++															 .raw_size = pixels * 4 }) ||
++				!Aeron_SubmitCommandBuffer(cmd)) {
++				if (cmd)
++					Aeron_CancelCommandBuffer(cmd);
++				Aeron_DestroyTexture(texture);
++				texture = NULL;
++			}
++			free(rgba);
++		}
++	}
++	AeronIndexedFrame_Free(&frame);
++	AeronLfd_Free(&lfd);
++	free(bytes);
++	if (!texture)
++		Aeron_LogWarn("xw.hud", "Unable to prepare XvT cockpit art %s", path);
++	return texture;
++}
++
++static AeronTexture* CachedArt(const char* lfd_name, XwSnapRect aperture, const uint32_t flight[256]) {
++	uint32_t hash = Hash(flight);
++	Art* slot = &g_art[0];
++	for (unsigned i = 0; i < ART_CACHE; ++i) {
++		if (g_art[i].texture && !strcmp(g_art[i].name, lfd_name) && g_art[i].palette_hash == hash) {
++			g_art[i].used = ++g_use;
++			return g_art[i].texture;
++		}
++		if (!g_art[i].texture || g_art[i].used < slot->used)
++			slot = &g_art[i];
++	}
++	Aeron_DestroyTexture(slot->texture);
++	memset(slot, 0, sizeof *slot);
++	slot->texture = Texture(lfd_name, aperture, flight);
++	if (slot->texture) {
++		snprintf(slot->name, sizeof slot->name, "%s", lfd_name);
++		slot->palette_hash = hash;
++		slot->used = ++g_use;
++	}
++	return slot->texture;
++}
++
++static void Blit(const XwHudDraw* d, AeronTexture* texture, float x0, float x1, float shift, bool mirrored) {
++	float u0 = x0 / 640.0f, u1 = x1 / 640.0f;
++	if (mirrored) {
++		u0 = 1 - u0;
++		u1 = 1 - u1;
++	}
++	AeronDrawList2DSprite sprite = { .texture = texture,
++									 .src_u0 = u0,
++									 .src_v0 = 0,
++									 .src_u1 = u1,
++									 .src_v1 = 1,
++									 .dst_x = d->offset_x + shift + x0 * d->layout.scale_x,
++									 .dst_y = d->offset_y,
++									 .dst_w = (x1 - x0) * d->layout.scale_x,
++									 .dst_h = 480 * d->layout.scale_y,
++									 .tint = { 1, 1, 1, 1 },
++									 .blend = AERON_BLIT2D_BLEND_PMA,
++									 .filter = AERON_BLIT2D_FILTER_NEAREST };
++	AeronDrawList_AddSprite(d->list, &sprite);
++}
++
++bool XwXvtCockpit_DrawBase(const XwHudDraw* d) {
++	const XwRenderSnapshot* s = d->snapshot;
++	unsigned resource;
++	bool mirrored;
++	if (!Resolve(s->cockpit.view, &resource, &mirrored))
++		return true;
++	const Descriptor* v = &g_craft.views[resource];
++	AeronTexture* texture = CachedArt(v->lfd, v->viewport, s->cockpit.palette_argb);
++	if (!texture)
++		return true;
++	/* Widescreen cockpit-off HUD: the sides move out with the instruments over them; the CMD block
++	 * (x 188-451) stays whole in the middle. */
++	if (d->edge_shift > 0 && s->cockpit.view == VIEW_HUD) {
++		Blit(d, texture, 0, 182, -d->edge_shift, mirrored);
++		Blit(d, texture, 182, 456, 0, mirrored);
++		Blit(d, texture, 456, 640, d->edge_shift, mirrored);
++	} else
++		Blit(d, texture, 0, 640, 0, mirrored);
++	return true;
++}
++
++/* X-Wing forward elements and their XvT counterparts, by role. Each group pairs in left-to-right order
++ * (then top to bottom), since the two games number a craft's cannons and launchers differently. */
++enum { GROUP_SIZE = 8 };
++
++typedef struct Group {
++	char craft; /* 'b': B-Wing only, '-': all but the B-Wing, 0: every craft. */
++	uint8_t count, xw[GROUP_SIZE], xvt[GROUP_SIZE];
++} Group;
++
++/* XvT gives each cannon role eight slots. The B-Wing's six cannons use X-Wing's slots 3-8 for charge bars,
++ * 58-63 for ready lights and 66-71 for the gunsight marks. */
++static const Group kGroups[] = {
++	{ '-', 4, { 3, 4, 5, 6 }, { 3, 4, 5, 6 } },                       /* Laser charge bars. */
++	{ '-', 4, { 7, 8, 9, 10 }, { 11, 12, 13, 14 } },                  /* Laser ready lights. */
++	{ 'b', 6, { 3, 4, 5, 6, 7, 8 }, { 3, 4, 5, 6, 7, 8 } },
++	{ 'b', 6, { 58, 59, 60, 61, 62, 63 }, { 11, 12, 13, 14, 15, 16 } },
++	{ 'b', 6, { 66, 67, 68, 69, 70, 71 }, { 53, 54, 55, 56, 57, 58 } },
++	{ 0, 2, { 11, 12 }, { 19, 20 } },                                 /* Linked fire lights. */
++	{ 0, 2, { 13, 14 }, { 27, 28 } },                                 /* Warhead counts. */
++	{ 0, 1, { 15 }, { 35 } },                                         /* Front shield. */
++	{ 0, 1, { 16 }, { 36 } },                                         /* Front overcharge. */
++	{ 0, 1, { 17 }, { 37 } },                                         /* Rear shield. */
++	{ 0, 1, { 18 }, { 38 } },                                         /* Rear overcharge. */
++	{ 0, 1, { 19 }, { 51 } },                                         /* Shield distribution. */
++	{ 0, 1, { 20 }, { 39 } },                                         /* Hull. */
++	{ 0, 1, { 28 }, { 42 } },                                         /* Engine power. */
++	{ 0, 1, { 29 }, { 43 } },                                         /* Laser power. */
++	{ 0, 1, { 30 }, { 44 } },                                         /* Shield power. */
++	{ 0, 1, { 31 }, { 45 } },                                         /* S-foils. */
++	{ 0, 1, { 33 }, { 47 } },                                         /* Panel indicator lights. */
++	{ 0, 1, { 34 }, { 48 } },
++	{ 0, 1, { 35 }, { 49 } },                                         /* View label. */
++	{ 0, 1, { 36 }, { 50 } },                                         /* Critical warning. */
++	{ 0, 1, { 37 }, { 52 } },                                         /* Gunsight. */
++	{ '-', 4, { 38, 39, 40, 41 }, { 53, 54, 55, 56 } },               /* Gunsight laser marks. */
++	{ 0, 4, { 42, 43, 44, 45 }, { 61, 62, 63, 64 } },                 /* Gunsight range marks. */
++};
++
++typedef struct Offset {
++	int16_t dx, dy;
++	uint8_t state; /* 0 unmapped, 1 mapped, 2 no place in XvT's cockpit. */
++} Offset;
++
++static Offset g_offsets[XW_SNAP_WIDGETS];
++static const XwCockpitDefinition* g_offsets_for;
++static char g_offsets_craft[8];
++
++static bool Placed(const Element* e) { return e->x || e->y; }
++
++static int Before(int ax, int ay, int bx, int by) { return ax != bx ? ax < bx : ay < by; }
++
++/* Indices of `count` points sorted left to right, then top to bottom. */
++static void Order(int (*points)[2], unsigned count, unsigned order[GROUP_SIZE]) {
++	for (unsigned i = 0; i < count; ++i)
++		order[i] = i;
++	for (unsigned i = 1; i < count; ++i)
++		for (unsigned j = i; j > 0 && Before(points[order[j]][0], points[order[j]][1], points[order[j - 1]][0],
++											 points[order[j - 1]][1]);
++			 --j) {
++			unsigned t = order[j];
++			order[j] = order[j - 1];
++			order[j - 1] = t;
++		}
++}
++
++static void ComputeOffsets(const XwCockpitDefinition* d) {
++	if (g_offsets_for == d && !strcmp(g_offsets_craft, g_craft.name))
++		return;
++	memset(g_offsets, 0, sizeof g_offsets);
++	bool bwing = g_craft.name[0] == 'b';
++	for (unsigned g = 0; g < sizeof kGroups / sizeof kGroups[0]; ++g) {
++		const Group* group = &kGroups[g];
++		if ((group->craft == 'b' && !bwing) || (group->craft == '-' && bwing))
++			continue;
++		int xw[GROUP_SIZE][2], xvt[GROUP_SIZE][2];
++		unsigned xw_index[GROUP_SIZE], xvt_index[GROUP_SIZE], n_xw = 0, n_xvt = 0;
++		for (unsigned i = 0; i < group->count; ++i) {
++			const XwCockpitElement* e = &d->elements[group->xw[i]];
++			if (e->x || e->y) {
++				xw_index[n_xw] = group->xw[i];
++				xw[n_xw][0] = e->x;
++				xw[n_xw++][1] = e->y;
++			}
++			const Element* v = &g_craft.elements[group->xvt[i]];
++			if (Placed(v)) {
++				xvt_index[n_xvt] = group->xvt[i];
++				xvt[n_xvt][0] = v->x;
++				xvt[n_xvt++][1] = v->y;
++			}
++		}
++		unsigned a[GROUP_SIZE], b[GROUP_SIZE];
++		Order(xw, n_xw, a);
++		Order(xvt, n_xvt, b);
++		for (unsigned i = 0; i < n_xw; ++i) {
++			Offset* o = &g_offsets[xw_index[a[i]]];
++			if (i < n_xvt) {
++				const Element* v = &g_craft.elements[xvt_index[b[i]]];
++				*o = (Offset) { (int16_t)(v->x - xw[a[i]][0]), (int16_t)(v->y - xw[a[i]][1]), 1 };
++			} else
++				o->state = 2;
++		}
++	}
++	g_offsets_for = d;
++	snprintf(g_offsets_craft, sizeof g_offsets_craft, "%s", g_craft.name);
++}
++
++/* Unmapped elements and panes move with the nearest mapped element. */
++static void Nearest(const XwCockpitDefinition* d, int x, int y, int* dx, int* dy) {
++	long best = -1;
++	for (unsigned i = 0; i < XW_SNAP_WIDGETS; ++i) {
++		if (g_offsets[i].state != 1)
++			continue;
++		long ex = d->elements[i].x - x, ey = d->elements[i].y - y, distance = ex * ex + ey * ey;
++		if (best < 0 || distance < best) {
++			best = distance;
++			*dx = g_offsets[i].dx;
++			*dy = g_offsets[i].dy;
++		}
++	}
++}
++
++/* Cockpit off: from X-Wing element `xw` (forward position) to XvT HUD element `hud`, which shows what
++ * XvT forward element `forward` does. */
++static void HudOffset(const XwCockpitDefinition* d, unsigned xw, unsigned forward, unsigned hud, int* dx,
++					  int* dy) {
++	const Element *f = &g_craft.elements[forward], *h = &g_craft.elements[HUD_BASE + hud];
++	int fx = d->elements[xw].x + g_offsets[xw].dx, fy = d->elements[xw].y + g_offsets[xw].dy;
++	*dx = h->x - f->x + fx - d->elements[xw].x;
++	*dy = h->y - f->y + fy - d->elements[xw].y;
++}
++
++bool XwXvtCockpit_Element(const XwHudDraw* d, unsigned index, int* dx, int* dy) {
++	*dx = *dy = 0;
++	if (index >= XW_SNAP_WIDGETS)
++		return false;
++	ComputeOffsets(d->definition);
++	const XwCockpitElement* e = &d->definition->elements[index];
++	const Offset* o = &g_offsets[index];
++	unsigned view = d->snapshot->cockpit.view;
++	if (view == 0) {
++		/* XvT shows throttle as text in the CMD. */
++		if (index == EL_THROTTLE || o->state == 2)
++			return false;
++		if (o->state == 1) {
++			*dx = o->dx;
++			*dy = o->dy;
++		} else
++			Nearest(d->definition, e->x, e->y, dx, dy);
++		return true;
++	}
++	if (view != VIEW_HUD)
++		return true;
++	/* Cockpit off: the gunsight stays; shields wrap XvT's HUD hull icon; power bars go to the edges. */
++	if (index >= 37 && index <= 45)
++		return true;
++	if (index >= EL_SHIELD_FIRST && index <= EL_SHIELD_LAST && g_offsets[EL_HULL].state == 1) {
++		/* Arcs keep their place around the hull icon. */
++		HudOffset(d->definition, EL_HULL, XVT_HULL, XVT_HULL, dx, dy);
++		*dx += o->state == 1 ? o->dx - g_offsets[EL_HULL].dx : 0;
++		*dy += o->state == 1 ? o->dy - g_offsets[EL_HULL].dy : 0;
++		return true;
++	}
++	if (index >= EL_ENGINE_POWER && index <= EL_SHIELD_POWER && o->state == 1) {
++		unsigned gauge = index - EL_ENGINE_POWER;
++		HudOffset(d->definition, index, XVT_ENGINE_POWER + gauge, XVT_ENGINE_POWER + gauge, dx, dy);
++		return true;
++	}
++	return false;
++}
++
++bool XwXvtCockpit_Pane(const XwHudDraw* d, unsigned pane, int x, int y, int* dx, int* dy, bool* plain) {
++	*dx = *dy = 0;
++	*plain = false;
++	const XwCockpitDefinition* def = d->definition;
++	unsigned view = d->snapshot->cockpit.view;
++	ComputeOffsets(def);
++	switch (pane) {
++		case XW_SNAP_PANE_READY_MESSAGE:
++			*dy = MESSAGE_Y - MESSAGE_STRIP_Y;
++			*plain = true;
++			return true;
++		/* The CMD shows speed and throttle as XvT's does. */
++		case XW_SNAP_PANE_SPEED:
++		case XW_SNAP_PANE_THROTTLE:
++			return false;
++		case XW_SNAP_PANE_VIEW_LABEL:
++		case XW_SNAP_PANE_COURSE:
++		case XW_SNAP_PANE_FRAME_RATE:
++		case XW_SNAP_PANE_REPLAY_TITLE:
++		case XW_SNAP_PANE_REPLAY_STATUS:
++		case XW_SNAP_PANE_REPLAY_BUTTONS:
++			return true;
++		default:
++			break;
++	}
++	if (view == VIEW_HUD) {
++		/* XvT HUD's lower right boxes: warheads, then the clock. Max speed and the film counter have no place. */
++		const Element* box;
++		unsigned anchor;
++		if (pane == XW_SNAP_PANE_WARHEADS) {
++			box = &g_craft.elements[HUD_BASE + 120];
++			anchor = EL_WARHEAD_COUNT;
++		} else if (pane == XW_SNAP_PANE_CLOCK) {
++			box = &g_craft.elements[HUD_BASE + XVT_CLOCK];
++			anchor = EL_CLOCK;
++		} else
++			return false;
++		int left = def->elements[anchor].x;
++		if (pane == XW_SNAP_PANE_WARHEADS && def->elements[EL_WARHEAD_COUNT + 1].x < left)
++			left = def->elements[EL_WARHEAD_COUNT + 1].x;
++		*dx = box->x + 4 - left;
++		*dy = box->y + 3 - def->elements[anchor].y;
++		return true;
++	}
++	if (view != 0 || x == INT32_MAX)
++		return true;
++	/* XvT's speed (121) and throttle (120) readout boxes take the clock and max speed; the CMD shows speed
++	 * and throttle. The offsets put the text inside the boxes as on the X-Wing's panel. */
++	if (pane == XW_SNAP_PANE_CLOCK || pane == XW_SNAP_PANE_MAX_SPEED) {
++		bool clock = pane == XW_SNAP_PANE_CLOCK;
++		const Element* box = &g_craft.elements[clock ? XVT_CLOCK : XVT_CLOCK - 1];
++		/* The B-Wing's boxes are placed but unused by XvT (selector 0). */
++		if (!Placed(box))
++			return false;
++		const XwCockpitElement* e = &def->elements[clock ? EL_CLOCK : EL_MAX_SPEED];
++		*dx = box->x + (clock ? 0 : 22) - e->x;
++		*dy = box->y - (clock ? 14 : 9) - e->y;
++		return true;
++	}
++	if (pane == XW_SNAP_PANE_WARHEADS && g_offsets[EL_WARHEAD_COUNT].state == 1) {
++		*dx = g_offsets[EL_WARHEAD_COUNT].dx;
++		*dy = g_offsets[EL_WARHEAD_COUNT].dy;
++		/* Two counts can map to different XvT spacing; the left one anchors the pane. */
++		if (g_offsets[EL_WARHEAD_COUNT + 1].state == 1 &&
++			def->elements[EL_WARHEAD_COUNT + 1].x < def->elements[EL_WARHEAD_COUNT].x) {
++			*dx = g_offsets[EL_WARHEAD_COUNT + 1].dx;
++			*dy = g_offsets[EL_WARHEAD_COUNT + 1].dy;
++		}
++		return true;
++	}
++	Nearest(def, x, y, dx, dy);
++	return true;
++}
++
++bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* s, XwSnapRect* rect) {
++	if (!XwXvtCockpit_Active(s))
++		return false;
++	if (s->cockpit.view == 0) {
++		/* Element 2 is the CMD's 3D view; the screen around it has a title row above and a status row below. */
++		const Element* crt = &g_craft.elements[2];
++		int top = crt->y - 30, bottom = crt->y + crt->color + 20;
++		*rect = (XwSnapRect) { crt->x, top, crt->selector + 2, (bottom < 480 ? bottom : 478) - top };
++	} else if (s->cockpit.view == VIEW_HUD)
++		*rect = (XwSnapRect) { 232, 358, 176, 120 };
++	else
++		return false;
++	return true;
++}
++
++void XwXvtCockpit_PaneText(const XwRenderSnapshot* s, unsigned pane, char* out, size_t capacity) {
++	size_t n = 0;
++	if (capacity)
++		out[0] = 0;
++	if (pane >= XW_SNAP_HUD_PANES || !capacity)
++		return;
++	const XwSnapCockpit* c = &s->cockpit;
++	XwSnapRange r = c->panes[pane].glyphs;
++	/* Glyph records may repeat a cell when a digit is redrawn; keep the latest by x. */
++	int last_x = -32768;
++	for (unsigned i = 0; i < r.count && r.first + i < c->glyph_count && n + 1 < capacity; ++i) {
++		const XwSnapGlyph* g = &c->glyphs[r.first + i];
++		if (g->x <= last_x)
++			continue;
++		last_x = g->x;
++		if (g->character > ' ' && g->character < 127)
++			out[n++] = (char)g->character;
++	}
++	out[n] = 0;
++}
++
++void XwXvtCockpit_Shutdown(void) {
++	for (unsigned i = 0; i < ART_CACHE; ++i)
++		Aeron_DestroyTexture(g_art[i].texture);
++	memset(g_art, 0, sizeof g_art);
++	memset(&g_craft, 0, sizeof g_craft);
++	g_failed[0] = 0;
++}
+diff --git a/src/xw_remaster/xvt_cockpit.h b/src/xw_remaster/xvt_cockpit.h
+new file mode 100644
+index 0000000..c6d46fe
+--- /dev/null
++++ b/src/xw_remaster/xvt_cockpit.h
+@@ -0,0 +1,25 @@
++#ifndef XW_REMASTER_XVT_COCKPIT_H
++#define XW_REMASTER_XVT_COCKPIT_H
++#include "xw_remaster/hud_draw.h"
++
++/* render.xvt_cockpit: X-Wing vs TIE Fighter's cockpit art (Balance of Power CP640, copied into RESOURCE
++ * xvt_cockpit at packaging time) replaces the 1998 cockpit. X-Wing's own instruments keep drawing, moved
++ * to where XvT's cockpit has them; the XvT-style CMD fills XvT's CMD screen. */
++
++/* True when this frame's cockpit view is drawn with XvT art. */
++bool XwXvtCockpit_Active(const XwRenderSnapshot* snapshot);
++/* The XvT cockpit for the current view, in place of XwHudDraw_Base. */
++bool XwXvtCockpit_DrawBase(const XwHudDraw* draw);
++/* Where X-Wing element `index` draws: classic-pixel offset from its X-Wing position. False hides it. */
++bool XwXvtCockpit_Element(const XwHudDraw* draw, unsigned index, int* dx, int* dy);
++/* Instrument sprites larger than this many pixels are X-Wing's damage overlays, which do not fit XvT art. */
++enum { XW_XVT_COCKPIT_OVERLAY_PIXELS = 3000 };
++/* Pane placement as for elements, for a pane whose contents start at classic (x, y) (INT32_MAX when empty).
++ * `plain` drops the pane's fills and text backgrounds. */
++bool XwXvtCockpit_Pane(const XwHudDraw* draw, unsigned pane, int x, int y, int* dx, int* dy, bool* plain);
++/* XvT's CMD screen in classic pixels. False when the X-Wing CMD position applies. */
++bool XwXvtCockpit_CmdRect(const XwRenderSnapshot* snapshot, XwSnapRect* rect);
++/* Text of a captured HUD pane in reading order ("" when absent). */
++void XwXvtCockpit_PaneText(const XwRenderSnapshot* snapshot, unsigned pane, char* out, size_t capacity);
++void XwXvtCockpit_Shutdown(void);
++#endif
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index a50b7f8..c67da27 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -8,6 +8,11 @@ static int s_ai_ion_link = XW_AI_ION_LINK_ALL;
+ static bool s_xvt_throttle = true;
+ static bool s_xvt_targeting_computer = true;
+ static bool s_restore_pilot = true;
++static bool s_xvt_cockpit = true;
++
++bool XwFlightTweaks_XvtCockpit(void) { return s_xvt_cockpit; }
++
++void XwFlightTweaks_SetXvtCockpit(bool enabled) { s_xvt_cockpit = enabled; }
+ 
+ bool XwFlightTweaks_RestorePilot(void) { return s_restore_pilot; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index b92daa8..2ccff7e 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -46,6 +46,10 @@ bool XwFlightTweaks_RestorePilot(void);
+ void XwFlightTweaks_SetRestorePilot(bool enabled);
+ bool XwFlightTweaks_XvtTargetingComputer(void);
+ void XwFlightTweaks_SetXvtTargetingComputer(bool enabled);
++/* render.xvt_cockpit: 1998 flight draws X-Wing vs TIE Fighter's cockpit art (Balance of Power CP640) and
++ * cockpit-off HUD, with X-Wing's instruments moved to XvT's positions. Needs xvt_targeting_computer. */
++bool XwFlightTweaks_XvtCockpit(void);
++void XwFlightTweaks_SetXvtCockpit(bool enabled);
+ 
+ /* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+  * laser and ion cannons), with xvt_lasers applied. */
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 8feab9d..15acd90 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -37,6 +37,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
++	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+ }
+ 
+ static void ApplyAudioFilter(void) {
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 6498490..27d7f41 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -116,6 +116,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+ 	SETTING_BOOL("render.xvt_targeting_computer", xvt_targeting_computer),
++	SETTING_BOOL("render.xvt_cockpit", xvt_cockpit),
+ 	SETTING_BOOL("audio.xvt_weapon_sounds", xvt_weapon_sounds),
+ 	SETTING_STRING("music.arrangement", music.arrangement),
+ 	SETTING_STRING("music.backend", music.backend),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 574d310..8e86a0c 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -39,6 +39,7 @@ typedef struct XwSettings {
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
++	int xvt_cockpit;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;

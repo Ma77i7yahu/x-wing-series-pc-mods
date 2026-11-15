@@ -1,0 +1,536 @@
+From b335d35af1c33867a3e3a1188ec52d2994ad20e0 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 23:45:54 +1100
+Subject: [PATCH 42/59] XvT damage display on D (game.xvt_damage_display)
+
+- D (info_damage, now key 239 USER_KEY_DAMAGE_DISPLAY) toggles X-Wing vs TIE
+  Fighter's damage display instead of leaving flight for the damage screen;
+  "All systems operational" when nothing is out. Off: X-Wing's 'd' as before.
+- Up / Down pick a knocked-out system (shared with the F lists: the one opened
+  last has the arrows), Enter moves it to the head of the repair order
+  instead of matching speed (Damage_DisplayMfdPage). The saved order follows.
+- Drawn at XvT element 133 (433,105 207x90) in MICRO64: green header, rows in
+  repair order with red mm:ss repair time, highlighted row, green frame while
+  it has the keys. Closes when everything is repaired.
+- Settings: Game page "Damage Report (D)".
+---
+ resources/config.yaml                    |   3 +
+ src/xw/flight/object/create.c            |   1 +
+ src/xw/flight/player/user.c              | 115 ++++++++++++++++++++++-
+ src/xw/flight/player/user.h              |  12 +++
+ src/xw_app/settings/game_page.c          |   2 +
+ src/xw_remaster/hud_readout.c            |  47 +++++++++
+ src/xw_remaster/hud_readout.h            |   2 +
+ src/xw_remaster/hud_renderer.c           |   3 +
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   4 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ src/xw_runtime/input/actions.c           |   7 +-
+ src/xw_runtime/snapshot/render_readout.c |  27 ++++++
+ src/xw_runtime/snapshot/render_types.h   |  17 ++++
+ 16 files changed, 243 insertions(+), 6 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 49c133c..8847b74 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -287,6 +287,9 @@ game:
+   # Flight messages stay up half as long (2 s instead of 4; 6 s instead of 12),
+   # never less than 1.5 s.
+   short_messages: true
++  # D shows X-Wing vs TIE Fighter's damage display over the flight view (Up / Down
++  # pick a damaged system, Enter repairs it first) instead of X-Wing's damage screen.
++  xvt_damage_display: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index fab296a..fe8649b 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -3893,6 +3893,7 @@ void create_createmission(void) {
+ 	g_playerFlightState.savedTargetRefs[3] = XW_PLAYER_NO_TARGET;
+ #ifdef XW_MODERN
+ 	user_closecraftlist();
++	user_closedamagedisplay();
+ #endif
+ 	g_hyperspaceflag = 0;
+ 	g_hyperspaceAbortAndCollisionsAllowed = 1;
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 03f74e1..7be81fd 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -69,6 +69,13 @@ int user_targetviewactive(void) { return s_targetViewActive; }
+ static int s_craftListMode;
+ static unsigned s_craftListTop;
+ 
++/* XvT's D damage display. It and the craft lists share Up / Down: the one opened last has them, and the
++ * damage display gets them back when the lists close. Its state changes only from keys (live or from a
++ * film), so films replay the same repair order. */
++static int s_damageOpen;
++static int s_damageHasArrows;
++static int s_damageSelected = -1;
++
+ int user_craftlistmode(void) { return s_craftListMode; }
+ 
+ unsigned user_craftlisttop(void) { return s_craftListTop; }
+@@ -94,6 +101,82 @@ static void user_togglecraftlist(int mode) {
+ 	}
+ 	s_craftListMode = s_craftListMode == mode ? USER_CRAFT_LIST_CLOSED : mode;
+ 	s_craftListTop = 0;
++	s_damageHasArrows = 0;
++}
++
++unsigned user_damagedsystems(uint8_t* systems) {
++	unsigned count = 0;
++	for (unsigned i = 0; i < XW_PLAYER_SUBSYSTEM_COUNT; ++i) {
++		uint8_t id = g_playerSubsystemRepairPriority[i];
++		if (id < XW_PLAYER_SUBSYSTEM_COUNT && g_playerFlightState.subsystemHealth[id] == 0)
++			systems[count++] = id;
++	}
++	return count;
++}
++
++int user_damagedisplayselected(void) {
++	uint8_t systems[XW_PLAYER_SUBSYSTEM_COUNT];
++	unsigned count = user_damagedsystems(systems);
++	for (unsigned i = 0; i < count; ++i)
++		if (systems[i] == s_damageSelected)
++			return s_damageSelected;
++	return count ? systems[0] : -1;
++}
++
++int user_damagedisplayopen(void) { return s_damageOpen; }
++
++int user_damagedisplayactive(void) {
++	return s_damageOpen && (s_damageHasArrows || s_craftListMode == USER_CRAFT_LIST_CLOSED);
++}
++
++void user_closedamagedisplay(void) {
++	s_damageOpen = 0;
++	s_damageHasArrows = 0;
++	s_damageSelected = -1;
++}
++
++static void user_toggledamagedisplay(void) {
++	uint8_t systems[XW_PLAYER_SUBSYSTEM_COUNT];
++	if (s_damageOpen)
++		user_closedamagedisplay();
++	else if (!user_damagedsystems(systems))
++		msg_messagetext(XW_MSG_SUBSYSTEM_STATUS, "\005All systems operational");
++	else {
++		s_damageOpen = 1;
++		s_damageHasArrows = 1;
++		s_damageSelected = systems[0];
++	}
++}
++
++/* Damage_FindAdjacentDamagedSystem: the next or previous damaged system in repair order, wrapping. */
++static void user_movedamageselection(int step) {
++	uint8_t systems[XW_PLAYER_SUBSYSTEM_COUNT];
++	unsigned count = user_damagedsystems(systems), at = 0;
++	int selected = user_damagedisplayselected();
++	if (!count)
++		return;
++	while (at < count && systems[at] != selected)
++		++at;
++	s_damageSelected = systems[(at + count + (step < 0 ? count - 1 : 1)) % count];
++}
++
++/* XvT's Enter on the damage display: the highlighted system goes to the head of the repair order. The
++ * saved order follows, since the map and briefing screens restore it on the way out. */
++static void user_repairselectedfirst(void) {
++	int selected = user_damagedisplayselected();
++	unsigned at = 0;
++	if (selected < 0)
++		return;
++	while (at < XW_PLAYER_SUBSYSTEM_COUNT && g_playerSubsystemRepairPriority[at] != selected)
++		++at;
++	if (at == XW_PLAYER_SUBSYSTEM_COUNT)
++		return;
++	for (; at > 0; --at)
++		g_playerSubsystemRepairPriority[at] = g_playerSubsystemRepairPriority[at - 1];
++	g_playerSubsystemRepairPriority[0] = (uint8_t)selected;
++	s_damageSelected = selected;
++	memcpy(g_playerFlightState.savedSubsystemRepairPriority, g_playerSubsystemRepairPriority,
++		   sizeof(g_playerFlightState.savedSubsystemRepairPriority));
+ }
+ 
+ /* The player's target when it can be shown: a live object-table object or mission object. */
+@@ -757,6 +840,14 @@ void user_inputforplane(void) {
+ 	}
+ 	feinput_degitterinput();
+ 	g_scaledInputPitch *= 2;
++#ifdef XW_MODERN
++	{
++		/* XvT closes the damage display once every system is repaired. */
++		uint8_t systems[XW_PLAYER_SUBSYSTEM_COUNT];
++		if (s_damageOpen && !user_damagedsystems(systems))
++			user_closedamagedisplay();
++	}
++#endif
+ 	switch (g_currentActionKey) {
+ 		case 'o':
+ 			g_playerFlightState.currentTargetObjectIdx = XW_PLAYER_NO_TARGET;
+@@ -1397,12 +1488,16 @@ void user_inputforplane(void) {
+ 			user_togglecraftlist(USER_CRAFT_LIST_ENEMY);
+ 			break;
+ 		case USER_KEY_CRAFT_LIST_SCROLL_UP:
+-			if (s_craftListMode && s_craftListTop)
++			if (user_damagedisplayactive())
++				user_movedamageselection(-1);
++			else if (s_craftListMode && s_craftListTop)
+ 				--s_craftListTop;
+ 			break;
+ 		case USER_KEY_CRAFT_LIST_SCROLL_DOWN:
+ 			/* The capture clamps it to the rows there are. */
+-			if (s_craftListMode)
++			if (user_damagedisplayactive())
++				user_movedamageselection(1);
++			else if (s_craftListMode)
+ 				++s_craftListTop;
+ 			break;
+ #endif
+@@ -1563,6 +1658,15 @@ void user_inputforplane(void) {
+ 				}
+ 			}
+ 			break;
++#ifdef XW_MODERN
++		case USER_KEY_DAMAGE_DISPLAY:
++			/* With the XvT display off, X-Wing's damage screen, as 'd'. */
++			if (XwFlightTweaks_XvtDamageDisplay()) {
++				user_toggledamagedisplay();
++				break;
++			}
++#endif
++			/* fall through */
+ 		case 'd':
+ 			if (g_missionRuntimeState.provingGroundsActive == 0) {
+ 				if (g_replayviewmode != 0) {
+@@ -1725,6 +1829,13 @@ void user_inputforplane(void) {
+ #endif
+ 			break;
+ 		case '\r':
++#ifdef XW_MODERN
++			/* XvT: Enter on the damage display repairs the highlighted system first, instead of matching speed. */
++			if (user_damagedisplayactive()) {
++				user_repairselectedfirst();
++				break;
++			}
++#endif
+ 			if (g_playerFlightState.currentTargetObjectIdx != XW_PLAYER_NO_TARGET) {
+ 				uint16_t engine;
+ 				if (g_playerFlightState.currentTargetObjectIdx < XW_MISSION_OBJECT_REF_BASE) {
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index 02caefa..aff4492 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -53,6 +53,9 @@ enum {
+ 	USER_KEY_CRAFT_LIST_ENEMY = 236,
+ 	USER_KEY_CRAFT_LIST_SCROLL_UP = 237,
+ 	USER_KEY_CRAFT_LIST_SCROLL_DOWN = 238,
++	/* Modern addition: X-Wing vs TIE Fighter's D damage display. With game.xvt_damage_display off it acts as
++	 * X-Wing's 'd'. Its own code keeps films recorded with it from reading a repair-order record. */
++	USER_KEY_DAMAGE_DISPLAY = 239,
+ };
+ 
+ #ifdef XW_MODERN
+@@ -63,6 +66,15 @@ unsigned user_craftlisttop(void);
+ /* The list has `rows` rows and shows `visible`: keeps the first shown row in range. */
+ void user_clampcraftlist(unsigned rows, unsigned visible);
+ void user_closecraftlist(void);
++/* XvT's damage display (Damage_DisplayMfdPage): the player's knocked-out systems in repair order. Up / Down
++ * pick one while it holds the arrows (it was opened after any craft list), Enter repairs it first. */
++int user_damagedisplayopen(void);
++int user_damagedisplayactive(void);
++/* The damaged systems in repair order (room for XW_PLAYER_SUBSYSTEM_COUNT); returns the count. */
++unsigned user_damagedsystems(uint8_t* systems);
++/* The highlighted system: the chosen one while it is damaged, else the first damaged; -1 when none. */
++int user_damagedisplayselected(void);
++void user_closedamagedisplay(void);
+ #endif
+ 
+ enum {
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index 549da1e..5b9c8e6 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -112,6 +112,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "Off", "XvT (Capital Ships & Freighters)" }, 2);
+ 	AeronUi_Selector(ui, "Message Time", &draft->short_messages,
+ 					 (const char* const[]) { "X-Wing", "Short (Half)" }, 2);
++	AeronUi_Selector(ui, "Damage Report (D)", &draft->xvt_damage_display,
++					 (const char* const[]) { "X-Wing Screen", "XvT Pop-up" }, 2);
+ 	AeronUi_Selector(ui, "Ion Cannons vs TIEs", &draft->ion_disable_only,
+ 					 (const char* const[]) { "X-Wing (Disabled TIEs Explode)", "Disable Only" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 6a304b4..8307872 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -548,6 +548,53 @@ bool XwHudCraftList_Draw(const XwHudDraw* d) {
+ 	return true;
+ }
+ 
++/* ---- XvT's D damage display (Damage_DisplayMfdPage) ----
++ * XvT's damage box (forward and cockpit-off element 133) is 207 x 90 at (433, 105) in every 640 cockpit, over
++ * the view. "Damage Assessment" centred in green, then a row per knocked-out system in repair order with its
++ * repair time right-aligned in red; the highlighted row (Up / Down) gets a dark blue bar. Like XvT there is no
++ * fill; the green frame shows while it has the keys, and the box shrinks to its rows. */
++enum { DAMAGE_X = 433, DAMAGE_Y = 105, DAMAGE_W = 207, DAMAGE_H = 90, DAMAGE_SELECTED = 0x1C3C78 };
++
++bool XwHudDamage_Draw(const XwHudDraw* d) {
++	const XwRenderSnapshot* s = d->snapshot;
++	const XwSnapDamageDisplay* damage = &s->readout.damage_display;
++	const XwSnapCamera* c = &s->camera;
++	if (!damage->open || !damage->count || c->replay_mode || s->cockpit.suppressed ||
++		(c->hud_state != 0 && c->hud_state != XW_SNAP_VIEW_FULL_FORWARD) || !LoadXvtFont())
++		return true;
++	Pen pen = XvtPen(d);
++	if (d->edge_shift > 0)
++		pen.ox += XwHudDraw_PaneShift(d, DAMAGE_X, DAMAGE_X + DAMAGE_W);
++	float step = FontHeight(&g_xvtFont) + 1;
++	float left = DAMAGE_X + 2, top = DAMAGE_Y + 2, right = DAMAGE_X + DAMAGE_W - 2;
++	float bottom = top + step * (damage->count + 1) + 2;
++	if (bottom > DAMAGE_Y + DAMAGE_H - 2)
++		bottom = DAMAGE_Y + DAMAGE_H - 2;
++	if (damage->active) {
++		float fx = left - 2, fy = top - 2, fw = right - left + 4, fh = bottom - top + 4;
++		Fill(&pen, fx, fy, fw, 1, XVT_GREEN, 1);
++		Fill(&pen, fx, fy + fh - 1, fw, 1, XVT_GREEN, 1);
++		Fill(&pen, fx, fy, 1, fh, XVT_GREEN, 1);
++		Fill(&pen, fx + fw - 1, fy, 1, fh, XVT_GREEN, 1);
++	}
++	XwSnapRect header = { (int32_t)left, 0, (int32_t)(right - left), 0 };
++	Centered(&pen, &header, top, "Damage Assessment", XVT_GREEN);
++	for (unsigned i = 0; i < damage->count; ++i) {
++		const XwSnapDamageRow* row = &damage->rows[i];
++		float y = top + step * (i + 1);
++		if (y + step > bottom + 0.5f)
++			break;
++		if (row->selected)
++			Fill(&pen, left, y, right - left, step, DAMAGE_SELECTED, 1);
++		char time[8];
++		snprintf(time, sizeof time, "%02u:%02u", row->minutes, row->seconds);
++		float time_w = Measure(&pen, time);
++		Text(&pen, left, y, row->name, XVT_VALUE, right - left - time_w - 4);
++		RightText(&pen, right, y, time, XVT_RED);
++	}
++	return true;
++}
++
+ bool XwHudCmd_Active(const XwRenderSnapshot* s) {
+ 	const XwSnapCamera* c = &s->camera;
+ 	bool active = XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+index a3f2d10..d1d60a7 100644
+--- a/src/xw_remaster/hud_readout.h
++++ b/src/xw_remaster/hud_readout.h
+@@ -20,5 +20,7 @@ bool XwHudThreat_Active(const XwRenderSnapshot* snapshot);
+ bool XwHudThreat_Draw(const XwHudDraw* draw);
+ /* XvT's F / Shift+F friendly and enemy craft lists, when one is open. */
+ bool XwHudCraftList_Draw(const XwHudDraw* draw);
++/* XvT's D damage display, when it is open. */
++bool XwHudDamage_Draw(const XwHudDraw* draw);
+ void XwHudThreat_Shutdown(void);
+ #endif
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index 059c7b7..d8aa6ee 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -22,6 +22,7 @@ typedef struct HudKey {
+ 	int xvt_cockpit;    /* render.xvt_cockpit: XvT art for this view. */
+ 	uint8_t threats[4]; /* XvT threat lights (with xvt_cockpit). */
+ 	XwSnapCraftList craft_list; /* XvT's F / Shift+F lists. */
++	XwSnapDamageDisplay damage_display; /* XvT's D damage display. */
+ 	XwSnapReadout readout;
+ 	const AeronTexture* target_view;
+ } HudKey;
+@@ -226,6 +227,7 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		memcpy(key.threats, snapshot->readout.threats, sizeof key.threats);
+ 	}
+ 	memcpy(&key.craft_list, &snapshot->readout.craft_list, sizeof key.craft_list);
++	memcpy(&key.damage_display, &snapshot->readout.damage_display, sizeof key.damage_display);
+ 	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+@@ -278,6 +280,7 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		else
+ 			XwHudDraw_Cross(&draw);
+ 		XwHudCraftList_Draw(&draw);
++		XwHudDamage_Draw(&draw);
+ 	}
+ 	AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 	if (!cmd)
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 62e1d29..756e61c 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -15,6 +15,11 @@ static bool s_start_overshield = true;
+ static bool s_xvt_engine_wash = true;
+ static bool s_ion_disable_only = true;
+ static bool s_short_messages = true;
++static bool s_xvt_damage_display = true;
++
++bool XwFlightTweaks_XvtDamageDisplay(void) { return s_xvt_damage_display; }
++
++void XwFlightTweaks_SetXvtDamageDisplay(bool enabled) { s_xvt_damage_display = enabled; }
+ 
+ bool XwFlightTweaks_ShortMessages(void) { return s_short_messages; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 32ef178..af4c9d4 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -77,6 +77,10 @@ void XwFlightTweaks_SetIonDisableOnly(bool enabled);
+  * 12), and never less than 1.5 s while others wait. */
+ bool XwFlightTweaks_ShortMessages(void);
+ void XwFlightTweaks_SetShortMessages(bool enabled);
++/* game.xvt_damage_display: D shows X-Wing vs TIE Fighter's damage display over the flight view instead of
++ * leaving flight for X-Wing's damage screen. Up / Down pick a damaged system, Enter repairs it first. */
++bool XwFlightTweaks_XvtDamageDisplay(void);
++void XwFlightTweaks_SetXvtDamageDisplay(bool enabled);
+ 
+ /* Cannon bolt speed, lifetime and launch distance ahead of the gun for projectile property index `index`
+  * (0-5 are laser and ion cannons), with xvt_lasers applied: XvT's own values (speed 2000/1800 lasers,
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 7fae899..50cc542 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -41,6 +41,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtEngineWash(settings->xvt_engine_wash != 0);
+ 	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
+ 	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
++	XwFlightTweaks_SetXvtDamageDisplay(settings->xvt_damage_display != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index dc2a4cb..e95817b 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -118,6 +118,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_engine_wash", xvt_engine_wash),
+ 	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
+ 	SETTING_BOOL("game.short_messages", short_messages),
++	SETTING_BOOL("game.xvt_damage_display", xvt_damage_display),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 1c44d1c..8ee87a8 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -40,7 +40,7 @@ typedef struct XwSettings {
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+-	int short_messages;
++	int short_messages, xvt_damage_display;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index c7683a7..ddfd062 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -72,13 +72,14 @@ static const struct {
+ 	{ "view_external", "Toggle external view", XW_INPUT_ACTION_CATEGORY_VIEW, 47 },
+ 	{ "view_manual_camera", "Toggle camera control", XW_INPUT_ACTION_CATEGORY_VIEW, 63 },
+ 	{ "info_map", "Map", XW_INPUT_ACTION_CATEGORY_INFORMATION, 109 },
+-	{ "info_damage", "Damage report", XW_INPUT_ACTION_CATEGORY_INFORMATION, 100 },
++	/* USER_KEY_DAMAGE_DISPLAY: XvT's damage display, or X-Wing's 'd' damage screen with it off. */
++	{ "info_damage", "Damage report", XW_INPUT_ACTION_CATEGORY_INFORMATION, 239 },
+ 	{ "info_briefing", "Mission briefing", XW_INPUT_ACTION_CATEGORY_INFORMATION, 98 },
+ 	/* Not in X-Wing: XvT's craft lists (USER_KEY_CRAFT_LIST_FRIENDLY and following). */
+ 	{ "info_friendly_craft", "Friendly craft list", XW_INPUT_ACTION_CATEGORY_INFORMATION, 235 },
+ 	{ "info_enemy_craft", "Enemy craft list", XW_INPUT_ACTION_CATEGORY_INFORMATION, 236 },
+-	{ "info_scroll_up", "Scroll craft list up", XW_INPUT_ACTION_CATEGORY_INFORMATION, 237 },
+-	{ "info_scroll_down", "Scroll craft list down", XW_INPUT_ACTION_CATEGORY_INFORMATION, 238 },
++	{ "info_scroll_up", "Scroll craft list / damage up", XW_INPUT_ACTION_CATEGORY_INFORMATION, 237 },
++	{ "info_scroll_down", "Scroll craft list / damage down", XW_INPUT_ACTION_CATEGORY_INFORMATION, 238 },
+ 	{ "replay_record", "Toggle film recording", XW_INPUT_ACTION_CATEGORY_INFORMATION, 99 },
+ 	{ "replay_view", "View recorded film", XW_INPUT_ACTION_CATEGORY_INFORMATION, 118 },
+ 	{ "comm_head_home", "Order target home", XW_INPUT_ACTION_CATEGORY_COMMUNICATIONS, 72 },
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index cad25de..9cdb473 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -448,6 +448,32 @@ static void CaptureCraftList(XwSnapCraftList* list) {
+ 	}
+ }
+ 
++/* ---- XvT's D damage display (Damage_DisplayMfdPage) ----
++ * X-Wing's systems under XvT's names (strings.txt lines 14-23); XvT has no auto-ejection system. Only the
++ * system first in the repair order counts down (Xw_UpdateMissionClock). */
++static const char* const kDamageNames[XW_PLAYER_SUBSYSTEM_COUNT] = {
++	"Auto-Ejection",   "Hyperdrive",         "Cannon System", "Flight Controls",
++	"Engines",         "Targeting Computer", "Shield System", "Warhead Launcher"
++};
++
++static void CaptureDamageDisplay(XwSnapDamageDisplay* display) {
++	if (!user_damagedisplayopen())
++		return;
++	uint8_t systems[XW_PLAYER_SUBSYSTEM_COUNT];
++	unsigned count = user_damagedsystems(systems);
++	int selected = user_damagedisplayselected();
++	display->open = count != 0;
++	display->active = user_damagedisplayactive() != 0;
++	for (unsigned i = 0; i < count && i < XW_SNAP_DAMAGE_ROWS; ++i) {
++		XwSnapDamageRow* row = &display->rows[display->count++];
++		unsigned seconds = g_playerFlightState.subsystemRepairTimers[systems[i]];
++		CopyText(row->name, sizeof row->name, kDamageNames[systems[i]]);
++		row->minutes = (uint8_t)(seconds / 60 > 99 ? 99 : seconds / 60);
++		row->seconds = (uint8_t)(seconds % 60);
++		row->selected = systems[i] == selected;
++	}
++}
++
+ void XwReadout_Capture(XwSnapReadout* r) {
+ 	memset(r, 0, sizeof *r);
+ 	r->boarding_remaining_s = -1;
+@@ -455,6 +481,7 @@ void XwReadout_Capture(XwSnapReadout* r) {
+ 		return;
+ 	CaptureThreats(r);
+ 	CaptureCraftList(&r->craft_list);
++	CaptureDamageDisplay(&r->damage_display);
+ 	const XwFlightPanelLayout* layout = XwFlightPanel_Layout();
+ 	r->cmd = (XwSnapRect) { g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].x,
+ 							g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].y, layout->width, layout->footerBottom };
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 1c57ac1..0e66fb3 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -220,6 +220,22 @@ typedef struct XwSnapCraftList {
+ 	XwSnapCraftListRow rows[XW_SNAP_CRAFT_LIST_ROWS];
+ } XwSnapCraftList;
+ 
++/* XvT's D damage display (Damage_DisplayMfdPage): the player's knocked-out systems in repair order, the first
++ * being repaired, with the time its repair still needs. Byte-sized fields only, so there is no padding. */
++enum { XW_SNAP_DAMAGE_ROWS = 8 };
++
++typedef struct XwSnapDamageRow {
++	char name[20];            /* XvT's name for the system ("Targeting Computer"). */
++	uint8_t minutes, seconds; /* Repair time still needed. */
++	uint8_t selected;         /* Highlighted for Enter. */
++} XwSnapDamageRow;
++
++typedef struct XwSnapDamageDisplay {
++	uint8_t open, active, count; /* active: it has the Up / Down / Enter keys (its frame is drawn). */
++	uint8_t reserved;            /* Keeps the size a multiple of 4 for the HUD cache key. */
++	XwSnapDamageRow rows[XW_SNAP_DAMAGE_ROWS];
++} XwSnapDamageDisplay;
++
+ /* render.xvt_targeting_computer: XvT-style targeting computer contents, captured from flight state each world
+  * frame. Strings are mixed-case ASCII, as XvT shows them (X-Wing fonts uppercase them when drawing);
+  * percentages are -1 when not applicable. */
+@@ -250,6 +266,7 @@ typedef struct XwSnapReadout {
+ 	 * warhead lock (0 off, 1 flashing while locking, 2 locked). */
+ 	uint8_t threats[4];
+ 	XwSnapCraftList craft_list;
++	XwSnapDamageDisplay damage_display;
+ } XwSnapReadout;
+ 
+ typedef struct XwSnapWidget {

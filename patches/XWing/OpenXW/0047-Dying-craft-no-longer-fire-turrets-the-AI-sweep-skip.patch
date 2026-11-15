@@ -1,0 +1,25 @@
+From 005b955d57484486c5ecd54879e9f834bbb7ea85 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 07:07:00 +1100
+Subject: [PATCH 47/59] Dying craft no longer fire turrets: the AI sweep skips
+ them, so their turret targets were never cleared
+
+---
+ src/xw/flight/object/laser.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index 367e77d..0deb268 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -235,6 +235,10 @@ void laser_weaponsfire(void) {
+ 			if (firingGate > 0
+ #ifdef XW_MODERN
+ 				&& XwFlightTiming_ReferenceDue()
++				/* The AI sweep skips dying craft (kinds 3/4), so paifight_SelectTurretTargets never clears their
++				 * firingGate and wrecks kept shooting at their last target. */
++				&& weaponCraft->objectKind != XW_CRAFT_OBJECT_KIND_3 &&
++				weaponCraft->objectKind != XW_CRAFT_OBJECT_KIND_4
+ #endif
+ 			) {
+ #ifdef XW_MODERN

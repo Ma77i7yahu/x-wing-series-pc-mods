@@ -1,0 +1,70 @@
+From e4f1f4df940ae14f29c4c26cff2b18d708b9b55d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 11 Nov 2026 03:25:03 +1100
+Subject: [PATCH 56/59] game.xvt_components: components take hits with the
+ shields up
+
+As in TIE Fighter (collide_damagecraft step 2) and X-Wing Alliance, and XvT
+on easy: a laser or warhead hit on a mesh with explosion flag 1 goes to the
+component first whatever the shields, so turrets, generators and the rest
+can be shot off a shielded Star Destroyer. XvT above easy waited for both
+shield banks to be empty.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ resources/config.yaml                   |  4 ++--
+ src/xw_runtime/runtime/xvt_components.c | 10 +++-------
+ src/xw_runtime/runtime/xvt_components.h |  4 ++--
+ 3 files changed, 7 insertions(+), 11 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 7637503..a58d127 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -309,8 +309,8 @@ game:
+   # (5 charged), and a disabled craft loses its shields.
+   xvt_ions: true
+   # Starship components as in X-Wing vs TIE Fighter (1998 flight): turrets, guns, shield
+-  # generators, launchers and more can be targeted (, and Shift+,) and destroyed once the
+-  # ship's shields are down (shield generators at any time, as X-Wing's ISD ones are).
++  # generators, launchers and more can be targeted (, and Shift+,) and destroyed by lasers
++  # or warheads even with the ship's shields up (as in TIE Fighter and X-Wing Alliance).
+   # A destroyed turret stops firing; the last shield generator takes the shields with it.
+   xvt_components: true
+   # Flight messages stay up half as long (2 s instead of 4; 6 s instead of 12),
+diff --git a/src/xw_runtime/runtime/xvt_components.c b/src/xw_runtime/runtime/xvt_components.c
+index 54d369f..a9274e9 100644
+--- a/src/xw_runtime/runtime/xvt_components.c
++++ b/src/xw_runtime/runtime/xvt_components.c
+@@ -111,13 +111,9 @@ bool XwXvtComponents_RouteDamage(uint16_t victimObjIdx, int16_t hitMeshIndex) {
+ 	if (hitMeshIndex <= 0 || !IsCraft(victimObjIdx) || g_objectTable[victimObjIdx].genusId == XW_GENUS_STARFIGHTER)
+ 		return false;
+ 	int objectType = g_objectTable[victimObjIdx].objectType, mesh = hitMeshIndex - 1;
+-	if (!(Explosion(objectType, mesh) & EXPLOSION_ROUTES_DAMAGE))
+-		return false;
+-	const CraftData* craft = g_objectTable[victimObjIdx].instanceData;
+-	/* XvT 0x41FC50 (difficulty above easy): components only once both shield banks are empty. X-Wing's ISD
+-	 * shield generators take hits through the shields, which its missions are built around. */
+-	return MeshType(objectType, mesh) == MESH_SHIELD_GENERATOR ||
+-		   craft->shieldEnergy[XW_SHIELD_FRONT] + craft->shieldEnergy[XW_SHIELD_REAR] <= 0;
++	/* As TIE Fighter (collide_damagecraft step 2), X-Wing Alliance and XvT on easy: the component takes the
++	 * hit whatever the shields. (XvT above easy waits for both shield banks to be empty.) */
++	return (Explosion(objectType, mesh) & EXPLOSION_ROUTES_DAMAGE) != 0;
+ }
+ 
+ bool XwXvtComponents_RouteOverflow(uint16_t victimObjIdx, int16_t hitMeshIndex) {
+diff --git a/src/xw_runtime/runtime/xvt_components.h b/src/xw_runtime/runtime/xvt_components.h
+index 2b7c9ab..2d33b0a 100644
+--- a/src/xw_runtime/runtime/xvt_components.h
++++ b/src/xw_runtime/runtime/xvt_components.h
+@@ -13,8 +13,8 @@ struct CraftData;
+ /* game.xvt_components: starship components as in X-Wing vs TIE Fighter (1998 flight only). The OPT's mesh
+  * descriptors decide everything, as in XvT: every mesh with explosion flag 2 gets XvT's hit points for its
+  * type (g_meshTypeComponentMaxHp) and stays visible (X-Wing hides the turrets of every starship but the
+- * corvette); laser and warhead hits on a mesh with explosion flag 1 go to the component first once the
+- * craft's shields are down (shield generators take them at any time, as X-Wing's ISD generators do); a
++ * corvette); laser and warhead hits on a mesh with explosion flag 1 go to the component first whatever the
++ * shields (as in TIE Fighter and X-Wing Alliance), as does damage that breaks through them; a
+  * destroyed turret or gun stops the weapon slots it carries; losing the last shield generator drops the
+  * shields; and the player can target components (, and Shift+,), shown in the CMD, boxed on the HUD, used
+  * for the CMD range and warhead lock, and homed on by warheads. Mesh indices are 0-based. */

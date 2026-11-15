@@ -1,0 +1,285 @@
+From 880c8c2d99483a3eaa4f1d5372c851af43c7e41c Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 08:18:13 +1100
+Subject: [PATCH 05/18] XvT-style acceleration and braking for all craft
+ (flight.xvt_throttle)
+
+---
+ resources/config.yaml                 |  4 ++
+ src/tie/dynamix.c                     | 61 ++++++++++++++++++++++++++-
+ src/tie_app/application.c             |  1 +
+ src/tie_app/config/app_config.c       |  7 ++-
+ src/tie_app/config/app_config.h       |  2 +
+ src/tie_app/settings/flight_options.c |  3 +-
+ src/tie_app/settings/settings.c       |  9 ++++
+ src/tie_runtime/hooks/flight_tweaks.c |  7 ++-
+ src/tie_runtime/hooks/flight_tweaks.h |  6 +++
+ 9 files changed, 95 insertions(+), 5 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index e1980b5..7bffa8c 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -50,6 +50,10 @@ flight:
+   # B-Wing...) fire both together, X-Wing Alliance style. Disable orders keep
+   # the original ions-only behaviour. off, friendly (Imperial side only) or all.
+   ai_ion_link: all
++  # X-Wing vs TIE Fighter acceleration and braking: XvT's per-craft rates, and
++  # large throttle cuts brake quickly instead of shedding 20 speed per second.
++  # Applies to every craft.
++  xvt_throttle: true
+   models:
+     source: original
+     smooth_angle_degrees: 90
+diff --git a/src/tie/dynamix.c b/src/tie/dynamix.c
+index 2943f11..94ca88e 100644
+--- a/src/tie/dynamix.c
++++ b/src/tie/dynamix.c
+@@ -5,6 +5,7 @@
+ #include "tie_runtime/diagnostics/diagnostics.h"
+ #include "tie_runtime/display/classic_display.h"
+ #include "tie_runtime/display/classic_framebuffer.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
+ #include "tie_runtime/flight_assets/model_types.h"
+ #include "tie_runtime/input/input.h"
+ #include "tie_runtime/runtime/exports.h"
+@@ -27,6 +28,22 @@
+ // GLOBAL: TIE95 0xD4058
+ uint16_t pspecnum;
+ 
++/* flight.xvt_throttle: X-Wing vs TIE Fighter's ModelDef accelRate/decelRate
++ * (XVT 0x51C560). XvT keeps TIE's species order, so the rows line up with
++ * spec_data; TIE's own max_accel is about a third of these. */
++static const uint8_t xvt_accel[NUM_SPEC_DATA] = {
++	36, 24, 48, 36, 45, 48, 30, 35, 48, 10, 10, 48, 48, 36, 36, 45, 25, 20, 30, 30, 15, 15, 15,
++	25, 20, 0,  0,  0,  0,  15, 10, 10, 10, 10, 12, 10, 15, 15, 10, 10, 10, 10, 10, 10, 10, 10,
++	10, 10, 10, 10, 8,  8,  10, 10, 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
++};
++static const uint8_t xvt_decel[NUM_SPEC_DATA] = {
++	60, 45, 90, 52, 52, 60, 45, 50, 75, 20, 20, 60, 45, 52, 60, 75, 30, 25, 20, 20, 25, 25, 25,
++	30, 25, 0,  0,  0,  0,  25, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
++	20, 20, 20, 20, 20, 20, 20, 20, 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
++};
++
++static void dynamix_xvtadjustvelocity(uint16_t obj_idx, uint16_t target, uint16_t throttle_frac);
++
+ /* ======================================================================
+  * dynamix_planedynamics
+  *
+@@ -298,7 +315,9 @@ void dynamix_planedynamics(void) {
+ 					target *= 2;
+ 				}
+ 
+-				if (target < (uint16_t)objects[i].current_speed) {
++				if (TieFlightTweaks_XvtThrottle()) {
++					dynamix_xvtadjustvelocity(i, target, throttle_frac);
++				} else if (target < (uint16_t)objects[i].current_speed) {
+ 					dynamix_subvelocity(i, 20);
+ 				} else {
+ 					dynamix_adjustvelocity(i, (int16_t)target, 1, throttle_frac);
+@@ -411,6 +430,46 @@ void dynamix_adjustvelocity(uint16_t obj_idx, uint16_t speed, uint16_t allow_dec
+ 	}
+ }
+ 
++/* flight.xvt_throttle cruise speed controller, ported from XvT's
++ * ACTIVE-craft case (XVT 0x4AD880 and its caller). Gaps of 200+ brake at a
++ * third of the gap per second; smaller ones ease in at the species decel
++ * rate, which grows as the throttle closes. Acceleration matches
++ * dynamix_adjustvelocity with XvT's rate. */
++static void dynamix_xvtadjustvelocity(uint16_t obj_idx, uint16_t target, uint16_t throttle_frac) {
++	const uint16_t current = (uint16_t)objects[obj_idx].current_speed;
++	uint16_t rate;
++	uint16_t step;
++	uint16_t gap;
++
++	if (target == current)
++		return;
++	if (target < current) {
++		gap = current - target;
++		if (gap >= 200) {
++			dynamix_subvelocity(obj_idx, gap / 3);
++			return;
++		}
++		rate = pspecnum < NUM_SPEC_DATA ? xvt_decel[pspecnum] : 20;
++		step = math2_fraction(rate, 0x4000u);
++		if (step == 0)
++			step = 1;
++		if (rate > step)
++			step += math2_fraction((uint16_t)(rate - step), (uint16_t)(0xFFFFu - throttle_frac));
++		dynamix_subvelocity(obj_idx, gap < step ? gap : step);
++		return;
++	}
++	gap = target - current;
++	rate = pspecnum < NUM_SPEC_DATA ? xvt_accel[pspecnum] : 10;
++	step = math2_fraction(rate, 0x4000u);
++	if (step == 0)
++		step = 1;
++	if (rate > step)
++		step += math2_fraction((uint16_t)(rate - step), throttle_frac);
++	if (!objects[obj_idx].craft_ptr->slam_active)
++		step *= 3;
++	dynamix_addvelocity(obj_idx, gap < step ? gap : step);
++}
++
+ /* ======================================================================
+  * dynamix_addvelocity / dynamix_subvelocity
+  *
+diff --git a/src/tie_app/application.c b/src/tie_app/application.c
+index 0b3e8a7..ec1e0b6 100644
+--- a/src/tie_app/application.c
++++ b/src/tie_app/application.c
+@@ -187,6 +187,7 @@ int TieApplication_Run(const TieLaunchOptions* launch) {
+ 		TieFlightTweaks_SetLaserConvergenceMetres(app_config.requested.laser_convergence_m);
+ 		TieFlightTweaks_SetXvtLasers(app_config.requested.xvt_lasers);
+ 		TieFlightTweaks_SetAiIonLink(app_config.requested.ai_ion_link);
++		TieFlightTweaks_SetXvtThrottle(app_config.requested.xvt_throttle);
+ 		if (!Aeron_SetFullscreen(app_config.requested.video.fullscreen))
+ 			Aeron_LogWarn("tie.config", "could not apply fullscreen setting");
+ 	}
+diff --git a/src/tie_app/config/app_config.c b/src/tie_app/config/app_config.c
+index 122ea2e..0264246 100644
+--- a/src/tie_app/config/app_config.c
++++ b/src/tie_app/config/app_config.c
+@@ -183,7 +183,7 @@ static bool TieAppConfig_ValidateSchemaKeys(const AeronConfigFile* document, boo
+ 	VALIDATE_KEYS(document, "frontend", warn, "version", "aspect_correct_legacy_scenes");
+ 	VALIDATE_KEYS(document, "flight", warn, "version", "original_renderer", "update_rate",
+ 				  "player_engine_sound", "fix_axis_input_bias", "widescreen", "cockpit_stretch", "widescreen_hud",
+-				  "laser_convergence", "xvt_lasers", "ai_ion_link", "models");
++				  "laser_convergence", "xvt_lasers", "ai_ion_link", "xvt_throttle", "models");
+ 	VALIDATE_KEYS(document, "flight.models", warn, "source", "smooth_angle_degrees", "opt_emissive_strength",
+ 				  "opt_projectile_emissive_strength");
+ 	VALIDATE_KEYS(document, "input", warn, "controllers", "gamepad_defaults", "keyboard", "mouse_flight",
+@@ -540,7 +540,8 @@ static bool TieAppConfig_ParseComplete(const AeronConfigFile* document,
+ 		!TieAppConfig_ReadBool(document, "flight.widescreen_hud", &out->widescreen_hud, error, capacity) ||
+ 		!TieAppConfig_ReadInt(document, "flight.laser_convergence", 0, 5000, &out->laser_convergence_m, error,
+ 							  capacity) ||
+-		!TieAppConfig_ReadBool(document, "flight.xvt_lasers", &out->xvt_lasers, error, capacity))
++		!TieAppConfig_ReadBool(document, "flight.xvt_lasers", &out->xvt_lasers, error, capacity) ||
++		!TieAppConfig_ReadBool(document, "flight.xvt_throttle", &out->xvt_throttle, error, capacity))
+ 		return false;
+ 	const char* ai_ion_link = AeronConfigFile_GetString(document, "flight.ai_ion_link", NULL);
+ 	if (!ai_ion_link)
+@@ -790,6 +791,7 @@ void TieAppConfig_GetLiveFlightOptions(const TieAppConfig* config, TieAppLiveFli
+ 		.laser_convergence_m = config->laser_convergence_m,
+ 		.xvt_lasers = config->xvt_lasers,
+ 		.ai_ion_link = config->ai_ion_link,
++		.xvt_throttle = config->xvt_throttle,
+ 	};
+ }
+ 
+@@ -853,6 +855,7 @@ bool TieAppConfig_SetLiveFlightOptions(TieAppConfigState* state, const TieAppLiv
+ 		!AeronConfigFile_SetInt(candidate, "flight.laser_convergence", options->laser_convergence_m,
+ 								&aeron_error) ||
+ 		!AeronConfigFile_SetBool(candidate, "flight.xvt_lasers", options->xvt_lasers, &aeron_error) ||
++		!AeronConfigFile_SetBool(candidate, "flight.xvt_throttle", options->xvt_throttle, &aeron_error) ||
+ 		!AeronConfigFile_SetString(candidate, "flight.ai_ion_link",
+ 								   options->ai_ion_link == TIE_AI_ION_LINK_OFF		  ? "off"
+ 								   : options->ai_ion_link == TIE_AI_ION_LINK_FRIENDLY ? "friendly"
+diff --git a/src/tie_app/config/app_config.h b/src/tie_app/config/app_config.h
+index 03af222..7cf5b45 100644
+--- a/src/tie_app/config/app_config.h
++++ b/src/tie_app/config/app_config.h
+@@ -53,6 +53,7 @@ typedef struct TieAppLiveFlightOptions {
+ 	int laser_convergence_m; /* 0 fires parallel */
+ 	bool xvt_lasers;
+ 	int ai_ion_link; /* TIE_AI_ION_LINK_* */
++	bool xvt_throttle;
+ } TieAppLiveFlightOptions;
+ 
+ typedef struct TieAppLiveAudioOptions {
+@@ -98,6 +99,7 @@ typedef struct TieAppConfig {
+ 	int laser_convergence_m;
+ 	bool xvt_lasers;
+ 	int ai_ion_link;
++	bool xvt_throttle;
+ 	float flight_model_smooth_angle_degrees;
+ 	float flight_model_opt_emissive_strength;
+ 	float flight_model_opt_projectile_emissive_strength;
+diff --git a/src/tie_app/settings/flight_options.c b/src/tie_app/settings/flight_options.c
+index 83261ca..fbe1287 100644
+--- a/src/tie_app/settings/flight_options.c
++++ b/src/tie_app/settings/flight_options.c
+@@ -33,7 +33,7 @@ static bool TieFlightOptions_FlightOptionsEqual(const TieAppLiveFlightOptions* l
+ 		   left->widescreen == right->widescreen && left->cockpit_stretch == right->cockpit_stretch &&
+ 		   left->widescreen_hud == right->widescreen_hud &&
+ 		   left->laser_convergence_m == right->laser_convergence_m && left->xvt_lasers == right->xvt_lasers &&
+-		   left->ai_ion_link == right->ai_ion_link;
++		   left->ai_ion_link == right->ai_ion_link && left->xvt_throttle == right->xvt_throttle;
+ }
+ 
+ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* options) {
+@@ -43,6 +43,7 @@ static void TieFlightOptions_FlightOptionsNormalize(TieAppLiveFlightOptions* opt
+ 	options->cockpit_stretch = options->cockpit_stretch != 0;
+ 	options->widescreen_hud = options->widescreen_hud != 0;
+ 	options->xvt_lasers = options->xvt_lasers != 0;
++	options->xvt_throttle = options->xvt_throttle != 0;
+ }
+ 
+ bool TieFlightOptions_Configure(const TieAppLiveFlightOptions* requested, TieFlightOptionsApplyFn apply,
+diff --git a/src/tie_app/settings/settings.c b/src/tie_app/settings/settings.c
+index f4ec8c9..b0e1f7d 100644
+--- a/src/tie_app/settings/settings.c
++++ b/src/tie_app/settings/settings.c
+@@ -184,6 +184,7 @@ static bool TieSettings_ApplyFlightOptions(const TieAppLiveFlightOptions* previo
+ 	TieFlightTweaks_SetLaserConvergenceMetres(requested->laser_convergence_m);
+ 	TieFlightTweaks_SetXvtLasers(requested->xvt_lasers);
+ 	TieFlightTweaks_SetAiIonLink(requested->ai_ion_link);
++	TieFlightTweaks_SetXvtThrottle(requested->xvt_throttle);
+ 	return true;
+ }
+ 
+@@ -789,6 +790,14 @@ static void TieSettings_GamePage(AeronUiContext* ui) {
+ 		tweaks.xvt_lasers = laser_style != 0;
+ 		TieSettings_SetFlightTweaks(&tweaks);
+ 	}
++	static const char* const throttle_styles[] = { "TIE Fighter", "X-Wing vs TIE Fighter" };
++	int throttle_style = tweaks.xvt_throttle;
++	if (AeronUi_Selector(ui, "Acceleration and Braking", &throttle_style, throttle_styles, 2)) {
++		tweaks.xvt_throttle = throttle_style != 0;
++		TieSettings_SetFlightTweaks(&tweaks);
++	}
++	AeronUi_Help(ui, throttle_style ? "All craft accelerate and brake at XvT rates; big throttle cuts brake fast."
++									: "Original: slow acceleration, and throttle cuts shed only 20 speed per second.");
+ 	static const char* const ion_link_labels[] = { "Off", "Friendly Only", "All Craft" };
+ 	int ion_link = tweaks.ai_ion_link;
+ 	if (AeronUi_Selector(ui, "AI Laser & Ion Linking", &ion_link, ion_link_labels, 3)) {
+diff --git a/src/tie_runtime/hooks/flight_tweaks.c b/src/tie_runtime/hooks/flight_tweaks.c
+index c19e188..901737e 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.c
++++ b/src/tie_runtime/hooks/flight_tweaks.c
+@@ -5,6 +5,7 @@ static bool s_widescreen_hud = true;
+ static int s_laser_convergence_m = 550;
+ static bool s_xvt_lasers = true;
+ static int s_ai_ion_link = TIE_AI_ION_LINK_ALL;
++static bool s_xvt_throttle = true;
+ 
+ bool TieFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
+ 
+@@ -26,4 +27,8 @@ int TieFlightTweaks_AiIonLink(void) { return s_ai_ion_link; }
+ 
+ void TieFlightTweaks_SetAiIonLink(int mode) {
+ 	s_ai_ion_link = mode < TIE_AI_ION_LINK_OFF || mode > TIE_AI_ION_LINK_ALL ? TIE_AI_ION_LINK_OFF : mode;
+-}
+\ No newline at end of file
++}
++
++bool TieFlightTweaks_XvtThrottle(void) { return s_xvt_throttle; }
++
++void TieFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
+\ No newline at end of file
+diff --git a/src/tie_runtime/hooks/flight_tweaks.h b/src/tie_runtime/hooks/flight_tweaks.h
+index c65dd9b..db3260d 100644
+--- a/src/tie_runtime/hooks/flight_tweaks.h
++++ b/src/tie_runtime/hooks/flight_tweaks.h
+@@ -28,5 +28,11 @@ void TieFlightTweaks_SetXvtLasers(bool enabled);
+ enum { TIE_AI_ION_LINK_OFF = 0, TIE_AI_ION_LINK_FRIENDLY = 1, TIE_AI_ION_LINK_ALL = 2 };
+ int TieFlightTweaks_AiIonLink(void);
+ void TieFlightTweaks_SetAiIonLink(int mode);
++/* xvt_throttle (flight.xvt_throttle): craft accelerate and brake as in X-Wing
++ * vs TIE Fighter: XvT's per-species accel/decel rates (about 3x TIE's), and
++ * big throttle cuts brake at a third of the gap per second instead of a flat
++ * 20. Applies to every craft. */
++bool TieFlightTweaks_XvtThrottle(void);
++void TieFlightTweaks_SetXvtThrottle(bool enabled);
+ 
+ #endif

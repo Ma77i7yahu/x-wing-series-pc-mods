@@ -1,0 +1,90 @@
+From f2444f81c1e590e3afd1c08b9146ca80ecbccd0c Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 11 Nov 2026 03:18:14 +1100
+Subject: [PATCH 55/59] game.xvt_components: damage past the shields hits the
+ component
+
+XvT 0x41FC50 also calls Craft_DamageComponent for the damage left after
+the shields when the hit mesh is destroyable, so a warhead that breaks a
+starship's shields takes out the turret or generator it hits instead of
+going to the hull. Only the first-pass routing (shields already down) was
+ported; this adds the overflow path, once per hit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/xw/flight/object/collide.c          | 12 ++++++++++++
+ src/xw_runtime/runtime/xvt_components.c |  7 +++++++
+ src/xw_runtime/runtime/xvt_components.h |  5 +++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index b92094f..06afe8e 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -1667,6 +1667,7 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 	int16_t damageAmount;
+ #ifdef XW_MODERN
+ 	int16_t finalDamagePastShields = 0;
++	uint8_t routedToComponent = 0;
+ #endif
+ 	uint16_t sourceObjectType;
+ 	uint16_t victimObjectType;
+@@ -1718,6 +1719,9 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ #endif
+ 		damageAmount = starship_damagecomponent(victimObjIdx, hitMeshIndex, damageAmount);
+ 		victimCraft = g_curCraft;
++#ifdef XW_MODERN
++		routedToComponent = 1;
++#endif
+ 	}
+ 	if (victimCraft->shieldEnergy[shieldSide] > damageAmount) {
+ 		victimCraft->shieldEnergy[shieldSide] -= damageAmount;
+@@ -1836,6 +1840,14 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 					fsfx_triggersfx(COLLIDE_ION_HIT_SOUND, victimObjIdx);
+ 				}
+ 			} else {
++#ifdef XW_MODERN
++				/* game.xvt_components: XvT 0x41FC50 gives the damage past the shields to the destroyable mesh
++				 * it hit before the hull. */
++				if (!routedToComponent && damagePastShields > 0 &&
++					XwXvtComponents_RouteOverflow(victimObjIdx, hitMeshIndex))
++					damagePastShields =
++						(int16_t)starship_damagecomponent(victimObjIdx, hitMeshIndex, (uint16_t)damagePastShields);
++#endif
+ 				g_curCraft->hullDamage += damagePastShields;
+ 				if (victimObjIdx == g_playerFlightState.objectIndex) {
+ 					uint16_t* cockpitOverlayMask;
+diff --git a/src/xw_runtime/runtime/xvt_components.c b/src/xw_runtime/runtime/xvt_components.c
+index 4ecba61..54d369f 100644
+--- a/src/xw_runtime/runtime/xvt_components.c
++++ b/src/xw_runtime/runtime/xvt_components.c
+@@ -120,6 +120,13 @@ bool XwXvtComponents_RouteDamage(uint16_t victimObjIdx, int16_t hitMeshIndex) {
+ 		   craft->shieldEnergy[XW_SHIELD_FRONT] + craft->shieldEnergy[XW_SHIELD_REAR] <= 0;
+ }
+ 
++bool XwXvtComponents_RouteOverflow(uint16_t victimObjIdx, int16_t hitMeshIndex) {
++	if (!XwXvtComponents_Active() || hitMeshIndex <= 0 || !IsCraft(victimObjIdx) ||
++		g_objectTable[victimObjIdx].genusId == XW_GENUS_STARFIGHTER)
++		return false;
++	return (Explosion(g_objectTable[victimObjIdx].objectType, hitMeshIndex - 1) & EXPLOSION_DESTROYABLE) != 0;
++}
++
+ /* XvT selects by mesh (Craft_IsSelectableDamageComponentMesh): not the decorative hull pieces, and only the
+  * first mesh of each hull target group. */
+ static bool Selectable(int objectType, int mesh) {
+diff --git a/src/xw_runtime/runtime/xvt_components.h b/src/xw_runtime/runtime/xvt_components.h
+index c65319b..2b7c9ab 100644
+--- a/src/xw_runtime/runtime/xvt_components.h
++++ b/src/xw_runtime/runtime/xvt_components.h
+@@ -29,6 +29,11 @@ void XwXvtComponents_InitCraft(uint16_t objectIndex);
+  * component first. */
+ bool XwXvtComponents_RouteDamage(uint16_t victimObjIdx, int16_t hitMeshIndex);
+ 
++/* collide_damagecraft, damage past the shields: whether it goes to the hit mesh first (XvT 0x41FC50 calls
++ * Craft_DamageComponent for any destroyable mesh there, so a warhead that breaks the shields still takes
++ * out the component it hits). */
++bool XwXvtComponents_RouteOverflow(uint16_t victimObjIdx, int16_t hitMeshIndex);
++
+ /* starship_damagecomponent, once a component's hit points reach zero: XvT's effects. False when the mesh
+  * is not destroyable (no explosion, it stays drawn). */
+ bool XwXvtComponents_Destroyed(uint16_t victimObjIdx, uint16_t meshIndex);

@@ -1,0 +1,345 @@
+From c0005f3aff375b984777728ebd2eab1949e8525f Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 23:06:38 +1100
+Subject: [PATCH 39/59] game.xvt_lasers: XvT's bolt speed, lifetime, launch
+ point and gun positions
+
+- Cannon bolts take XvT's g_projectileDamageByObjectType values instead of
+  doubling X-Wing's: lasers 2000/1800 for 1 s (1.5 s charged), ions 1400 for
+  1.5 s and 1600 for 2 s charged (they were 700/750 for 2.5 s). Bolts start
+  921 units ahead of the gun, not 2048.
+- Starship turrets fire at the same speeds for three times the lifetime, as
+  XvT's turrets do.
+- xvt_hardpoints.c: XvT's gun positions where its OPTs override the static
+  table it shares with X-Wing (fediskio.c): X-Wing, B-Wing (Balance of Power
+  OPT), TIE fighter, TIE interceptor and shuttle, in XvT's slot order. The
+  TIE Advanced (4 guns in XvT, 2 in X-Wing) and capital ships keep X-Wing's.
+  Used when firing and by the HUD in-range check; not in DOS flight.
+- Charged shots stay Rebel-only (XvT and XWA give them to every craft).
+---
+ CMakeLists.txt                          |  1 +
+ resources/config.yaml                   |  3 +-
+ src/xw/flight/object/collide.c          | 13 ++++++-
+ src/xw/flight/object/laser.c            | 17 ++++++++-
+ src/xw/flight/object/starship.c         | 19 ++++++++++
+ src/xw_runtime/config/flight_tweaks.c   | 22 +++++++++--
+ src/xw_runtime/config/flight_tweaks.h   | 11 ++++--
+ src/xw_runtime/runtime/xvt_hardpoints.c | 49 +++++++++++++++++++++++++
+ src/xw_runtime/runtime/xvt_hardpoints.h | 22 +++++++++++
+ 9 files changed, 146 insertions(+), 11 deletions(-)
+ create mode 100644 src/xw_runtime/runtime/xvt_hardpoints.c
+ create mode 100644 src/xw_runtime/runtime/xvt_hardpoints.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3d74e04..2921ac2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -368,6 +368,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/runtime/computer_task.c
+     src/xw_runtime/runtime/options_task.c
+     src/xw_runtime/runtime/gate_collision_task.c
++    src/xw_runtime/runtime/xvt_hardpoints.c
+     src/xw_runtime/runtime/flight_frame.c
+     src/xw_runtime/runtime/flight_input.c
+     src/xw_runtime/runtime/startup_task.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index d884e4b..4533a0f 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -251,7 +251,8 @@ game:
+   # selected fires parallel.
+   laser_convergence_metres: 550
+   # Laser and ion cannons cycle and fly as in X-Wing vs TIE Fighter: faster
+-  # refire, bolts twice as fast for half as long (same range). Every craft.
++  # refire, XvT's bolt speed, range and launch point, and XvT's gun positions
++  # (X-Wing, B-Wing, TIE fighter, TIE interceptor, shuttle). Every craft.
+   xvt_lasers: true
+   # AI craft with lasers and ion cannons fire both together (XWA style).
+   # 0 = off, 1 = friendly craft only, 2 = all craft. Disable orders keep ions only.
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index df123b3..2233b4f 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -16,6 +16,7 @@
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_math.h"
+ #include "xw_runtime/runtime/flight_types.h"
++#include "xw_runtime/runtime/xvt_hardpoints.h"
+ #include "xw_runtime/storage/dos94_assets.h"
+ #endif
+ 
+@@ -1244,7 +1245,7 @@ int16_t collide_targetinrange(uint16_t sourceObjectIndex, uint16_t targetObjectR
+ 	int projectileIndex = projectileType - LASER_PROJECTILE_FIRST_TYPE;
+ #endif
+ #ifdef XW_MODERN
+-	/* Predict with the bolt actually fired (game.xvt_lasers doubles speed and halves lifetime). */
++	/* Predict with the bolt actually fired (game.xvt_lasers: XvT's speed, lifetime and gun positions). */
+ 	int16_t projectileSpeed =
+ 		XwFlightTweaks_ProjectileSpeed(projectileIndex, g_projectileSpeedByType[projectileIndex]);
+ 	int16_t predictionSteps = XwFlightTweaks_ProjectileLifetimeTicks(
+@@ -1272,9 +1273,19 @@ int16_t collide_targetinrange(uint16_t sourceObjectIndex, uint16_t targetObjectR
+ 	g_collisionSegmentStartWorldX = sourceObject->worldX;
+ 	g_collisionSegmentStartWorldY = sourceObject->worldY;
+ 	g_collisionSegmentStartWorldZ = sourceObject->worldZ;
++#ifdef XW_MODERN
++	{
++		int16_t side = g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].x;
++		int16_t up = g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].z;
++		int16_t forward = g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].y;
++		XwXvtHardpoints_Get(craftTypeIndex, weaponSlot, &side, &up, &forward);
++		pai_calcrotatedpoint(sourceObject, side, up, forward);
++	}
++#else
+ 	pai_calcrotatedpoint(sourceObject, g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].x,
+ 						 g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].z,
+ 						 g_craftTypeDefs[craftTypeIndex].weaponHardpoints[weaponSlot].y);
++#endif
+ #ifdef XW_MODERN
+ 	g_collisionSegmentStartWorldX = (int32_t)((uint32_t)g_collisionSegmentStartWorldX + (uint32_t)g_rotatedX);
+ 	g_collisionSegmentStartWorldY = (int32_t)((uint32_t)g_collisionSegmentStartWorldY + (uint32_t)g_rotatedY);
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index a4ed7d0..bb863d6 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -4,6 +4,7 @@
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_math.h"
+ #include "xw_runtime/runtime/flight_types.h"
++#include "xw_runtime/runtime/xvt_hardpoints.h"
+ #include "xw_runtime/timing/flight_timing.h"
+ #endif
+ 
+@@ -646,7 +647,7 @@ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotI
+ 		g_objectTable[projectileIndex].lifetimeTicks =
+ 			XW_SIMULATION_TICKS_PER_SECOND * g_projectileLifetimeSecondsByType[propertyIndex];
+ #ifdef XW_MODERN
+-		/* game.xvt_lasers: cannon bolts fly twice as fast for half as long. Damage keeps the original speed. */
++		/* game.xvt_lasers: cannon bolts take XvT's speed and lifetime. Damage keeps the original speed. */
+ 		g_objectTable[projectileIndex].speed =
+ 			sourceObject->speed +
+ 			XwFlightTweaks_ProjectileSpeed(propertyIndex, g_projectileSpeedByType[propertyIndex]);
+@@ -656,9 +657,20 @@ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotI
+ 		worldY = sourceObject->worldY;
+ 		worldX = sourceObject->worldX;
+ 		worldZ = sourceObject->worldZ;
++#ifdef XW_MODERN
++		{
++			/* game.xvt_lasers: XvT's gun positions where its model's differ. */
++			int16_t side = g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].x;
++			int16_t up = g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].z;
++			int16_t forward = g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].y;
++			XwXvtHardpoints_Get(modelIndex, weaponSlotIndex, &side, &up, &forward);
++			pai_calcrotatedpoint(sourceObject, side, up, forward);
++		}
++#else
+ 		pai_calcrotatedpoint(sourceObject, g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].x,
+ 							 g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].z,
+ 							 g_craftTypeDefs[modelIndex].weaponHardpoints[weaponSlotIndex].y);
++#endif
+ #ifdef XW_MODERN
+ 		worldX = (int32_t)((uint32_t)worldX + (uint32_t)g_rotatedX);
+ #else
+@@ -678,6 +690,9 @@ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotI
+ 		g_objectTable[projectileIndex].prevWorldY = worldY;
+ 		g_objectTable[projectileIndex].prevWorldZ = worldZ;
+ 		launchOffset = g_projectileLaunchOffsetByType[propertyIndex];
++#ifdef XW_MODERN
++		launchOffset = XwFlightTweaks_ProjectileLaunchOffset(propertyIndex, launchOffset);
++#endif
+ 		product = (int64_t)sourceObject->cachedForwardX * launchOffset;
+ 		launchX = (int32_t)(product >> LASER_LAUNCH_BASIS_SHIFT);
+ 		product = (int64_t)sourceObject->cachedForwardY * launchOffset;
+diff --git a/src/xw/flight/object/starship.c b/src/xw/flight/object/starship.c
+index 47ff99a..7ffa4a8 100644
+--- a/src/xw/flight/object/starship.c
++++ b/src/xw/flight/object/starship.c
+@@ -8,6 +8,7 @@
+ #include "xw_dos94/assets/models.h"
+ #include "xw_dos94/flight/object/collision.h"
+ #include "xw_dos94/flight/object/effects.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #endif
+ 
+@@ -1136,16 +1137,34 @@ void starship_firelasergunner(uint16_t sourceObjIdx, uint16_t weaponSlotIdx, uin
+ 	g_objectTable[projectileIndex].lifetimeTicks =
+ 		(int16_t)(STARSHIP_GUN_LIFETIME_MULTIPLIER * XW_SIMULATION_TICKS_PER_SECOND *
+ 				  g_projectileLifetimeSecondsByType[projectileDataIndex]);
++#ifdef XW_MODERN
++	/* game.xvt_lasers: turbolasers fly at XvT's speed for three times XvT's bolt lifetime, as XvT's turrets do
++	 * (laser_firewarheadlauncher). */
++	g_objectTable[projectileIndex].speed =
++		XwFlightTweaks_ProjectileSpeed(projectileDataIndex, g_projectileSpeedByType[projectileDataIndex]);
++	g_objectTable[projectileIndex].lifetimeTicks =
++		XwFlightTweaks_ProjectileLifetimeTicks(projectileDataIndex, g_objectTable[projectileIndex].lifetimeTicks);
++#endif
+ 	fview_calcrotatemove((int16_t)shotPitch, shotYaw, &g_objectTable[projectileIndex]);
+ 	g_objectTable[projectileIndex].prevWorldX = muzzleWorldX;
+ 	g_objectTable[projectileIndex].prevWorldY = muzzleWorldY;
+ 	g_objectTable[projectileIndex].prevWorldZ = muzzleWorldZ;
++#ifdef XW_MODERN
++	{
++		int16_t launchOffset = XwFlightTweaks_ProjectileLaunchOffset(
++			projectileDataIndex, g_projectileLaunchOffsetByType[projectileDataIndex]);
++		launchX = (int)((uint64_t)((int64_t)launchOffset * g_craftMoveX) >> LASER_LAUNCH_BASIS_SHIFT);
++		launchY = (int)((uint64_t)((int64_t)launchOffset * g_craftMoveZ) >> LASER_LAUNCH_BASIS_SHIFT);
++		launchZ = (int)((uint64_t)((int64_t)launchOffset * g_craftMoveY) >> LASER_LAUNCH_BASIS_SHIFT);
++	}
++#else
+ 	launchX = (int)((uint64_t)((int64_t)g_projectileLaunchOffsetByType[projectileDataIndex] * g_craftMoveX) >>
+ 					LASER_LAUNCH_BASIS_SHIFT);
+ 	launchY = (int)((uint64_t)((int64_t)g_projectileLaunchOffsetByType[projectileDataIndex] * g_craftMoveZ) >>
+ 					LASER_LAUNCH_BASIS_SHIFT);
+ 	launchZ = (int)((uint64_t)((int64_t)g_projectileLaunchOffsetByType[projectileDataIndex] * g_craftMoveY) >>
+ 					LASER_LAUNCH_BASIS_SHIFT);
++#endif
+ 	g_objectTable[projectileIndex].worldX = (int)((uint32_t)muzzleWorldX + launchX);
+ 	g_objectTable[projectileIndex].worldY = (int)((uint32_t)muzzleWorldY + launchY);
+ 	g_objectTable[projectileIndex].worldZ = (int)((uint32_t)muzzleWorldZ + launchZ);
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index af0d740..d0eb45f 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -75,10 +75,24 @@ bool XwFlightTweaks_XvtTargetingComputer(void) { return s_xvt_targeting_computer
+ 
+ void XwFlightTweaks_SetXvtTargetingComputer(bool enabled) { s_xvt_targeting_computer = enabled; }
+ 
+-int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base) {
+-	return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES ? (int16_t)(2 * base) : base;
+-}
++/* XvT's g_projectileDamageByObjectType for its cannon types 137-142 (rebel laser, rebel turbo, imperial laser,
++ * imperial turbo, ion, ion turbo), which line up with X-Wing's 143-148 (the turbo is X-Wing's charged shot). */
++static const int16_t kXvtSpeed[CANNON_PROJECTILE_TYPES] = { 2000, 2000, 1800, 1800, 1400, 1600 };
++/* Lifetime as a fraction of X-Wing's: XvT 1, 1.5, 1, 1.5, 1.5, 2 s against X-Wing's 2, 3, 2, 3, 5, 5 s. */
++static const int16_t kXvtLifetimeRatio[CANNON_PROJECTILE_TYPES][2] = { { 1, 2 }, { 1, 2 },  { 1, 2 },
++																		{ 1, 2 }, { 3, 10 }, { 2, 5 } };
++enum { XVT_CANNON_LAUNCH_OFFSET = 921 };
++
++static bool XvtCannon(int index) { return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES; }
++
++int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base) { return XvtCannon(index) ? kXvtSpeed[index] : base; }
+ 
+ int16_t XwFlightTweaks_ProjectileLifetimeTicks(int index, int16_t baseTicks) {
+-	return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES ? (int16_t)(baseTicks / 2) : baseTicks;
++	return XvtCannon(index)
++			   ? (int16_t)((int32_t)baseTicks * kXvtLifetimeRatio[index][0] / kXvtLifetimeRatio[index][1])
++			   : baseTicks;
++}
++
++int16_t XwFlightTweaks_ProjectileLaunchOffset(int index, int16_t base) {
++	return XvtCannon(index) ? XVT_CANNON_LAUNCH_OFFSET : base;
+ }
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 8e8ccbc..d619b63 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -18,8 +18,9 @@ extern "C" {
+  * distance when the target is off the nose or out of range (see
+  * XwFlightMath_ConvergeLaser).
+  * xvt_lasers (game.xvt_lasers): cannons cycle and fly as in X-Wing vs TIE
+- * Fighter: 47 instead of 78 cooldown ticks per shot, bolts at twice the speed
+- * for half the lifetime (same range). Applies to every craft.
++ * Fighter: 47 instead of 78 cooldown ticks per shot, XvT's bolt speed, lifetime
++ * and launch distance, and XvT's gun positions (xvt_hardpoints.h). Applies to
++ * every craft.
+  * ai_ion_link (game.ai_ion_link): AI craft with lasers and ion cannons fire both
+  * together, X-Wing Alliance style. Disable orders keep ions only.
+  * xvt_throttle (game.xvt_throttle): craft accelerate and brake as in XvT.
+@@ -73,10 +74,12 @@ void XwFlightTweaks_SetXvtEngineWash(bool enabled);
+ bool XwFlightTweaks_IonDisableOnly(void);
+ void XwFlightTweaks_SetIonDisableOnly(bool enabled);
+ 
+-/* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
+- * laser and ion cannons), with xvt_lasers applied. */
++/* Cannon bolt speed, lifetime and launch distance ahead of the gun for projectile property index `index`
++ * (0-5 are laser and ion cannons), with xvt_lasers applied: XvT's own values (speed 2000/1800 lasers,
++ * 1400/1600 ions; 1-2 s; 921 units). Fighters and starship turrets alike. */
+ int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base);
+ int16_t XwFlightTweaks_ProjectileLifetimeTicks(int index, int16_t baseTicks);
++int16_t XwFlightTweaks_ProjectileLaunchOffset(int index, int16_t base);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/xw_runtime/runtime/xvt_hardpoints.c b/src/xw_runtime/runtime/xvt_hardpoints.c
+new file mode 100644
+index 0000000..ca0fad2
+--- /dev/null
++++ b/src/xw_runtime/runtime/xvt_hardpoints.c
+@@ -0,0 +1,49 @@
++#include "xw_runtime/runtime/xvt_hardpoints.h"
++#include "xw_runtime/config/flight_tweaks.h"
++#include "xw_runtime/runtime/flight_types.h"
++
++enum { MAX_SLOTS = 8 };
++
++typedef struct Point {
++	int16_t side, up, forward;
++} Point;
++
++typedef struct Craft {
++	uint8_t type, slots; /* X-Wing craft type index; slots 0..slots-1 are replaced. */
++	Point points[MAX_SLOTS];
++} Craft;
++
++/* XvT CP640/IVFILES OPT hardpoints (x, -y, z as ModelMesh_GetHardpoint reads them), in XvT's slot order:
++ * each laser group, then each warhead launcher, by mesh then hardpoint. */
++static const Craft kCraft[] = {
++	/* X-W: cannons top left, bottom left, bottom right, top right; torpedoes. */
++	{ 0, 6, { { -182, 66, 131 }, { -182, -38, 131 }, { 182, -38, 131 }, { 182, 66, 131 }, { 17, -4, 332 },
++			  { -18, -4, 332 } } },
++	/* B-W (Balance of Power): lasers on the wing tips and lower wing, ions above the cockpit; torpedoes. */
++	{ 3, 8, { { -231, -53, 204 }, { 0, -456, 163 }, { 232, -53, 204 }, { -11, 166, 159 }, { 0, 164, 197 },
++			  { 12, 166, 159 }, { 37, -55, 66 }, { -36, -55, 66 } } },
++	/* T/F. */
++	{ 4, 2, { { -17, -32, 70 }, { 15, -33, 70 } } },
++	/* T/I: top left, bottom left, top right, bottom right. */
++	{ 5, 4, { { -174, 40, 286 }, { -174, -46, 286 }, { 174, 40, 286 }, { 174, -46, 286 } } },
++	/* SHU (all four X-Wing shuttle types use the Lambda model). */
++	{ 16, 4, { { -185, 10, 211 }, { 185, 10, 211 }, { -103, 129, 211 }, { 101, 129, 211 } } },
++	{ 17, 4, { { -185, 10, 211 }, { 185, 10, 211 }, { -103, 129, 211 }, { 101, 129, 211 } } },
++	{ 18, 4, { { -185, 10, 211 }, { 185, 10, 211 }, { -103, 129, 211 }, { 101, 129, 211 } } },
++	{ 19, 4, { { -185, 10, 211 }, { 185, 10, 211 }, { -103, 129, 211 }, { 101, 129, 211 } } },
++};
++
++bool XwXvtHardpoints_Get(unsigned craftTypeIndex, unsigned slot, int16_t* side, int16_t* up, int16_t* forward) {
++	if (!XwFlightTweaks_XvtLasers() || XwFlightTypes_Dos())
++		return false;
++	for (unsigned i = 0; i < sizeof kCraft / sizeof kCraft[0]; ++i)
++		if (kCraft[i].type == craftTypeIndex) {
++			if (slot >= kCraft[i].slots)
++				return false;
++			*side = kCraft[i].points[slot].side;
++			*up = kCraft[i].points[slot].up;
++			*forward = kCraft[i].points[slot].forward;
++			return true;
++		}
++	return false;
++}
+diff --git a/src/xw_runtime/runtime/xvt_hardpoints.h b/src/xw_runtime/runtime/xvt_hardpoints.h
+new file mode 100644
+index 0000000..8f6c1a2
+--- /dev/null
++++ b/src/xw_runtime/runtime/xvt_hardpoints.h
+@@ -0,0 +1,22 @@
++#ifndef XW_RUNTIME_RUNTIME_XVT_HARDPOINTS_H
++#define XW_RUNTIME_RUNTIME_XVT_HARDPOINTS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* game.xvt_lasers: where X-Wing vs TIE Fighter fires each weapon slot from, for the 1998 craft whose XvT
++ * positions differ from X-Wing's table. XvT keeps the same static table as X-Wing, then rebuilds a weapon
++ * group from the OPT's hardpoints when the OPT has them (fediskio.c), so the X-Wing, B-Wing (Balance of
++ * Power OPT), TIE fighter, TIE interceptor and shuttle fire from their model's guns, in mesh order. Slot
++ * counts match X-Wing's; craft whose counts differ (the TIE Advanced) and capital ships keep X-Wing's.
++ * False (keep the table) for other craft, other slots, DOS flight, or with xvt_lasers off. */
++bool XwXvtHardpoints_Get(unsigned craftTypeIndex, unsigned slot, int16_t* side, int16_t* up, int16_t* forward);
++
++#ifdef __cplusplus
++}
++#endif
++#endif

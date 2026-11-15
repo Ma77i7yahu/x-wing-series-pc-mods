@@ -1,0 +1,201 @@
+From 19d889c0d370c0da7cc5a23d682c860689397825 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 12:02:38 +1100
+Subject: [PATCH 23/25] Capital ship missiles wait for 2 s of being the
+ player's target (flight.capital_missile_grace)
+
+---
+ resources/config.yaml             |  4 ++++
+ src/xvt/flight/ai/paifight.c      |  9 +++++++++
+ src/xvt/flight/object/laser.c     | 26 ++++++++++++++++++++++++++
+ src/xvt/flight/object/laser.h     |  2 ++
+ src/xvt_app/settings/settings.c   |  9 +++++++++
+ src/xvt_runtime/config/config.c   | 18 ++++++++++++++++++
+ src/xvt_runtime/config/config.h   |  2 ++
+ src/xvt_runtime/config/settings.c |  1 +
+ src/xvt_runtime/config/settings.h |  2 ++
+ 9 files changed, 73 insertions(+)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 46b2f40..490cf98 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -457,3 +457,7 @@ flight:
+   # single-player missions keep wingmen at the mission's own skill level;
+   # enemies still get Hard's boost. Multiplayer is unaffected.
+   hard_keeps_friendly_skill: true
++  # Capital ships launch missiles at you once you have kept them targeted for
++  # 2 seconds, so cycling targets with T past them does not set them off.
++  # false = the original: they launch as soon as you target them.
++  capital_missile_grace: true
+diff --git a/src/xvt/flight/ai/paifight.c b/src/xvt/flight/ai/paifight.c
+index 52e12d4..f13ede3 100644
+--- a/src/xvt/flight/ai/paifight.c
++++ b/src/xvt/flight/ai/paifight.c
+@@ -7,6 +7,7 @@
+ #include "xvt/flight/flight.h"
+ #include "xvt/flight/mission/mission.h"
+ #include "xvt/flight/object/collide.h"
++#include "xvt/flight/object/laser.h"
+ #include "xvt/flight/object/object.h"
+ #include "xvt/flight/player/player.h"
+ #include "xvt/math/math2.h"
+@@ -1396,6 +1397,14 @@ int16_t paifight_missiledefenseorder(void) {
+ 										if (g_players[playerOwner].currentTargetObjectIdx !=
+ 											g_paiContext.objectIndex)
+ 											continue;
++#ifdef XVT_MODERN
++										/* flight.capital_missile_grace: only after 2 s as the player's
++										 * target, so cycling past the ship with T does not set it off. */
++										if (XvtConfig_Settings()->capital_missile_grace &&
++											laser_PlayerTargetHeldTicks(playerOwner, g_paiContext.objectIndex) <
++												2 * SIMULATION_TICKS_PER_SECOND)
++											continue;
++#endif
+ 									}
+ 								}
+ 
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index e989a7f..f772902 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -71,6 +71,29 @@ const uint8_t g_platformBeamDisabledComponentIds[60] = {
+ 	0x11, 0x12, 0x17, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0xFF, 0x15, 0x16, 0x17, 0x18, 0x1E, 0xFF,
+ };
+ 
++#ifdef XVT_MODERN
++/* When each player picked their current target (g_gameTime), for laser_PlayerTargetHeldTicks. */
++static uint16_t s_heldTarget[8];
++static int s_heldSince[8];
++
++static void laser_TrackPlayerTargets(void) {
++	for (int player = 0; player < 8; ++player) {
++		uint16_t target = (uint16_t)g_players[player].currentTargetObjectIdx;
++		if (target != s_heldTarget[player] || g_gameTime < s_heldSince[player]) {
++			s_heldTarget[player] = target;
++			s_heldSince[player] = g_gameTime;
++		}
++	}
++}
++
++int laser_PlayerTargetHeldTicks(int player, uint16_t objectIdx) {
++	if (player < 0 || player >= 8 || (uint16_t)g_players[player].currentTargetObjectIdx != objectIdx ||
++		s_heldTarget[player] != objectIdx)
++		return 0;
++	return g_gameTime - s_heldSince[player];
++}
++#endif
++
+ // FLAGS: /O2 /G5
+ // FUNCTION: XVT 0x404710
+ void laser_weaponsfire(void) {
+@@ -106,6 +129,9 @@ void laser_weaponsfire(void) {
+ 	char doPeriodicPowerUpdate;
+ 	uint16_t objectIdx;
+ 
++#ifdef XVT_MODERN
++	laser_TrackPlayerTargets();
++#endif
+ 	doPeriodicPowerUpdate = 0;
+ 	if (g_flightGlobalCountdownTimers.weaponPowerUpdateTimer == 0
+ #ifdef XVT_MODERN
+diff --git a/src/xvt/flight/object/laser.h b/src/xvt/flight/object/laser.h
+index c2c89a3..f8ad89f 100644
+--- a/src/xvt/flight/object/laser.h
++++ b/src/xvt/flight/object/laser.h
+@@ -89,6 +89,8 @@ void laser_fireplayerweapon(int playerIdx);
+ int laser_CanLinkCannonBanks(const CraftData* craft);
+ int laser_PlayerCannonBanksLinked(int playerIdx, const CraftData* craft);
+ void laser_SetPlayerCannonBanksLinked(int playerIdx, int linked);
++/* Game-time ticks the player has kept objectIdx as the current target; 0 when it is not the target. */
++int laser_PlayerTargetHeldTicks(int player, uint16_t objectIdx);
+ void laser_firelasersystem(int objectIndex, int laserSystemIndex);
+ void laser_firerocketsystem(int objectIndex, unsigned int launcherIndex);
+ int laser_firemissile(int objectIndex, int weaponSlotIndex, int projectileTypeId, unsigned int launcherIndex);
+diff --git a/src/xvt_app/settings/settings.c b/src/xvt_app/settings/settings.c
+index 577d39e..48963c4 100644
+--- a/src/xvt_app/settings/settings.c
++++ b/src/xvt_app/settings/settings.c
+@@ -76,6 +76,15 @@ static void XvtSettingsMenu_DrawGame(AeronUiContext* ui, const AeronInputSnapsho
+ 	}
+ 	AeronUi_Help(ui, ion_link == 0 ? "Original: AI craft fire lasers, and ion cannons only on disable orders."
+ 									: "AI Y-Wings, B-Wings, Gunboats etc. fire ions with lasers (ions only to disable).");
++	static const char* const grace_labels[] = { "Immediate", "After 2 Seconds" };
++	int grace = XvtConfig_Settings()->capital_missile_grace != 0;
++	if (AeronUi_Selector(ui, "Capital Ship Missiles", &grace, grace_labels, 2)) {
++		char error[1024];
++		if (!XvtConfig_SetCapitalMissileGrace(grace != 0, error, sizeof error))
++			XvtSettingsMenu_ReportError(error);
++	}
++	AeronUi_Help(ui, grace ? "They launch at you once you keep them targeted for 2 s, so T can scroll past them."
++						   : "Original: they launch as soon as you target them.");
+ 	AeronUi_Spacer(ui, 8.0f);
+ 	XvtInstallationPage_Draw(ui, input);
+ }
+diff --git a/src/xvt_runtime/config/config.c b/src/xvt_runtime/config/config.c
+index f9151fc..3592dda 100644
+--- a/src/xvt_runtime/config/config.c
++++ b/src/xvt_runtime/config/config.c
+@@ -515,6 +515,24 @@ bool XvtConfig_SetHardKeepsFriendlySkill(bool enabled, char* error, size_t capac
+ 	return success;
+ }
+ 
++bool XvtConfig_SetCapitalMissileGrace(bool enabled, char* error, size_t capacity) {
++	AeronConfigFile* updated = NULL;
++	AeronConfigError detail;
++	if (!g_writable)
++		return XvtConfig_Error(error, capacity, "configuration saving is disabled", NULL);
++	if (!AeronConfigFile_Clone(g_user, &updated, &detail))
++		return XvtSettings_FileError(&detail, error, capacity);
++	bool success = enabled == (XvtConfig_DefaultSettings()->capital_missile_grace != 0)
++					   ? AeronConfigFile_Remove(updated, "flight.capital_missile_grace", &detail)
++					   : AeronConfigFile_SetBool(updated, "flight.capital_missile_grace", enabled, &detail);
++	if (success)
++		success = XvtConfig_UpdateUser(updated, 0, error, capacity);
++	else
++		XvtSettings_FileError(&detail, error, capacity);
++	AeronConfigFile_Destroy(updated);
++	return success;
++}
++
+ bool XvtConfig_SetAiIonLink(int mode, char* error, size_t capacity) {
+ 	static const char* const names[] = { "off", "friendly", "all" };
+ 	AeronConfigFile* updated = NULL;
+diff --git a/src/xvt_runtime/config/config.h b/src/xvt_runtime/config/config.h
+index c5e3706..d497a00 100644
+--- a/src/xvt_runtime/config/config.h
++++ b/src/xvt_runtime/config/config.h
+@@ -31,6 +31,8 @@ bool XvtConfig_SetFlightRate(bool unlocked, char* error, size_t capacity);
+ bool XvtConfig_SetSkipIntro(bool enabled, char* error, size_t capacity);
+ /* Consumed at the next mission start; Save persists it. */
+ bool XvtConfig_SetHardKeepsFriendlySkill(bool enabled, char* error, size_t capacity);
++/* Takes effect immediately; Save persists it. */
++bool XvtConfig_SetCapitalMissileGrace(bool enabled, char* error, size_t capacity);
+ /* 0 off, 1 friendly, 2 all; takes effect immediately; Save persists it. */
+ bool XvtConfig_SetAiIonLink(int mode, char* error, size_t capacity);
+ int XvtConfig_Apply(GameConfig* game, char* error, size_t capacity);
+diff --git a/src/xvt_runtime/config/settings.c b/src/xvt_runtime/config/settings.c
+index bae7af9..ef51b4a 100644
+--- a/src/xvt_runtime/config/settings.c
++++ b/src/xvt_runtime/config/settings.c
+@@ -33,6 +33,7 @@ static const XvtSettingField g_fields[] = {
+ 	SETTING_BOOL("startup.skip_intro", skip_intro),
+ 	SETTING_INT("flight.laser_convergence", laser_convergence_m, 0, 5000),
+ 	SETTING_BOOL("flight.hard_keeps_friendly_skill", hard_keeps_friendly_skill),
++	SETTING_BOOL("flight.capital_missile_grace", capital_missile_grace),
+ 	SETTING_STRING("paths.game_data", game_data),
+ 	SETTING_STRING("ui.font", ui_font),
+ 	SETTING_STRING("network.lobby_url", lobby_url),
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index 73e693f..1f528f8 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -96,6 +96,8 @@ typedef struct XvtSettings {
+ 	int ai_ion_link;
+ 	/* Single player on Hard: friendly AI keeps its mission skill instead of dropping one level. */
+ 	int hard_keeps_friendly_skill;
++	/* Capital ship missile launchers fire at a player only after 2 s of being that player's target. */
++	int capital_missile_grace;
+ 	char game_data[XVT_PATH_CAPACITY];
+ 	char ui_font[XVT_PATH_CAPACITY];
+ 	char lobby_url[AERON_DPLAY_DIRECTORY_URL_CAPACITY];

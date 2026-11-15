@@ -1,0 +1,762 @@
+From b8f9e10e848048f850ddeff4423c0b5a81aa19a7 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 08:17:18 +1100
+Subject: [PATCH 08/18] XvT craft lists (F / Shift+F) and damage display (D)
+ with Up/Down/Enter (flight.xvt_hud)
+
+---
+ CMakeLists.txt                             |   1 +
+ src/tie/create.c                           |   4 +
+ src/tie/user.c                             |   6 +
+ src/tie/xvt_mfd.c                          | 384 +++++++++++++++++++++
+ src/tie/xvt_mfd.h                          |  21 ++
+ src/tie_remaster/flight/cockpit/renderer.c | 198 +++++++++++
+ src/tie_runtime/snapshot/hud_types.h       |  20 ++
+ src/tie_runtime/snapshot/snapshot_hud.c    |   4 +-
+ 8 files changed, 637 insertions(+), 1 deletion(-)
+ create mode 100644 src/tie/xvt_mfd.c
+ create mode 100644 src/tie/xvt_mfd.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 137e2e2..a604848 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -171,6 +171,7 @@ set(TIE_RECOVERED_SOURCES
+         src/tie/fscript.c
+         src/tie/fscript.h
+         src/tie/panel.c
++        src/tie/xvt_mfd.c
+         src/tie/overlay.c
+         src/tie/damage.c
+         src/tie/feinput.c
+diff --git a/src/tie/create.c b/src/tie/create.c
+index ba43d25..e0061aa 100644
+--- a/src/tie/create.c
++++ b/src/tie/create.c
+@@ -32,6 +32,7 @@
+ #include "tie/tie_render_tie98.h"
+ #include "tie/trig2.h"
+ #include "tie/xtimer.h"
++#include "tie/xvt_mfd.h"
+ #include "tie_runtime/audio/config.h"
+ #include "tie_runtime/diagnostics/diagnostics.h"
+ #include "tie_runtime/display/classic_display.h"
+@@ -538,6 +539,9 @@ void create_createmission(void) {
+ 	}
+ 	for (i = 0; i < 20; i++)
+ 		timers[i] = 0;
++#ifdef TIE_MODERN
++	TieXvtMfd_Reset();
++#endif
+ 
+ 	camera.view_dir_dirty = 0;
+ 	camera.side_angle = 0;
+diff --git a/src/tie/user.c b/src/tie/user.c
+index b1ab1c4..ed06b98 100644
+--- a/src/tie/user.c
++++ b/src/tie/user.c
+@@ -1,4 +1,5 @@
+ #include "tie/user.h"
++#include "tie/xvt_mfd.h"
+ #include "tie/edition.h"
+ #include "tie/help.h"
+ #include "tie_runtime/audio/imuse_api.h"
+@@ -766,6 +767,11 @@ void user_inputforplane(void) {
+ 			}
+ 		}
+ 
++#ifdef TIE_MODERN
++		/* flight.xvt_hud: XvT's craft lists and damage display take their keys first. */
++		if (TieXvtMfd_HandleKey((uint16_t)inputkey))
++			inputkey = KEY_NONE;
++#endif
+ 		switch ((uint16_t)inputkey) {
+ 			/* Alt+O: screenshot. */
+ 			case KEY_ALT_O:
+diff --git a/src/tie/xvt_mfd.c b/src/tie/xvt_mfd.c
+new file mode 100644
+index 0000000..c5f21ff
+--- /dev/null
++++ b/src/tie/xvt_mfd.c
+@@ -0,0 +1,384 @@
++/* flight.xvt_hud: X-Wing vs TIE Fighter's craft lists (F friendly, Shift+F
++ * enemy; Mfd_DrawCraftListPage) and damage display (D; Damage_DisplayMfdPage).
++ *
++ * The lists and the damage display share Up / Down: the one opened last has
++ * them, and the damage display gets them back when the lists close. Enter
++ * on the damage display moves the highlighted system to the head of the
++ * repair queue, as the damage room does. State changes only from keys, so
++ * flight recordings replay the same repair order. The cockpit renderer
++ * draws what TieXvtMfd_Capture puts in the HUD snapshot. */
++#include "tie/xvt_mfd.h"
++
++#include "tie/collide.h"
++#include "tie/msg.h"
++#include "tie/msg_templates.h"
++#include "tie/panel.h"
++#include "tie/spec.h"
++#include "tie/tie.h"
++#include "tie_runtime/hooks/flight_tweaks.h"
++
++#include <ctype.h>
++#include <stdio.h>
++#include <string.h>
++
++enum { NUM_SYSTEMS = 10, TARGETING_SYSTEM = 5, LIST_ROWS = 8 };
++
++static int s_list_mode;
++static unsigned s_list_top;
++static int s_damage_open;
++static int s_damage_has_arrows;
++static int s_damage_selected = -1;
++
++/* XvT's names (strings.txt lines 14-23) for TIE's systems; XvT has no
++ * beam or communications system, so those keep TIE's wording. */
++static const char* const k_system_names[NUM_SYSTEMS] = {
++	"Auto-Ejection", "Hyperdrive",		   "Cannon System", "Flight Controls", "Engines",
++	"Targeting Computer", "Shield System", "Warhead Launcher", "Beam System", "Comm System",
++};
++
++void TieXvtMfd_Reset(void) {
++	s_list_mode = TIE_XVT_LIST_CLOSED;
++	s_list_top = 0;
++	s_damage_open = 0;
++	s_damage_has_arrows = 0;
++	s_damage_selected = -1;
++}
++
++static bool TieXvtMfd_TargetingWorks(void) { return pstate.subsystem_health_percent[TARGETING_SYSTEM] != 0; }
++
++/* Systems knocked out (health 0) and fitted, in repair order. */
++static unsigned TieXvtMfd_DamagedSystems(uint8_t systems[NUM_SYSTEMS]) {
++	uint8_t by_rank[NUM_SYSTEMS];
++	unsigned count = 0;
++	memset(by_rank, 0xFF, sizeof by_rank);
++	for (unsigned i = 0; i < NUM_SYSTEMS; ++i)
++		if (pstate.subsystem_repair_priority[i] < NUM_SYSTEMS)
++			by_rank[pstate.subsystem_repair_priority[i]] = (uint8_t)i;
++	for (unsigned rank = 0; rank < NUM_SYSTEMS; ++rank) {
++		uint8_t sys = by_rank[rank];
++		if (sys < NUM_SYSTEMS && !pstate.subsystem_health_percent[sys] && pstate.player_craft &&
++			(pstate.player_craft->subsystem_active & (uint16_t)systemmask[sys]))
++			systems[count++] = sys;
++	}
++	return count;
++}
++
++static int TieXvtMfd_DamageSelected(void) {
++	uint8_t systems[NUM_SYSTEMS];
++	unsigned count = TieXvtMfd_DamagedSystems(systems);
++	for (unsigned i = 0; i < count; ++i)
++		if (systems[i] == s_damage_selected)
++			return s_damage_selected;
++	return count ? systems[0] : -1;
++}
++
++static bool TieXvtMfd_DamageHasKeys(void) {
++	return s_damage_open && (s_damage_has_arrows || s_list_mode == TIE_XVT_LIST_CLOSED);
++}
++
++static void TieXvtMfd_ToggleList(int mode) {
++	/* Both lists need the targeting computer, as in XvT. */
++	if (!TieXvtMfd_TargetingWorks()) {
++		argtable[0] = damagemsg[TARGETING_SYSTEM];
++		argtable[1] = MSG_SYS_DAMAGED;
++		msg_messageprintf(MSG_SYSTEM_STATUS);
++		return;
++	}
++	s_list_mode = s_list_mode == mode ? TIE_XVT_LIST_CLOSED : mode;
++	s_list_top = 0;
++	s_damage_has_arrows = 0;
++}
++
++static void TieXvtMfd_ToggleDamage(void) {
++	uint8_t systems[NUM_SYSTEMS];
++	if (s_damage_open) {
++		s_damage_open = 0;
++		s_damage_has_arrows = 0;
++		s_damage_selected = -1;
++	} else if (!TieXvtMfd_DamagedSystems(systems)) {
++		msg_messagetext(MSG_SYSTEM_STATUS, "All systems operational");
++	} else {
++		s_damage_open = 1;
++		s_damage_has_arrows = 1;
++		s_damage_selected = systems[0];
++	}
++}
++
++/* Damage_FindAdjacentDamagedSystem: the next or previous damaged system in
++ * repair order, wrapping. */
++static void TieXvtMfd_MoveDamageSelection(int step) {
++	uint8_t systems[NUM_SYSTEMS];
++	unsigned count = TieXvtMfd_DamagedSystems(systems), at = 0;
++	int selected = TieXvtMfd_DamageSelected();
++	if (!count)
++		return;
++	while (at < count && systems[at] != selected)
++		++at;
++	s_damage_selected = systems[(at + count + (step < 0 ? count - 1 : 1)) % count];
++}
++
++/* damage_damageroom's Enter: the highlighted system ranks first and the
++ * ones ahead of it move down one. */
++static void TieXvtMfd_RepairSelectedFirst(void) {
++	int selected = TieXvtMfd_DamageSelected();
++	if (selected < 0)
++		return;
++	uint8_t top = pstate.subsystem_repair_priority[selected];
++	for (unsigned i = 0; i < NUM_SYSTEMS; ++i)
++		if (top > pstate.subsystem_repair_priority[i])
++			pstate.subsystem_repair_priority[i]++;
++	pstate.subsystem_repair_priority[selected] = 0;
++	s_damage_selected = selected;
++}
++
++bool TieXvtMfd_HandleKey(uint16_t key) {
++	if (!TieFlightTweaks_XvtHud())
++		return false;
++	switch (key) {
++		case 'f':
++			TieXvtMfd_ToggleList(TIE_XVT_LIST_FRIENDLY);
++			return true;
++		case 'F':
++			TieXvtMfd_ToggleList(TIE_XVT_LIST_ENEMY);
++			return true;
++		case 'd':
++			TieXvtMfd_ToggleDamage();
++			return true;
++		case 3: /* Up */
++			if (TieXvtMfd_DamageHasKeys())
++				TieXvtMfd_MoveDamageSelection(-1);
++			else if (s_list_mode && s_list_top)
++				--s_list_top;
++			return s_list_mode || s_damage_open;
++		case 4: /* Down; the capture clamps it to the rows there are. */
++			if (TieXvtMfd_DamageHasKeys())
++				TieXvtMfd_MoveDamageSelection(1);
++			else if (s_list_mode)
++				++s_list_top;
++			return s_list_mode || s_damage_open;
++		case 13: /* Enter: instead of matching speed while the display has the keys. */
++			if (TieXvtMfd_DamageHasKeys()) {
++				TieXvtMfd_RepairSelectedFirst();
++				return true;
++			}
++			return false;
++		default:
++			return false;
++	}
++}
++
++/* ---- Capture ---- */
++
++/* 0 friendly, 1 enemy (as the R key judges it), 2 neither. */
++static int TieXvtMfd_Relation(uint16_t obj) {
++	uint8_t mine = objects[pstate.object_idx].side, side = objects[obj].side;
++	if (side == mine || ((side == 1 || side == 4) && (mine == 1 || mine == 4)))
++		return 0;
++	if ((side == 2 && (int8_t)mission_file_header.mission.neutral_name[0][0] != '1') ||
++		(side == 3 && (int8_t)mission_file_header.mission.neutral_name[1][0] != '1') ||
++		(side == 5 && (int8_t)mission_file_header.mission.neutral_name[3][0] != '1'))
++		return 2;
++	return 1;
++}
++
++/* panel_buildobjectname's flight-group-name color for a side. */
++static uint8_t TieXvtMfd_SideColor(uint8_t side) {
++	return side == 0 ? 0x52 : side == 1 || side == 4 ? 0x4A : side == 2 ? 0x46 : 0x56;
++}
++
++static bool TieXvtMfd_Listed(uint16_t obj) {
++	if (obj >= NUM_CRAFTS || !objects[obj].ship_idx || objects[obj].category || !objects[obj].craft_ptr)
++		return false;
++	/* Craft in hangars or hyperspace drop out, as from the R key. */
++	uint8_t ff = objects[obj].craft_ptr->flight_flag;
++	return !ff || ff == 6;
++}
++
++/* XvT title case: all-capital words keep their first letter only. */
++static void TieXvtMfd_TitleCase(char* text) {
++	for (char* word = text; *word;) {
++		char* end = word;
++		bool letters = true, upper = true;
++		while (*end && *end != ' ') {
++			letters = letters && isalpha((unsigned char)*end);
++			upper = upper && !islower((unsigned char)*end);
++			++end;
++		}
++		if (letters && upper && end - word >= 2 && !(end - word == 3 && !strncmp(word, "TIE", 3)))
++			for (char* c = word + 1; c < end; ++c)
++				*c = (char)tolower((unsigned char)*c);
++		word = *end ? end + 1 : end;
++	}
++}
++
++/* Mfd_BuildScratchCraftListName: flight group and craft number, 9 characters. */
++static void TieXvtMfd_ListName(uint16_t obj, char* out, size_t capacity) {
++	const EFGStruct* fg = &fg_array[objects[obj].fg_idx];
++	char name[sizeof fg->name + 1] = { 0 }, text[32];
++	memcpy(name, fg->name, sizeof fg->name);
++	if ((int8_t)fg->count > 1)
++		snprintf(text, sizeof text, "%s %d", name, objects[obj].craft_ptr->craft_idx_in_fg + 1);
++	else
++		snprintf(text, sizeof text, "%s", name);
++	snprintf(out, capacity < 10 ? capacity : 10, "%s", text);
++	TieXvtMfd_TitleCase(out);
++}
++
++/* Any object's name without color escapes. */
++static void TieXvtMfd_ObjectName(uint16_t obj, char* out, size_t capacity) {
++	char saved[sizeof tempstring];
++	size_t n = 0;
++	memcpy(saved, tempstring, sizeof saved);
++	panel_buildobjectname(obj, 3);
++	for (const char* p = tempstring; *p && n + 1 < capacity; ++p) {
++		if ((uint8_t)*p == 0xFE) {
++			if (!p[1])
++				break;
++			++p;
++			continue;
++		}
++		out[n++] = *p;
++	}
++	out[n] = 0;
++	memcpy(tempstring, saved, sizeof saved);
++	TieXvtMfd_TitleCase(out);
++}
++
++static int8_t TieXvtMfd_Percent(int32_t value, int32_t maximum) {
++	if (maximum <= 0)
++		return -1;
++	if (value < 0)
++		value = 0;
++	int32_t pct = (value * 100 + maximum / 2) / maximum;
++	return (int8_t)(pct > 127 ? 127 : pct);
++}
++
++/* Mfd_GetFlightGroupGoalStatusStringId: the flight group's primary goal
++ * while it is still to do. */
++static const char* TieXvtMfd_GoalWord(uint16_t obj) {
++	uint8_t fg = objects[obj].fg_idx;
++	if (fgstatus[fg].primary_status == 1 || fgstatus[fg].primary_status == 2)
++		return "";
++	switch ((int8_t)fg_array[fg].pri_win_cond) {
++		case 2:
++			return "Destroy";
++		case 3:
++			return "Attack";
++		case 4:
++			return "Capture";
++		case 5:
++			return objects[obj].craft_ptr->inspected ? "" : "Inspect";
++		case 6:
++			return "Board";
++		case 8:
++			return "Disable";
++		default:
++			return "";
++	}
++}
++
++static void TieXvtMfd_CaptureList(TieHudState* hud) {
++	uint16_t rows[NUM_CRAFTS];
++	unsigned count = 0;
++	if (s_list_mode == TIE_XVT_LIST_CLOSED)
++		return;
++	if (!TieXvtMfd_TargetingWorks()) {
++		s_list_mode = TIE_XVT_LIST_CLOSED;
++		return;
++	}
++	if (s_list_mode == TIE_XVT_LIST_ENEMY) {
++		/* Only the craft a pilot fights: fighters, transports and shuttles. */
++		for (uint16_t i = 0; i < NUM_CRAFTS; ++i)
++			if (TieXvtMfd_Listed(i) && TieXvtMfd_Relation(i) == 1 &&
++				(objects[i].genus == GENUS_FIGHTER || objects[i].genus == GENUS_TRANSPORT))
++				rows[count++] = i;
++	} else {
++		/* The player's own flight group first, then the others in mission order. */
++		unsigned own = objects[pstate.object_idx].fg_idx;
++		for (int pass = 0; pass <= (int)mission_file_header.num_fg; ++pass) {
++			unsigned fg = pass == 0 ? own : (unsigned)pass - 1;
++			if (pass && fg == own)
++				continue;
++			for (uint16_t i = 0; i < NUM_CRAFTS; ++i)
++				if (TieXvtMfd_Listed(i) && TieXvtMfd_Relation(i) != 1 && objects[i].fg_idx == fg)
++					rows[count++] = i;
++		}
++	}
++	/* XvT groups rows by team, keeping their order within each. */
++	for (unsigned i = 1; i < count; ++i)
++		for (unsigned j = i; j > 0 && objects[rows[j]].side < objects[rows[j - 1]].side; --j) {
++			uint16_t t = rows[j];
++			rows[j] = rows[j - 1];
++			rows[j - 1] = t;
++		}
++	if (s_list_top + LIST_ROWS > count)
++		s_list_top = count > LIST_ROWS ? count - LIST_ROWS : 0;
++
++	hud->xvt_list_mode = (uint8_t)s_list_mode;
++	for (unsigned i = s_list_top; i < count && hud->xvt_list_count < LIST_ROWS; ++i) {
++		uint16_t obj = rows[i];
++		const CraftData* cp = objects[obj].craft_ptr;
++		__typeof__(hud->xvt_list_rows[0])* row = &hud->xvt_list_rows[hud->xvt_list_count++];
++		TieXvtMfd_ListName(obj, row->name, sizeof row->name);
++		row->name_color = TieXvtMfd_SideColor(objects[obj].side);
++		row->shield_pct = TieXvtMfd_Percent(cp->forward_shield + cp->rear_shield,
++											2 * spec_data[cp->species_idx].shield_points);
++		row->hull_pct = TieXvtMfd_Percent((int32_t)cp->hull_max - cp->hull_damage, cp->hull_max);
++		uint16_t target = obj == pstate.object_idx ? pstate.target_obj_idx : (uint16_t)cp->ai_target_ref;
++		if (target < NUM_CRAFTS && TieXvtMfd_Listed(target)) {
++			TieXvtMfd_ListName(target, row->target, sizeof row->target);
++			row->target_color = TieXvtMfd_SideColor(objects[target].side);
++		} else if (target < 0x3800 && objects[target].ship_idx) {
++			TieXvtMfd_ObjectName(target, row->target, sizeof row->target);
++			row->target_color = TieXvtMfd_SideColor(objects[target].side);
++		} else {
++			snprintf(row->target, sizeof row->target, "None");
++			row->target_color = 0x46;
++		}
++		if (s_list_mode == TIE_XVT_LIST_ENEMY)
++			snprintf(row->orders, sizeof row->orders, "%s", TieXvtMfd_GoalWord(obj));
++	}
++}
++
++static void TieXvtMfd_CaptureDamage(TieHudState* hud) {
++	uint8_t systems[NUM_SYSTEMS];
++	unsigned count;
++	int selected;
++	if (!s_damage_open)
++		return;
++	count = TieXvtMfd_DamagedSystems(systems);
++	if (!count) {
++		/* XvT closes the display once every system is repaired. */
++		s_damage_open = 0;
++		s_damage_has_arrows = 0;
++		s_damage_selected = -1;
++		return;
++	}
++	selected = TieXvtMfd_DamageSelected();
++	hud->xvt_damage_open = 1;
++	hud->xvt_damage_active = TieXvtMfd_DamageHasKeys() ? 1 : 0;
++	for (unsigned i = 0; i < count; ++i) {
++		unsigned seconds = pstate.subsystem_repair_seconds[systems[i]];
++		__typeof__(hud->xvt_damage_rows[0])* row = &hud->xvt_damage_rows[hud->xvt_damage_count++];
++		snprintf(row->name, sizeof row->name, "%s", k_system_names[systems[i]]);
++		row->minutes = (uint8_t)(seconds / 60 > 99 ? 99 : seconds / 60);
++		row->seconds = (uint8_t)(seconds % 60);
++		row->selected = systems[i] == selected;
++	}
++}
++
++void TieXvtMfd_Capture(TieHudState* hud) {
++	hud->xvt_list_mode = 0;
++	hud->xvt_list_count = 0;
++	hud->xvt_damage_open = 0;
++	hud->xvt_damage_active = 0;
++	hud->xvt_damage_count = 0;
++	if (!TieFlightTweaks_XvtHud()) {
++		TieXvtMfd_Reset();
++		return;
++	}
++	if (!pstate.player_craft || pstate.object_idx >= NUM_CRAFTS)
++		return;
++	TieXvtMfd_CaptureList(hud);
++	TieXvtMfd_CaptureDamage(hud);
++}
+diff --git a/src/tie/xvt_mfd.h b/src/tie/xvt_mfd.h
+new file mode 100644
+index 0000000..fcbaba6
+--- /dev/null
++++ b/src/tie/xvt_mfd.h
+@@ -0,0 +1,21 @@
++#ifndef TIE_XVT_MFD_H
++#define TIE_XVT_MFD_H
++
++#include "tie_runtime/snapshot/hud_types.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* flight.xvt_hud: X-Wing vs TIE Fighter's craft lists and damage display.
++ * See xvt_mfd.c. */
++enum { TIE_XVT_LIST_CLOSED = 0, TIE_XVT_LIST_FRIENDLY = 1, TIE_XVT_LIST_ENEMY = 2 };
++
++/* Closes both; called when the player's craft is created. */
++void TieXvtMfd_Reset(void);
++/* F, Shift+F, D, Up, Down and Enter (inputkey codes). True when the key was
++ * used and must not reach TIE's own binding. */
++bool TieXvtMfd_HandleKey(uint16_t key);
++/* Fills the xvt_list / xvt_damage HUD snapshot fields. */
++void TieXvtMfd_Capture(TieHudState* hud);
++
++#endif
+\ No newline at end of file
+diff --git a/src/tie_remaster/flight/cockpit/renderer.c b/src/tie_remaster/flight/cockpit/renderer.c
+index a6e1c39..c6c1e09 100644
+--- a/src/tie_remaster/flight/cockpit/renderer.c
++++ b/src/tie_remaster/flight/cockpit/renderer.c
+@@ -3102,6 +3102,201 @@ static bool TieCockpitRenderer_FlightHudRecordLists(TieCockpitRenderer* cg, Aero
+ 	return ok;
+ }
+ 
++/* ---- flight.xvt_hud: XvT's F / Shift+F craft lists and D damage display ----
++ * Boxes at XvT's places in every 640 cockpit (Balance of Power .INT elements
++ * 130 and 133), drawn in XvT's layout with TIE's cockpit font and colors.
++ * The craft list is filled in the cockpit and see-through with it off; the
++ * damage box has no fill and shows its frame while it has Up / Down. */
++enum {
++	XVT_LIST_X = 415,
++	XVT_LIST_Y = 296,
++	XVT_LIST_W = 225,
++	XVT_LIST_H = 94,
++	XVT_DAMAGE_X = 433,
++	XVT_DAMAGE_Y = 105,
++	XVT_DAMAGE_W = 207,
++	XVT_DAMAGE_H = 90,
++	XVT_ROW_STEP = 10,
++	XVT_LIST_FILL = 0x141C28,
++	XVT_DAMAGE_SELECTED = 0x1C3C78,
++	XVT_LABEL = 0x46, /* TIE's CMD label blue */
++	XVT_VALUE = 0x47, /* and its value color */
++	XVT_AMBER = 0x4E,
++	XVT_RED = 0x4A,
++};
++
++typedef struct TieCockpitRendererXvtPen {
++	TieCockpitRenderer* cg;
++	const TieScene2dTextSpace* space;
++	float shift_px; /* Widescreen cockpit-off HUD shift, in target pixels. */
++	TieUIText recs[64];
++	int n;
++} TieCockpitRendererXvtPen;
++
++static float TieCockpitRenderer_XvtMeasure(TieCockpitRendererXvtPen* p, const char* s) {
++	return TieScene2dTextRenderer_MeasureFestringClassic(p->cg->text_renderer, TIE_FONT_DOMAIN_COCKPIT,
++														  FONT_MICRO64, p->space, s);
++}
++
++/* Text at (x, y), clipped to `width` classic pixels. */
++static void TieCockpitRenderer_XvtText(TieCockpitRendererXvtPen* p, float x, float y, const char* s,
++									   uint8_t logical, float width) {
++	if (!s || !s[0] || width <= 0.0f ||
++		!TieCockpitText_Push(p->recs, &p->n, (int)(sizeof p->recs / sizeof p->recs[0]), (int16_t)x, (int16_t)y,
++							 s, TieCockpitText_RemapColor(logical)))
++		return;
++	TieUIText* t = &p->recs[p->n - 1];
++	t->font_id = FONT_MICRO64;
++	t->clip_left = (int16_t)x;
++	t->clip_top = (int16_t)(y - 1);
++	t->clip_right = (int16_t)(x + width);
++	t->clip_bottom = (int16_t)(y + XVT_ROW_STEP + 1);
++}
++
++static void TieCockpitRenderer_XvtRightText(TieCockpitRendererXvtPen* p, float right, float y, const char* s,
++											uint8_t logical) {
++	const float w = TieCockpitRenderer_XvtMeasure(p, s);
++	TieCockpitRenderer_XvtText(p, right - w, y, s, logical, w + 1.0f);
++}
++
++/* A fill in classic 640x480 coordinates, unaffected by the cockpit's lower stretch. */
++static void TieCockpitRenderer_XvtFill(TieCockpitRendererXvtPen* p, float x, float y, float w, float h,
++									   float r, float g, float b, float a) {
++	const TieCockpitRendererDrawSpace* space = &p->cg->pending_space;
++	const float sx = space->scale_x * (float)space->coord_w / 640.0f;
++	const float sy = space->scale_y * (float)space->coord_h / 480.0f;
++	const float color[4] = { r * a, g * a, b * a, a };
++	AeronDrawList_AddFill(p->cg->record_list, space->fit_x + p->shift_px + x * sx, space->fit_y + y * sy, w * sx,
++						  h * sy, color, AERON_BLIT2D_BLEND_PMA, NULL);
++}
++
++static void TieCockpitRenderer_XvtFillRgb(TieCockpitRendererXvtPen* p, float x, float y, float w, float h,
++										  uint32_t rgb, float a) {
++	float r, g, b;
++	TieScene2dSrgb_PalToLinearRgb(rgb, &r, &g, &b);
++	TieCockpitRenderer_XvtFill(p, x, y, w, h, r, g, b, a);
++}
++
++static void TieCockpitRenderer_XvtFrame(TieCockpitRendererXvtPen* p, const TieSnapshot* snap, float x, float y,
++										float w, float h) {
++	float r, g, b;
++	TieCockpitRenderer_MsgColorToTint(snap, XVT_LABEL, &r, &g, &b);
++	TieCockpitRenderer_XvtFill(p, x, y, w, 1, r, g, b, 1);
++	TieCockpitRenderer_XvtFill(p, x, y + h - 1, w, 1, r, g, b, 1);
++	TieCockpitRenderer_XvtFill(p, x, y, 1, h, r, g, b, 1);
++	TieCockpitRenderer_XvtFill(p, x + w - 1, y, 1, h, r, g, b, 1);
++}
++
++static uint8_t TieCockpitRenderer_XvtHealthColor(int pct) {
++	return pct <= 20 ? XVT_RED : pct <= 50 ? XVT_AMBER : XVT_VALUE;
++}
++
++static void TieCockpitRenderer_XvtCraftList(TieCockpitRendererXvtPen* p, const TieSnapshot* snap) {
++	const TieHudState* h = &snap->hud;
++	const bool enemy = h->xvt_list_mode == 2;
++	const float half = XVT_ROW_STEP / 2.0f;
++	const float left = XVT_LIST_X + 2, top = XVT_LIST_Y + 2, right = XVT_LIST_X + XVT_LIST_W - 2;
++	float bottom = top + XVT_ROW_STEP * (h->xvt_list_count + 1);
++	if (bottom > XVT_LIST_Y + XVT_LIST_H - 2 || !h->xvt_list_count)
++		bottom = XVT_LIST_Y + XVT_LIST_H - 2;
++	const float fx = left - 2, fy = top - 2, fw = right - left + 4, fh = bottom - top + 4;
++	TieCockpitRenderer_XvtFillRgb(p, fx, fy, fw, fh, XVT_LIST_FILL, snap->cockpit.view_idx == 0 ? 1.0f : 0.55f);
++	TieCockpitRenderer_XvtFrame(p, snap, fx, fy, fw, fh);
++
++	const float health_x = left + 11 * half;
++	TieCockpitRenderer_XvtText(p, left, top, "Craft", XVT_LABEL, health_x - left);
++	TieCockpitRenderer_XvtText(p, health_x, top, "SHD/HULL", XVT_LABEL, right - health_x);
++	const float target_x = health_x + TieCockpitRenderer_XvtMeasure(p, "SHD/HULL") + half;
++	const float orders_x = target_x + 17 * half;
++	if (enemy) {
++		TieCockpitRenderer_XvtText(p, target_x, top, "Target", XVT_LABEL, orders_x - target_x);
++		TieCockpitRenderer_XvtText(p, orders_x, top, "Orders", XVT_LABEL, right - orders_x);
++	} else {
++		TieCockpitRenderer_XvtRightText(p, right, top, "Target", XVT_LABEL);
++	}
++
++	const float digits = TieCockpitRenderer_XvtMeasure(p, "000");
++	for (unsigned i = 0; i < h->xvt_list_count; ++i) {
++		const float y = top + XVT_ROW_STEP * (float)(i + 1);
++		if (y + XVT_ROW_STEP - 2 > bottom + 0.5f)
++			break;
++		const __typeof__(h->xvt_list_rows[0])* row = &h->xvt_list_rows[i];
++		char value[8];
++		TieCockpitRenderer_XvtText(p, left, y, row->name, row->name_color, health_x - left);
++		float x = health_x + half;
++		snprintf(value, sizeof value, "%d", row->shield_pct > 0 ? row->shield_pct : 0);
++		TieCockpitRenderer_XvtRightText(p, x + digits, y, value, TieCockpitRenderer_XvtHealthColor(row->shield_pct));
++		x += digits;
++		TieCockpitRenderer_XvtText(p, x, y, "/", row->name_color, 8);
++		x += TieCockpitRenderer_XvtMeasure(p, "/");
++		if (row->hull_pct > 0) {
++			snprintf(value, sizeof value, "%d", row->hull_pct);
++			TieCockpitRenderer_XvtRightText(p, x + digits, y, value,
++											TieCockpitRenderer_XvtHealthColor(row->hull_pct));
++		}
++		if (enemy) {
++			TieCockpitRenderer_XvtText(p, target_x, y, row->target, row->target_color, orders_x - target_x - half);
++			TieCockpitRenderer_XvtText(p, orders_x, y, row->orders, row->name_color, right - orders_x);
++		} else {
++			const float avail = right - (x + digits + half);
++			const float w = fminf(TieCockpitRenderer_XvtMeasure(p, row->target), avail);
++			TieCockpitRenderer_XvtText(p, right - w, y, row->target, row->target_color, avail);
++		}
++	}
++}
++
++static void TieCockpitRenderer_XvtDamage(TieCockpitRendererXvtPen* p, const TieSnapshot* snap) {
++	const TieHudState* h = &snap->hud;
++	const float step = XVT_ROW_STEP;
++	const float left = XVT_DAMAGE_X + 2, top = XVT_DAMAGE_Y + 2, right = XVT_DAMAGE_X + XVT_DAMAGE_W - 2;
++	float bottom = top + step * (h->xvt_damage_count + 1) + 2;
++	if (bottom > XVT_DAMAGE_Y + XVT_DAMAGE_H - 2)
++		bottom = XVT_DAMAGE_Y + XVT_DAMAGE_H - 2;
++	if (h->xvt_damage_active)
++		TieCockpitRenderer_XvtFrame(p, snap, left - 2, top - 2, right - left + 4, bottom - top + 4);
++	const char* title = "Damage Assessment";
++	TieCockpitRenderer_XvtText(p, left + (right - left - TieCockpitRenderer_XvtMeasure(p, title)) / 2.0f, top,
++							   title, XVT_LABEL, right - left);
++	for (unsigned i = 0; i < h->xvt_damage_count; ++i) {
++		const __typeof__(h->xvt_damage_rows[0])* row = &h->xvt_damage_rows[i];
++		const float y = top + step * (float)(i + 1);
++		if (y + step > bottom + 0.5f)
++			break;
++		if (row->selected)
++			TieCockpitRenderer_XvtFillRgb(p, left, y - 1, right - left, step, XVT_DAMAGE_SELECTED, 1.0f);
++		char time[8];
++		snprintf(time, sizeof time, "%02u:%02u", row->minutes, row->seconds);
++		const float time_w = TieCockpitRenderer_XvtMeasure(p, time);
++		TieCockpitRenderer_XvtText(p, left, y, row->name, XVT_VALUE, right - left - time_w - 4);
++		TieCockpitRenderer_XvtRightText(p, right, y, time, XVT_RED);
++	}
++}
++
++static void TieCockpitRenderer_DrawXvtMfd(TieCockpitRenderer* cg, const TieSnapshot* snap,
++										  const TieScene2dTextSpace* space) {
++	const TieHudState* h = &snap->hud;
++	if (!cg->text_renderer || (!h->xvt_list_mode && !h->xvt_damage_open) ||
++		(snap->cockpit.view_idx != 0 && snap->cockpit.view_idx != 19))
++		return;
++	static TieCockpitRendererXvtPen pen;
++	pen.cg = cg;
++	pen.space = space;
++	/* Both boxes sit on the right; with the cockpit off they follow the HUD out to the edge. */
++	pen.shift_px = s_hud_spread_px;
++	pen.n = 0;
++	if (h->xvt_list_mode)
++		TieCockpitRenderer_XvtCraftList(&pen, snap);
++	if (h->xvt_damage_open)
++		TieCockpitRenderer_XvtDamage(&pen, snap);
++	if (pen.n > 0) {
++		const TieCockpitRendererDrawSpace* d = &cg->pending_space;
++		TieScene2dTextRenderer_RecordFestringScaled(cg->text_renderer, cg->record_list, space->classic_w,
++													space->classic_h, space, pen.recs, pen.n, snap->palette,
++													d->fit_x + pen.shift_px, d->fit_y, d->scale_x, d->scale_y,
++													d->target_w, d->target_h);
++	}
++}
++
+ static bool TieCockpitRenderer_CockpitRecordLists(TieCockpitRenderer* cg, AeronCommandBuffer* cmd, int rt_w,
+ 												  int rt_h, const TieSnapshot* snap) {
+ 	if (!cg || !cmd || !snap || !cg->pending_entry)
+@@ -3241,6 +3436,9 @@ static bool TieCockpitRenderer_CockpitRecordLists(TieCockpitRenderer* cg, AeronC
+ 														space->fit_x, space->fit_y, space->scale_x,
+ 														space->scale_y, space->target_w, space->target_h);
+ 		}
++		/* Classic 640x480 frames only: the boxes use XvT's 640 coordinates. */
++		if (coord_w == 640 && coord_h == 480)
++			TieCockpitRenderer_DrawXvtMfd(cg, snap, &cockpit_space);
+ 	}
+ 	TIE_GPU_MARKER(cmd, "Flight message bar");
+ 	TieCockpitRenderer_DrawMessageBar(cg, cmd, NULL, snap);
+diff --git a/src/tie_runtime/snapshot/hud_types.h b/src/tie_runtime/snapshot/hud_types.h
+index 9b22982..525f7c1 100644
+--- a/src/tie_runtime/snapshot/hud_types.h
++++ b/src/tie_runtime/snapshot/hud_types.h
+@@ -229,6 +229,26 @@ typedef struct TieHudState {
+ 	/* flight.xvt_hud beam threat light: 0 off, 1 tractor beam, 2 jamming beam
+ 	 * on the player (XvT Hud_UpdateThreatIndicators). */
+ 	uint8_t xvt_beam_threat;
++	/* flight.xvt_hud: XvT's F / Shift+F craft lists and D damage display
++	 * (tie/xvt_mfd.c). Text carries the festring 0xFE color escapes. */
++	uint8_t xvt_list_mode; /* 0 closed, 1 friendly, 2 enemy */
++	uint8_t xvt_list_count;
++	struct {
++		char name[16];
++		char target[24];
++		char orders[12];
++		uint8_t name_color; /* logical colors, as panel_buildobjectname's */
++		uint8_t target_color;
++		int8_t shield_pct; /* -1: no shields */
++		int8_t hull_pct;
++	} xvt_list_rows[8];
++	uint8_t xvt_damage_open;
++	uint8_t xvt_damage_active; /* has Up / Down: frame drawn */
++	uint8_t xvt_damage_count;
++	struct {
++		char name[24];
++		uint8_t minutes, seconds, selected;
++	} xvt_damage_rows[10];
+ 	/* Cargo painted by panel_updatethreatname at instrument 70. */
+ 	char threat_cargo[24];
+ 
+diff --git a/src/tie_runtime/snapshot/snapshot_hud.c b/src/tie_runtime/snapshot/snapshot_hud.c
+index cb562d5..3161ad1 100644
+--- a/src/tie_runtime/snapshot/snapshot_hud.c
++++ b/src/tie_runtime/snapshot/snapshot_hud.c
+@@ -16,6 +16,7 @@
+ #include "tie/tie.h"
+ #include "tie/transfm2.h"
+ #include "tie/user.h"
++#include "tie/xvt_mfd.h"
+ #include "tie_runtime/runtime/bonus_countdown_task.h"
+ #include "tie_runtime/runtime/profile.h"
+ #include "tie_runtime/snapshot/snapshot_internal.h"
+@@ -316,7 +317,8 @@ static void TieHudSnapshot_CaptureHud(void) {
+ 						   : (pstate.player_craft->beam_state & 1) ? 1
+ 						   : (pstate.player_craft->beam_state & 2) ? 2
+ 																   : 0;
+-	const uint8_t clock_minutes =mission.train_craft_type ? timeleft.minute : _date.minute;
++	TieXvtMfd_Capture(hud);
++	const uint8_t clock_minutes = mission.train_craft_type ? timeleft.minute : _date.minute;
+ 	const uint8_t clock_seconds = mission.train_craft_type ? timeleft.second : _date.second;
+ 	snprintf(hud->mission_clock_text, sizeof hud->mission_clock_text, "%2u:%02u", (unsigned)clock_minutes,
+ 			 (unsigned)clock_seconds);

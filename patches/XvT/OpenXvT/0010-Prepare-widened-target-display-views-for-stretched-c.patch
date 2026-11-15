@@ -1,0 +1,122 @@
+From 7adce80ec3654fb13070f3bbae81d2ac3305261d Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 06:05:19 +1100
+Subject: [PATCH 10/25] Prepare widened target display views for stretched
+ cockpits; fall back safely
+
+---
+ src/xvt_remaster/preview.c | 40 +++++++++++++++++++++++++-------------
+ 1 file changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/src/xvt_remaster/preview.c b/src/xvt_remaster/preview.c
+index f75cf8d..7a8eba6 100644
+--- a/src/xvt_remaster/preview.c
++++ b/src/xvt_remaster/preview.c
+@@ -11,13 +11,15 @@
+ 
+ /* Frontend previews share a fixed scene; the independent CRT follows its displayed size. */
+ enum { PREVIEW_SLOTS = XVT_SNAP_PREVIEWS + 1, PREVIEW_WIDTH = 2048, PREVIEW_HEIGHT = 1536 };
++/* Up to three display sizes, each also prepared widened for stretched cockpits. */
++enum { CRT_VIEWS = 6 };
+ 
+ static AeronScene3D *g_scene, *g_crtScene;
+ 
+ static struct {
+ 	AeronScene3D* scene;
+ 	int width, height, samples;
+-} g_crtViews[3];
++} g_crtViews[CRT_VIEWS];
+ 
+ static AeronRenderTarget* g_targets[PREVIEW_SLOTS];
+ static XvtPreviewOutput g_outputs[PREVIEW_SLOTS];
+@@ -33,7 +35,7 @@ typedef struct CrtDependencies {
+ 	XvtSnapType types[XVT_SNAP_TYPES];
+ 	int16_t fuselage[25];
+ 	uint16_t craft_slot_end, checkpoint;
+-	uint8_t debris, proving_grounds;
++	uint8_t debris, proving_grounds, stretched;
+ 	int width, height;
+ 	unsigned object_count;
+ 	XvtSnapObject objects[XVT_SNAP_OBJECTS];
+@@ -67,7 +69,7 @@ static int EnsureScene(AeronScene3D** scene, int* old_width, int* old_height, in
+ 
+ static int Ensure(unsigned slot, int width, int height) {
+ 	if (slot == XVT_SNAP_PREVIEWS) {
+-		for (unsigned index = 0; index < 3; ++index)
++		for (unsigned index = 0; index < CRT_VIEWS; ++index)
+ 			if (g_crtViews[index].scene && g_crtViews[index].width == width &&
+ 				g_crtViews[index].height == height) {
+ 				g_crtScene = g_crtViews[index].scene;
+@@ -127,13 +129,18 @@ int XvtRemasterPreview_PrepareCrtResources(const XvtCockpitResources* resources,
+ 		return 0;
+ 	float scale =
+ 		fminf((float)width / resources->view.screen_width, (float)height / resources->view.screen_height);
++	/* A stretched cockpit also needs each display at its widened size. */
++	float stretched = (float)width / resources->view.screen_width;
++	unsigned variants = XvtRemasterConfig_Effective()->cockpit_stretch && stretched > scale ? 2 : 1;
+ 	unsigned count = 0;
+-	for (unsigned index = 0; index < 3; ++index) {
++	for (unsigned slot = 0; slot < 3 * variants; ++slot) {
++		unsigned index = slot % 3;
+ 		const XvtSnapHudElement* element =
+ 			&resources->definition.layout.elements[index * HUD_INSTRUMENTS_PER_SET + 2];
+ 		if (!element->selector || !element->color_index)
+ 			continue;
+-		int w = (int)ceilf(element->selector * scale), h = (int)ceilf(element->color_index * scale);
++		int w = (int)ceilf(element->selector * (slot < 3 ? scale : stretched)),
++			h = (int)ceilf(element->color_index * scale);
+ 		unsigned existing = 0;
+ 		for (; existing < count; ++existing)
+ 			if (g_crtViews[existing].width == w && g_crtViews[existing].height == h)
+@@ -152,7 +159,7 @@ int XvtRemasterPreview_PrepareCrtResources(const XvtCockpitResources* resources,
+ 			return 0;
+ 		++count;
+ 	}
+-	for (unsigned index = count; index < 3; ++index) {
++	for (unsigned index = count; index < CRT_VIEWS; ++index) {
+ 		if (g_crtViews[index].scene)
+ 			XvtRemasterPreview_InvalidateCrt();
+ 		AeronScene_Destroy(g_crtViews[index].scene);
+@@ -187,6 +194,7 @@ int XvtRemasterPreview_CrtNeedsRender(const XvtRenderSnapshot* s, int width, int
+ 	key->craft_slot_end = s->sky.craft_slot_end;
+ 	key->checkpoint = s->sky.checkpoint_slot;
+ 	key->debris = s->sky.debris_enabled;
++	key->stretched = (uint8_t)XvtRenderMath_CockpitStretched(&s->camera);
+ 	key->proving_grounds = s->sky.proving_grounds;
+ 	key->width = width;
+ 	key->height = height;
+@@ -240,13 +248,19 @@ static int RenderOne(AeronCommandBuffer* cmd, const XvtRenderSnapshot* s, const
+ 		return 0;
+ 	float scale = fminf((float)tw / p->camera.screen_width, (float)th / p->camera.screen_height);
+ 	/* A stretched cockpit widens the display; widen its view, not its ship. */
+-	float widen = crt && XvtRenderMath_CockpitStretched(&s->camera)
+-					  ? ((float)tw / p->camera.screen_width) / scale
+-					  : 1.0f;
+-	int width = crt ? (int)ceilf(p->destination.width * scale * widen) : PREVIEW_WIDTH;
++	float stretched = (float)tw / p->camera.screen_width;
++	float widen = crt && XvtRenderMath_CockpitStretched(&s->camera) && stretched > scale ? stretched / scale : 1.0f;
++	int width = crt ? (int)ceilf(p->destination.width * (widen > 1 ? stretched : scale)) : PREVIEW_WIDTH;
+ 	int height = crt ? (int)ceilf(p->destination.height * scale) : PREVIEW_HEIGHT;
+-	if (!Ensure(slot, width, height))
+-		return 0;
++	if (!Ensure(slot, width, height)) {
++		/* Missing widened view (option changed mid-flight): use the normal size. */
++		if (widen == 1.0f)
++			return 0;
++		widen = 1.0f;
++		width = (int)ceilf(p->destination.width * scale);
++		if (!Ensure(slot, width, height))
++			return 0;
++	}
+ 	AeronScene3D* scene = crt ? g_crtScene : g_scene;
+ 	AeronSceneCamera camera = { 0 };
+ 	AeronSceneMeshInstance instance = { .mesh = mesh ? mesh->mesh : NULL,
+@@ -387,7 +401,7 @@ void XvtRemasterPreview_ReleaseFrontend(void) {
+ void XvtRemasterPreview_Shutdown(void) {
+ 	XvtRemasterPreview_ReleaseFrontend();
+ 	XvtRemasterPreview_InvalidateCrt();
+-	for (unsigned index = 0; index < 3; ++index)
++	for (unsigned index = 0; index < CRT_VIEWS; ++index)
+ 		AeronScene_Destroy(g_crtViews[index].scene);
+ 	memset(g_crtViews, 0, sizeof g_crtViews);
+ 	g_crtScene = NULL;

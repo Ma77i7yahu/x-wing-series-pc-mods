@@ -1,0 +1,151 @@
+From 9ec92b4807ed311545f59e6d0882ebf42558fbb2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 12:14:29 +1100
+Subject: [PATCH 11/59] game.restore_pilot: killed or captured on a tour keeps
+ the pre-mission pilot (TIE Fighter style)
+
+---
+ resources/config.yaml                    |  4 ++++
+ src/xw/flight/fediskio.c                 | 18 ++++++++++++++++++
+ src/xw_app/settings/game_page.c          |  2 ++
+ src/xw_runtime/config/flight_tweaks.c    |  5 +++++
+ src/xw_runtime/config/flight_tweaks.h    |  4 ++++
+ src/xw_runtime/config/preference_apply.c |  1 +
+ src/xw_runtime/config/settings.c         |  1 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ 8 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index a00dd2f..aa58039 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -251,6 +251,10 @@ game:
+   ai_ion_link: 2
+   # Craft accelerate and brake with X-Wing vs TIE Fighter's rates. Every craft.
+   xvt_throttle: true
++  # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
++  # mission (points, rank, medals, tour progress) instead of losing the tour, as with
++  # TIE Fighter's pre-mission pilot save. Fly the mission again.
++  restore_pilot: true
+   starfighter_collision_damage: true
+   player_invulnerable: false
+   unlimited_ammunition: false
+diff --git a/src/xw/flight/fediskio.c b/src/xw/flight/fediskio.c
+index f7d3044..8d0a3e7 100644
+--- a/src/xw/flight/fediskio.c
++++ b/src/xw/flight/fediskio.c
+@@ -8,8 +8,11 @@
+ #endif
+ 
+ #ifdef XW_MODERN
++#include "xw/flight/object/collide.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/storage/storage.h"
++#include <aeron/log.h>
+ #endif
+ 
+ #include "xw/assets/bitmap.h"
+@@ -173,6 +176,21 @@ int16_t fediskio_updatepilotrecord(uint16_t objectRef, uint8_t lostStatus, int16
+ 	fediskio_ReadFileBlockBuffered(pilot, sizeof(*pilot), 1, g_stream);
+ #endif
+ 	fediskio_tryclosefile(0);
++#ifdef XW_MODERN
++	/* game.restore_pilot: like TIE Fighter's pre-mission pilot save, a player killed or captured on a Tour of
++	 * Duty mission keeps the pilot file as it was before the mission (the tour is not lost); the mission can
++	 * simply be flown again. The file is only written here at the end of the mission, so leaving it untouched
++	 * restores it. */
++	if (XwFlightTweaks_RestorePilot() && objectRef == g_playerFlightState.objectIndex &&
++		g_missionRuntimeState.provingGroundsActive == 0 &&
++		g_missionRuntimeState.mode == FEDISKIO_MISSION_MODE_TOUR &&
++		(lostStatus == COLLIDE_PILOT_CAPTURED || lostStatus == COLLIDE_PILOT_KILLED)) {
++		Aeron_LogInfo("xw.pilot", "Pilot %s %s; keeping the pre-mission pilot record", pilotFilename,
++					  lostStatus == COLLIDE_PILOT_KILLED ? "killed" : "captured");
++		g_PilotObjectRefs[pilotSlot] = UINT8_MAX;
++		return 1;
++	}
++#endif
+ 	if (g_missionRuntimeState.provingGroundsActive != 0) {
+ 		uint8_t completedLevel = g_missionRuntimeState.provingGroundsLevel - 1;
+ 		unsigned int* trainingHighScore =
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index e07e026..cabc5b6 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -106,6 +106,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing", "XvT" }, 2);
+ 	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
+ 					 (const char* const[]) { "Off", "Friendly Only", "All Craft" }, 3);
++	AeronUi_Selector(ui, "Killed or Captured on Tour", &draft->restore_pilot,
++					 (const char* const[]) { "Tour Lost", "Restore Pilot" }, 2);
+ 	XwInstallationPage_Draw(ui, input);
+ 	AeronUi_EndScroll(ui);
+ }
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 6ef49e1..a50b7f8 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -7,6 +7,11 @@ static bool s_xvt_lasers = true;
+ static int s_ai_ion_link = XW_AI_ION_LINK_ALL;
+ static bool s_xvt_throttle = true;
+ static bool s_xvt_targeting_computer = true;
++static bool s_restore_pilot = true;
++
++bool XwFlightTweaks_RestorePilot(void) { return s_restore_pilot; }
++
++void XwFlightTweaks_SetRestorePilot(bool enabled) { s_restore_pilot = enabled; }
+ 
+ enum { CANNON_PROJECTILE_TYPES = 6 };
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 6d318b6..b92daa8 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -40,6 +40,10 @@ bool XwFlightTweaks_XvtThrottle(void);
+ void XwFlightTweaks_SetXvtThrottle(bool enabled);
+ /* render.xvt_targeting_computer: the CMD shows X-Wing vs TIE Fighter's layout (name, shields, hull and
+  * systems, a live 3D model of the target, orders, range) in 1998 flight, and also with the cockpit off. */
++/* game.restore_pilot: a player killed or captured on a Tour of Duty mission keeps the pre-mission pilot
++ * record, as TIE Fighter's pre-mission pilot save allowed. */
++bool XwFlightTweaks_RestorePilot(void);
++void XwFlightTweaks_SetRestorePilot(bool enabled);
+ bool XwFlightTweaks_XvtTargetingComputer(void);
+ void XwFlightTweaks_SetXvtTargetingComputer(bool enabled);
+ 
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 8d98697..8feab9d 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -36,6 +36,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetAiIonLink(settings->ai_ion_link);
+ 	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
++	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ }
+ 
+ static void ApplyAudioFilter(void) {
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 3ed135a..6498490 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -112,6 +112,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_lasers", xvt_lasers),
+ 	SETTING_INT("game.ai_ion_link", ai_ion_link, 0, 2),
+ 	SETTING_BOOL("game.xvt_throttle", xvt_throttle),
++	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+ 	SETTING_BOOL("render.xvt_targeting_computer", xvt_targeting_computer),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 5c35cfc..574d310 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -38,7 +38,7 @@ typedef struct XwSettings {
+ 	int laser_convergence;
+ 	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+-	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer;
++	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;

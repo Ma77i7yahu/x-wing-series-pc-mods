@@ -1,0 +1,655 @@
+From aa4cee5eb09ece7dfebb4cd12ffe05363423fad6 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 23:31:41 +1100
+Subject: [PATCH 40/59] XvT friendly/enemy craft lists (F, Shift+F); shorter
+ messages
+
+- F and Shift+F open X-Wing vs TIE Fighter's friendly and enemy craft lists
+  (Mfd_DrawCraftListPage), scrolled with Up and Down. The friendly list puts
+  the player's flight group first, then the other friendly groups; the
+  enemy list adds XvT's Orders column from the flight group's goal while it
+  is still to do (Destroy, Inspect, Capture, Board). Rows show the name as
+  XvT's 9 characters, SHD/HULL coloured by health and the craft's target.
+  Drawn in XvT's MICRO64 font in its 225x94 box at (415, 296), filled in the
+  cockpit and see-through with it off. The lists need the targeting
+  computer. Actions info_friendly_craft, info_enemy_craft, info_scroll_up,
+  info_scroll_down (keys 235-238).
+- S-foils move to V, as in XvT and XWA; the film viewer moves to Shift+V.
+- game.short_messages ("Message Time"): messages stay up half as long, never
+  less than 1.5 s.
+---
+ resources/config.yaml                    |  17 ++-
+ src/xw/flight/hud/msg.c                  |   8 ++
+ src/xw/flight/hud/msg.h                  |   4 +-
+ src/xw/flight/object/create.c            |   3 +
+ src/xw/flight/player/user.c              |  46 ++++++++
+ src/xw/flight/player/user.h              |  15 +++
+ src/xw_app/settings/game_page.c          |   2 +
+ src/xw_remaster/hud_readout.c            |  81 ++++++++++++++
+ src/xw_remaster/hud_readout.h            |   2 +
+ src/xw_remaster/hud_renderer.c           |   3 +
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   4 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   1 +
+ src/xw_runtime/input/actions.c           |   5 +
+ src/xw_runtime/input/actions.h           |   4 +
+ src/xw_runtime/snapshot/render_readout.c | 131 +++++++++++++++++++++++
+ src/xw_runtime/snapshot/render_types.h   |  19 ++++
+ 19 files changed, 349 insertions(+), 3 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 4533a0f..49c133c 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -52,8 +52,10 @@ input:
+       - {key: "W"}
+     cycle_weapon_firing_mode:
+       - {key: "X"}
++    # S-foils on V, as in X-Wing vs TIE Fighter and X-Wing Alliance; F and Shift+F
++    # open XvT's friendly and enemy craft lists, scrolled with Up and Down.
+     toggle_s_foils:
+-      - {key: "F"}
++      - {key: "V"}
+     cycle_cannon_recharge_rate:
+       - {key: "F9"}
+     cycle_shield_recharge_rate:
+@@ -180,10 +182,18 @@ input:
+       - {key: "D"}
+     info_briefing:
+       - {key: "B"}
++    info_friendly_craft:
++      - {key: "F"}
++    info_enemy_craft:
++      - {key: "F", modifiers: [shift]}
++    info_scroll_up:
++      - {key: "Up"}
++    info_scroll_down:
++      - {key: "Down"}
+     replay_record:
+       - {key: "C"}
+     replay_view:
+-      - {key: "V"}
++      - {key: "V", modifiers: [shift]}
+     comm_head_home:
+       - {key: "H", modifiers: [shift]}
+     comm_stop_and_wait:
+@@ -274,6 +284,9 @@ game:
+   # Ion cannons only disable: a TIE fighter, interceptor or bomber knocked out by ions
+   # stays disabled like any other craft instead of exploding (X-Wing blows them up).
+   ion_disable_only: true
++  # Flight messages stay up half as long (2 s instead of 4; 6 s instead of 12),
++  # never less than 1.5 s.
++  short_messages: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/hud/msg.c b/src/xw/flight/hud/msg.c
+index a6dd5d9..00de24b 100644
+--- a/src/xw/flight/hud/msg.c
++++ b/src/xw/flight/hud/msg.c
+@@ -535,6 +535,14 @@ void msg_completemessage(int16_t paneType, char lastCharacter) {
+ 		g_flightGlobalCountdownTimers.ticks[XW_TIMER_READY_MESSAGE] =
+ 			g_readyMessageQueueCount != 0 ? XW_MSG_QUEUED_DURATION_TICKS : XW_MSG_DEFAULT_DURATION_TICKS;
+ 	}
++#ifdef XW_MODERN
++	/* game.short_messages: half as long (2 s instead of 4, 6 s instead of 12), at least 1.5 s to read. */
++	if (XwFlightTweaks_ShortMessages()) {
++		int16_t ticks = g_flightGlobalCountdownTimers.ticks[XW_TIMER_READY_MESSAGE] / 2;
++		g_flightGlobalCountdownTimers.ticks[XW_TIMER_READY_MESSAGE] =
++			ticks < XW_MSG_SHORT_MINIMUM_TICKS ? XW_MSG_SHORT_MINIMUM_TICKS : ticks;
++	}
++#endif
+ 	nullsub_SharedNoOp();
+ 	festring_setfontsize(FLIGHT_FONT_MICRO);
+ }
+diff --git a/src/xw/flight/hud/msg.h b/src/xw/flight/hud/msg.h
+index 70a6f67..e69210b 100644
+--- a/src/xw/flight/hud/msg.h
++++ b/src/xw/flight/hud/msg.h
+@@ -21,7 +21,9 @@ enum {
+ 	XW_MSG_LONG_DURATION_TICKS = 2832,
+ 	XW_MSG_MEDIUM_DURATION_TICKS = 1652,
+ 	XW_MSG_QUEUED_DURATION_TICKS = 472,
+-	XW_MSG_DEFAULT_DURATION_TICKS = 944
++	XW_MSG_DEFAULT_DURATION_TICKS = 944,
++	/* Modern addition: game.short_messages never shows a message for less than 1.5 seconds. */
++	XW_MSG_SHORT_MINIMUM_TICKS = 354
+ };
+ 
+ enum {
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index 9d3cc2a..fab296a 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -3891,6 +3891,9 @@ void create_createmission(void) {
+ 	g_playerFlightState.previousTargetObjectIdx = XW_PLAYER_NO_TARGET;
+ 	g_playerFlightState.savedTargetRefs[2] = XW_PLAYER_NO_TARGET;
+ 	g_playerFlightState.savedTargetRefs[3] = XW_PLAYER_NO_TARGET;
++#ifdef XW_MODERN
++	user_closecraftlist();
++#endif
+ 	g_hyperspaceflag = 0;
+ 	g_hyperspaceAbortAndCollisionsAllowed = 1;
+ 	g_flightField62BAD0 = 0;
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index cedce2a..03f74e1 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -65,6 +65,37 @@ static uint16_t s_targetViewFramed;
+ 
+ int user_targetviewactive(void) { return s_targetViewActive; }
+ 
++/* XvT's F / Shift+F craft lists. The key for the open list closes it; the other key switches lists. */
++static int s_craftListMode;
++static unsigned s_craftListTop;
++
++int user_craftlistmode(void) { return s_craftListMode; }
++
++unsigned user_craftlisttop(void) { return s_craftListTop; }
++
++void user_clampcraftlist(unsigned rows, unsigned visible) {
++	unsigned last = rows > visible ? rows - visible : 0;
++	if (s_craftListTop > last)
++		s_craftListTop = last;
++}
++
++void user_closecraftlist(void) {
++	s_craftListMode = USER_CRAFT_LIST_CLOSED;
++	s_craftListTop = 0;
++}
++
++static void user_togglecraftlist(int mode) {
++	/* Both lists need the targeting computer, as in XvT. */
++	if (!(g_playerFlightState.craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_TARGETING)) {
++		g_msgArgTable[0] = XW_MSG_SUBSYSTEM_TARGETING_COMPUTER;
++		g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
++		msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++		return;
++	}
++	s_craftListMode = s_craftListMode == mode ? USER_CRAFT_LIST_CLOSED : mode;
++	s_craftListTop = 0;
++}
++
+ /* The player's target when it can be shown: a live object-table object or mission object. */
+ static uint16_t user_viewabletarget(void) {
+ 	uint16_t target = g_playerFlightState.currentTargetObjectIdx;
+@@ -1359,6 +1390,21 @@ void user_inputforplane(void) {
+ 		case USER_KEY_TARGET_ATTACKER_OF_TARGET:
+ 			user_setnewtarget(user_findattackeroftarget(g_playerFlightState.currentTargetObjectIdx));
+ 			break;
++		case USER_KEY_CRAFT_LIST_FRIENDLY:
++			user_togglecraftlist(USER_CRAFT_LIST_FRIENDLY);
++			break;
++		case USER_KEY_CRAFT_LIST_ENEMY:
++			user_togglecraftlist(USER_CRAFT_LIST_ENEMY);
++			break;
++		case USER_KEY_CRAFT_LIST_SCROLL_UP:
++			if (s_craftListMode && s_craftListTop)
++				--s_craftListTop;
++			break;
++		case USER_KEY_CRAFT_LIST_SCROLL_DOWN:
++			/* The capture clamps it to the rows there are. */
++			if (s_craftListMode)
++				++s_craftListTop;
++			break;
+ #endif
+ 		case 'i':
+ 			g_playerFlightState.hudTargetDetailsEnabled ^= 1;
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index cad5c7e..02caefa 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -48,8 +48,23 @@ enum {
+ 	USER_KEY_TARGET_NEWEST = 232,
+ 	USER_KEY_TARGET_INCOMING_WARHEAD = 233,
+ 	USER_KEY_TARGET_ATTACKER_OF_TARGET = 234,
++	/* Modern additions: X-Wing vs TIE Fighter's F / Shift+F craft lists and their Up / Down scrolling. */
++	USER_KEY_CRAFT_LIST_FRIENDLY = 235,
++	USER_KEY_CRAFT_LIST_ENEMY = 236,
++	USER_KEY_CRAFT_LIST_SCROLL_UP = 237,
++	USER_KEY_CRAFT_LIST_SCROLL_DOWN = 238,
+ };
+ 
++#ifdef XW_MODERN
++/* XvT's craft lists (Mfd_DrawCraftListPage): which is open and its first shown row. */
++enum { USER_CRAFT_LIST_CLOSED = 0, USER_CRAFT_LIST_FRIENDLY = 1, USER_CRAFT_LIST_ENEMY = 2 };
++int user_craftlistmode(void);
++unsigned user_craftlisttop(void);
++/* The list has `rows` rows and shows `visible`: keeps the first shown row in range. */
++void user_clampcraftlist(unsigned rows, unsigned visible);
++void user_closecraftlist(void);
++#endif
++
+ enum {
+ 	USER_KEY_ESCAPE = 27,
+ 	USER_HUD_TARGET_CACHE_RESET = -2,
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index f02a4f1..549da1e 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -110,6 +110,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "Normal", "Overcharged" }, 2);
+ 	AeronUi_Selector(ui, "Engine Wash", &draft->xvt_engine_wash,
+ 					 (const char* const[]) { "Off", "XvT (Capital Ships & Freighters)" }, 2);
++	AeronUi_Selector(ui, "Message Time", &draft->short_messages,
++					 (const char* const[]) { "X-Wing", "Short (Half)" }, 2);
+ 	AeronUi_Selector(ui, "Ion Cannons vs TIEs", &draft->ion_disable_only,
+ 					 (const char* const[]) { "X-Wing (Disabled TIEs Explode)", "Disable Only" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 92831bb..6a304b4 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -467,6 +467,87 @@ static void DrawXvtCmd(const XwHudDraw* d, const Pen* pen, const XwSnapReadout*
+ 	TargetModel(d, pen, view, view->y, view->y + view->height, false);
+ }
+ 
++/* ---- XvT's F / Shift+F craft lists (Mfd_DrawCraftListPage) ----
++ * XvT's craft-list box (forward and cockpit-off element 130) is 225 x 94 at (415, 296) in every 640 cockpit.
++ * A header row (Craft, SHD/HULL, Target, and Orders on the enemy list), then a row per craft in its team's
++ * color with shields and hull colored by health; the box shrinks to its rows. In the cockpit the box is
++ * filled; with the cockpit off only its frame is drawn, as in XvT. */
++enum { LIST_X = 415, LIST_Y = 296, LIST_W = 225, LIST_H = 94, LIST_FILL = 0x141C28 };
++
++static uint32_t HealthColor(int pct) { return pct <= 20 ? XVT_RED : pct <= 50 ? XVT_YELLOW : XVT_GREEN; }
++
++/* Text ending at x. */
++static void RightText(const Pen* p, float right, float y, const char* text, uint32_t rgb) {
++	float w = Measure(p, text);
++	Text(p, right - w, y, text, rgb, w + 1);
++}
++
++bool XwHudCraftList_Draw(const XwHudDraw* d) {
++	const XwRenderSnapshot* s = d->snapshot;
++	const XwSnapCraftList* list = &s->readout.craft_list;
++	const XwSnapCamera* c = &s->camera;
++	if (!list->mode || c->replay_mode || s->cockpit.suppressed ||
++		(c->hud_state != 0 && c->hud_state != XW_SNAP_VIEW_FULL_FORWARD) || !LoadXvtFont())
++		return true;
++	Pen pen = XvtPen(d);
++	if (d->edge_shift > 0)
++		pen.ox += XwHudDraw_PaneShift(d, LIST_X, LIST_X + LIST_W);
++	bool enemy = list->mode == 2;
++	float step = FontHeight(&g_xvtFont) + 2, half = FontHeight(&g_xvtFont) / 2.0f;
++	float left = LIST_X + 2, top = LIST_Y + 2, right = LIST_X + LIST_W - 2;
++	float bottom = top + step * (list->count + 1);
++	if (bottom > LIST_Y + LIST_H - 2 || !list->count)
++		bottom = LIST_Y + LIST_H - 2;
++	/* The box (see-through with the cockpit off), then the active page's 1-pixel frame. */
++	float fx = left - 2, fy = top - 2, fw = right - left + 4, fh = bottom - top + 4;
++	Fill(&pen, fx, fy, fw, fh, LIST_FILL, c->hud_state == 0 ? 1 : 0.55f);
++	Fill(&pen, fx, fy, fw, 1, XVT_GREEN, 1);
++	Fill(&pen, fx, fy + fh - 1, fw, 1, XVT_GREEN, 1);
++	Fill(&pen, fx, fy, 1, fh, XVT_GREEN, 1);
++	Fill(&pen, fx + fw - 1, fy, 1, fh, XVT_GREEN, 1);
++
++	float health_x = left + 11 * half;
++	Text(&pen, left, top, "Craft", XVT_GREEN, health_x - left);
++	Text(&pen, health_x, top, "SHD/HULL", XVT_GREEN, right - health_x);
++	float target_x = health_x + Measure(&pen, "SHD/HULL") + half;
++	float orders_x = target_x + 17 * half;
++	if (enemy) {
++		Text(&pen, target_x, top, "Target", XVT_GREEN, orders_x - target_x);
++		Text(&pen, orders_x, top, "Orders", XVT_GREEN, right - orders_x);
++	} else
++		RightText(&pen, right, top, "Target", XVT_GREEN);
++
++	float digits = Measure(&pen, "000");
++	for (unsigned i = 0; i < list->count; ++i) {
++		const XwSnapCraftListRow* row = &list->rows[i];
++		float y = top + step * (i + 1);
++		if (y + step - 2 > bottom + 0.5f)
++			break;
++		uint32_t team = XvtRelationColor(row->relation);
++		Text(&pen, left, y, row->name, team, health_x - left);
++		char value[8];
++		float x = health_x + half;
++		snprintf(value, sizeof value, "%d", row->shield_pct > 0 ? row->shield_pct : 0);
++		RightText(&pen, x + digits, y, value, HealthColor(row->shield_pct));
++		x += digits;
++		Text(&pen, x, y, "/", team, 8);
++		x += Measure(&pen, "/");
++		if (row->hull_pct > 0) {
++			snprintf(value, sizeof value, "%d", row->hull_pct);
++			RightText(&pen, x + digits, y, value, HealthColor(row->hull_pct));
++		}
++		if (enemy) {
++			Text(&pen, target_x, y, row->target, team, orders_x - target_x - half);
++			Text(&pen, orders_x, y, row->status, team, right - orders_x);
++		} else {
++			float avail = right - (x + digits + half);
++			float w = fminf(Measure(&pen, row->target), avail);
++			Text(&pen, right - w, y, row->target, team, avail);
++		}
++	}
++	return true;
++}
++
+ bool XwHudCmd_Active(const XwRenderSnapshot* s) {
+ 	const XwSnapCamera* c = &s->camera;
+ 	bool active = XwFlightTweaks_XvtTargetingComputer() && s->flight_version == 98 && s->readout.valid &&
+diff --git a/src/xw_remaster/hud_readout.h b/src/xw_remaster/hud_readout.h
+index 884b2e1..a3f2d10 100644
+--- a/src/xw_remaster/hud_readout.h
++++ b/src/xw_remaster/hud_readout.h
+@@ -18,5 +18,7 @@ void XwHudXvtMessage_Draw(const XwHudDraw* draw, int dy);
+  * Active only when XvT's frame art loaded. */
+ bool XwHudThreat_Active(const XwRenderSnapshot* snapshot);
+ bool XwHudThreat_Draw(const XwHudDraw* draw);
++/* XvT's F / Shift+F friendly and enemy craft lists, when one is open. */
++bool XwHudCraftList_Draw(const XwHudDraw* draw);
+ void XwHudThreat_Shutdown(void);
+ #endif
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index bb94d2d..059c7b7 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -21,6 +21,7 @@ typedef struct HudKey {
+ 	int threat_active;  /* view_target: XvT's threat display replaces the HUD. */
+ 	int xvt_cockpit;    /* render.xvt_cockpit: XvT art for this view. */
+ 	uint8_t threats[4]; /* XvT threat lights (with xvt_cockpit). */
++	XwSnapCraftList craft_list; /* XvT's F / Shift+F lists. */
+ 	XwSnapReadout readout;
+ 	const AeronTexture* target_view;
+ } HudKey;
+@@ -224,6 +225,7 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 		XwHudXvtFont_Load();
+ 		memcpy(key.threats, snapshot->readout.threats, sizeof key.threats);
+ 	}
++	memcpy(&key.craft_list, &snapshot->readout.craft_list, sizeof key.craft_list);
+ 	if (key.cmd_active || key.threat_active) {
+ 		key.readout = snapshot->readout;
+ 		key.target_view = XwTargetView_Texture(NULL);
+@@ -275,6 +277,7 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 			XwHudCmd_Draw(&draw);
+ 		else
+ 			XwHudDraw_Cross(&draw);
++		XwHudCraftList_Draw(&draw);
+ 	}
+ 	AeronCommandBuffer* cmd = Aeron_AcquireCommandBuffer();
+ 	if (!cmd)
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index d0eb45f..62e1d29 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -14,6 +14,11 @@ static bool s_xvt_turning = true;
+ static bool s_start_overshield = true;
+ static bool s_xvt_engine_wash = true;
+ static bool s_ion_disable_only = true;
++static bool s_short_messages = true;
++
++bool XwFlightTweaks_ShortMessages(void) { return s_short_messages; }
++
++void XwFlightTweaks_SetShortMessages(bool enabled) { s_short_messages = enabled; }
+ 
+ bool XwFlightTweaks_IonDisableOnly(void) { return s_ion_disable_only; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index d619b63..32ef178 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -73,6 +73,10 @@ void XwFlightTweaks_SetXvtEngineWash(bool enabled);
+  * other craft does, instead of exploding a quarter second later (X-Wing's COLLIDE_DISABLED_TIE_LIFETIME). */
+ bool XwFlightTweaks_IonDisableOnly(void);
+ void XwFlightTweaks_SetIonDisableOnly(bool enabled);
++/* game.short_messages: flight messages stay up half as long (2 s, 3.5 s or 6 s by kind instead of 4, 7 or
++ * 12), and never less than 1.5 s while others wait. */
++bool XwFlightTweaks_ShortMessages(void);
++void XwFlightTweaks_SetShortMessages(bool enabled);
+ 
+ /* Cannon bolt speed, lifetime and launch distance ahead of the gun for projectile property index `index`
+  * (0-5 are laser and ion cannons), with xvt_lasers applied: XvT's own values (speed 2000/1800 lasers,
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index b938321..7fae899 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -40,6 +40,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetStartOvershield(settings->start_overshield != 0);
+ 	XwFlightTweaks_SetXvtEngineWash(settings->xvt_engine_wash != 0);
+ 	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
++	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 2974cfd..dc2a4cb 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -117,6 +117,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.start_overshield", start_overshield),
+ 	SETTING_BOOL("game.xvt_engine_wash", xvt_engine_wash),
+ 	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
++	SETTING_BOOL("game.short_messages", short_messages),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 0c5114b..1c44d1c 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -40,6 +40,7 @@ typedef struct XwSettings {
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
++	int short_messages;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index e2f1f58..c7683a7 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -74,6 +74,11 @@ static const struct {
+ 	{ "info_map", "Map", XW_INPUT_ACTION_CATEGORY_INFORMATION, 109 },
+ 	{ "info_damage", "Damage report", XW_INPUT_ACTION_CATEGORY_INFORMATION, 100 },
+ 	{ "info_briefing", "Mission briefing", XW_INPUT_ACTION_CATEGORY_INFORMATION, 98 },
++	/* Not in X-Wing: XvT's craft lists (USER_KEY_CRAFT_LIST_FRIENDLY and following). */
++	{ "info_friendly_craft", "Friendly craft list", XW_INPUT_ACTION_CATEGORY_INFORMATION, 235 },
++	{ "info_enemy_craft", "Enemy craft list", XW_INPUT_ACTION_CATEGORY_INFORMATION, 236 },
++	{ "info_scroll_up", "Scroll craft list up", XW_INPUT_ACTION_CATEGORY_INFORMATION, 237 },
++	{ "info_scroll_down", "Scroll craft list down", XW_INPUT_ACTION_CATEGORY_INFORMATION, 238 },
+ 	{ "replay_record", "Toggle film recording", XW_INPUT_ACTION_CATEGORY_INFORMATION, 99 },
+ 	{ "replay_view", "View recorded film", XW_INPUT_ACTION_CATEGORY_INFORMATION, 118 },
+ 	{ "comm_head_home", "Order target home", XW_INPUT_ACTION_CATEGORY_COMMUNICATIONS, 72 },
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index 5519ba0..ce2a630 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -69,6 +69,10 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_INFO_MAP,
+ 	XW_INPUT_ACTION_INFO_DAMAGE,
+ 	XW_INPUT_ACTION_INFO_BRIEFING,
++	XW_INPUT_ACTION_INFO_FRIENDLY_CRAFT,
++	XW_INPUT_ACTION_INFO_ENEMY_CRAFT,
++	XW_INPUT_ACTION_INFO_SCROLL_UP,
++	XW_INPUT_ACTION_INFO_SCROLL_DOWN,
+ 	XW_INPUT_ACTION_REPLAY_RECORD,
+ 	XW_INPUT_ACTION_REPLAY_VIEW,
+ 	XW_INPUT_ACTION_COMM_HEAD_HOME,
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index ae339ae..d0ad247 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -314,12 +314,143 @@ static void CaptureThreats(XwSnapReadout* r) {
+ 								   : 0;
+ }
+ 
++/* ---- XvT's F / Shift+F craft lists (Mfd_DrawCraftListPage) ---- */
++
++static bool ListedCraft(uint16_t index) {
++	if (!LiveObject(index) || g_objectTable[index].familyId != XW_OBJECT_FAMILY_CRAFT)
++		return false;
++	const CraftData* craft = g_objectTable[index].instanceData;
++	/* Exploding and breaking-up craft drop out, as from the targeting keys. */
++	return craft && (craft->objectKind == XW_CRAFT_OBJECT_KIND_0 || craft->objectKind == XW_CRAFT_OBJECT_KIND_6);
++}
++
++/* Mfd_BuildScratchCraftListName: the flight group's name and craft number, cut to 9 characters. */
++static void ListName(uint16_t index, char* out, size_t capacity) {
++	const CraftData* craft = g_objectTable[index].instanceData;
++	const XwMissionFlightGroup* group = &g_missionFlightGroups[craft->flightGroupIndex];
++	char name[sizeof group->name + 1] = { 0 };
++	memcpy(name, group->name, sizeof group->name);
++	char text[32];
++	if (group->numberOfCraft > 1)
++		snprintf(text, sizeof text, "%s %d", name, craft->craftIndexInFlightGroup + 1);
++	else
++		snprintf(text, sizeof text, "%s", name);
++	CopyText(out, capacity < 10 ? capacity : 10, text);
++	TitleCase(out);
++}
++
++/* Mfd_GetFlightGroupGoalStatusStringId for X-Wing's single flight-group goal, while it is still to do. */
++static const char* GoalWord(uint16_t index) {
++	const CraftData* craft = g_objectTable[index].instanceData;
++	unsigned fg = craft->flightGroupIndex;
++	if (g_missionRuntimeState.flightGroupGoalState[fg] != XW_MISSION_GOAL_STATE_UNCOMPLETED)
++		return "";
++	const XwMissionFlightGroup* group = &g_missionFlightGroups[fg];
++	switch (group->missionGoal) {
++		case MISSION_GOAL_DESTROY_SPECIAL:
++		case MISSION_GOAL_RECOVER_SPECIAL:
++		case MISSION_GOAL_BOARD_SPECIAL:
++		case MISSION_GOAL_IDENTIFY_SPECIAL:
++			if (craft->craftIndexInFlightGroup != group->specialCraftIndex)
++				return "";
++			break;
++		default:
++			break;
++	}
++	switch (group->missionGoal) {
++		case MISSION_GOAL_IDENTIFY_ALL:
++		case MISSION_GOAL_IDENTIFY_SPECIAL:
++		case MISSION_GOAL_IDENTIFY_HALF:
++			return craft->isInspected ? "" : "Inspect";
++		case MISSION_GOAL_RECOVER_ALL:
++		case MISSION_GOAL_RECOVER_SPECIAL:
++		case MISSION_GOAL_RECOVER_HALF:
++			return "Capture";
++		case MISSION_GOAL_BOARD_ALL:
++		case MISSION_GOAL_BOARD_SPECIAL:
++		case MISSION_GOAL_BOARD_HALF:
++			return "Board";
++		case MISSION_GOAL_DESTROY_ALL:
++		case MISSION_GOAL_DESTROY_SPECIAL:
++		case MISSION_GOAL_DESTROY_HALF:
++			return "Destroy";
++		default:
++			return "";
++	}
++}
++
++static void CaptureCraftList(XwSnapCraftList* list) {
++	int mode = user_craftlistmode();
++	if (mode == USER_CRAFT_LIST_CLOSED)
++		return;
++	/* The lists go with the targeting computer, as in XvT. */
++	if (!(g_playerFlightState.craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_TARGETING)) {
++		user_closecraftlist();
++		return;
++	}
++	uint16_t rows[XW_CRAFT_OBJECT_COUNT];
++	unsigned count = 0;
++	if (mode == USER_CRAFT_LIST_ENEMY) {
++		for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index)
++			if (ListedCraft(index) && Relation(index) == 1)
++				rows[count++] = index;
++	} else {
++		/* The player's own flight group first, then the other friendly ones in mission order. */
++		unsigned own = g_playerFlightState.craft->flightGroupIndex;
++		for (int pass = 0; pass <= (int)g_missionHeader.flightGroupCount; ++pass) {
++			unsigned fg = pass == 0 ? own : (unsigned)pass - 1;
++			if (pass && fg == own)
++				continue;
++			for (uint16_t index = 0; index < XW_CRAFT_OBJECT_COUNT; ++index)
++				if (ListedCraft(index) && Relation(index) != 1 &&
++					((const CraftData*)g_objectTable[index].instanceData)->flightGroupIndex == fg)
++					rows[count++] = index;
++		}
++	}
++	/* XvT groups rows by team, keeping their order within each. */
++	for (unsigned i = 1; i < count; ++i)
++		for (unsigned j = i; j > 0 && Relation(rows[j]) < Relation(rows[j - 1]); --j) {
++			uint16_t t = rows[j];
++			rows[j] = rows[j - 1];
++			rows[j - 1] = t;
++		}
++	user_clampcraftlist(count, XW_SNAP_CRAFT_LIST_ROWS);
++	list->mode = (uint8_t)mode;
++	list->total = (uint16_t)count;
++	list->top = (uint16_t)user_craftlisttop();
++	for (unsigned i = list->top; i < count && list->count < XW_SNAP_CRAFT_LIST_ROWS; ++i) {
++		uint16_t index = rows[i];
++		const CraftData* craft = g_objectTable[index].instanceData;
++		XwSnapCraftListRow* row = &list->rows[list->count++];
++		ListName(index, row->name, sizeof row->name);
++		row->relation = Relation(index);
++		int shield = ShieldPercent(craft), hull = HullPercent(craft);
++		row->shield_pct = (int8_t)(shield > 127 ? 127 : shield);
++		row->hull_pct = (int8_t)(hull > 127 ? 127 : hull);
++		uint16_t target = index == g_playerFlightState.objectIndex ? g_playerFlightState.currentTargetObjectIdx
++																	: craft->aiTargetRef;
++		if (target < XW_OBJECT_COUNT && LiveObject(target)) {
++			if (ListedCraft(target))
++				ListName(target, row->target, sizeof row->target);
++			else
++				ObjectName(target, row->target, sizeof row->target);
++			row->target_relation = Relation(target);
++		} else {
++			strcpy(row->target, "None");
++			row->target_relation = 2;
++		}
++		if (mode == USER_CRAFT_LIST_ENEMY)
++			snprintf(row->status, sizeof row->status, "%s", GoalWord(index));
++	}
++}
++
+ void XwReadout_Capture(XwSnapReadout* r) {
+ 	memset(r, 0, sizeof *r);
+ 	r->boarding_remaining_s = -1;
+ 	if (!g_playerFlightState.craft || !g_playerFlightState.object || g_replayviewmode)
+ 		return;
+ 	CaptureThreats(r);
++	CaptureCraftList(&r->craft_list);
+ 	const XwFlightPanelLayout* layout = XwFlightPanel_Layout();
+ 	r->cmd = (XwSnapRect) { g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].x,
+ 							g_hudElementLayouts[PANEL_RADAR_TARGET_ELEMENT].y, layout->width, layout->footerBottom };
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index bad352c..1c57ac1 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -202,6 +202,24 @@ typedef struct XwSnapTargetBox {
+ 	uint8_t color_index, visible, direct_overlay;
+ } XwSnapTargetBox;
+ 
++/* XvT's F / Shift+F craft lists (Mfd_DrawCraftListPage): the rows from `top` that fit the list box. Strings
++ * are mixed case; percentages are -1 when not applicable. Byte-sized fields only, so there is no padding. */
++enum { XW_SNAP_CRAFT_LIST_ROWS = 8 };
++
++typedef struct XwSnapCraftListRow {
++	char name[12];    /* Flight group name and craft number, as XvT's 9 characters. */
++	char target[20];  /* The craft's target ("None"). */
++	char status[10];  /* Enemy list: the mission goal still to do ("Destroy", "Inspect"...), or "". */
++	int8_t shield_pct, hull_pct;
++	uint8_t relation, target_relation; /* 0 friendly, 1 hostile, 2 other. */
++} XwSnapCraftListRow;
++
++typedef struct XwSnapCraftList {
++	uint8_t mode, count; /* USER_CRAFT_LIST_* (0 closed); rows filled. */
++	uint16_t total, top; /* All rows in the list; the first shown. */
++	XwSnapCraftListRow rows[XW_SNAP_CRAFT_LIST_ROWS];
++} XwSnapCraftList;
++
+ /* render.xvt_targeting_computer: XvT-style targeting computer contents, captured from flight state each world
+  * frame. Strings are mixed-case ASCII, as XvT shows them (X-Wing fonts uppercase them when drawing);
+  * percentages are -1 when not applicable. */
+@@ -231,6 +249,7 @@ typedef struct XwSnapReadout {
+ 	 * player as its target, a starship turret aimed at the player, a beam (always 0: X-Wing has none), and a
+ 	 * warhead lock (0 off, 1 flashing while locking, 2 locked). */
+ 	uint8_t threats[4];
++	XwSnapCraftList craft_list;
+ } XwSnapReadout;
+ 
+ typedef struct XwSnapWidget {

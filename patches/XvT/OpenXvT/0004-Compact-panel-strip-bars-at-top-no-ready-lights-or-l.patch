@@ -1,0 +1,184 @@
+From 5f92c8a8aaecc6aaf31a214b36af51caa23009bd Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:21:46 +1100
+Subject: [PATCH 04/25] Compact panel strip: bars at top, no ready lights or
+ large frames
+
+---
+ src/xvt_remaster/hud_instruments.c | 62 +++++++++++++-----------------
+ src/xvt_remaster/hud_layout.c      |  7 +---
+ src/xvt_remaster/hud_layout.h      |  7 ++--
+ 3 files changed, 30 insertions(+), 46 deletions(-)
+
+diff --git a/src/xvt_remaster/hud_instruments.c b/src/xvt_remaster/hud_instruments.c
+index db6ead4..9d91eac 100644
+--- a/src/xvt_remaster/hud_instruments.c
++++ b/src/xvt_remaster/hud_instruments.c
+@@ -173,7 +173,7 @@ void XvtHudInstruments_DrawWorldMarkers(const XvtHudDraw* draw, const XvtSnapTar
+ }
+ 
+ /* Panel strip metrics in 640-wide source units, scaled for other layouts. */
+-enum { PANEL_TOP = 3, PANEL_MIN_HEIGHT = 13, PANEL_BOX = 44, PANEL_GAP = 4, PANEL_PAD = 3, PANEL_BARS = 160 };
++enum { PANEL_TOP = 2, PANEL_BOX = 30, PANEL_GAP = 6, PANEL_BARS = 160, PANEL_FALLBACK_HEIGHT = 8 };
+ 
+ typedef struct PanelGeometry {
+ 	XvtSnapRect counter, lasers, clock;
+@@ -213,47 +213,36 @@ static PanelGeometry MeasurePanel(const XvtHudDraw* draw) {
+ 			IncludeRect(box, first < last ? first : last, charge->y, (first > last ? first : last) + width,
+ 						charge->y + height);
+ 		}
+-		const XvtHudSpriteBinding* ready = &draw->layout->sprites[XVT_HUD_PANEL_READY + slot];
+-		if (PartBounds(draw, XVT_HUD_PANEL_READY + slot, &width, &height))
+-			IncludeRect(box, ready->x, ready->y, ready->x + width, ready->y + height);
+ 	}
+ 	geometry.sprites = box[2] > box[0];
+ 	int bars_width = geometry.sprites ? box[2] - box[0] : U(PANEL_BARS);
+-	int bars_height = geometry.sprites ? box[3] - box[1] : U(PANEL_MIN_HEIGHT) - 2 * U(PANEL_PAD);
+-	int height = bars_height + 2 * U(PANEL_PAD);
+-	if (height < U(PANEL_MIN_HEIGHT))
+-		height = U(PANEL_MIN_HEIGHT);
+-	int lasers_width = bars_width + 2 * U(PANEL_PAD);
+-	int total = 2 * U(PANEL_BOX) + 2 * U(PANEL_GAP) + lasers_width;
+-	int left = (draw->layout->source_width - total) / 2, top = U(PANEL_TOP);
+-	geometry.counter = (XvtSnapRect) { left, top, U(PANEL_BOX), height };
+-	geometry.lasers = (XvtSnapRect) { left + U(PANEL_BOX) + U(PANEL_GAP), top, lasers_width, height };
+-	geometry.clock = (XvtSnapRect) { geometry.lasers.x + lasers_width + U(PANEL_GAP), top, U(PANEL_BOX), height };
++	int bars_height = geometry.sprites ? box[3] - box[1] : U(PANEL_FALLBACK_HEIGHT);
++	/* Readout boxes fit one line of the readout font. */
++	const XvtCockpitFontBinding* font = &draw->state->definition.fonts[2];
++	int text_height = (font->line_height ? font->line_height : 8) + 4;
++	int top = U(PANEL_TOP), total = 2 * U(PANEL_BOX) + 2 * U(PANEL_GAP) + bars_width;
++	int left = (draw->layout->source_width - total) / 2;
++	int box_y = top + (bars_height > text_height ? (bars_height - text_height) / 2 : 0);
++	geometry.counter = (XvtSnapRect) { left, box_y, U(PANEL_BOX), text_height };
++	geometry.lasers = (XvtSnapRect) { left + U(PANEL_BOX) + U(PANEL_GAP), top, bars_width, bars_height };
++	geometry.clock = (XvtSnapRect) { geometry.lasers.x + bars_width + U(PANEL_GAP), box_y, U(PANEL_BOX), text_height };
+ 	if (geometry.sprites) {
+-		geometry.dx = geometry.lasers.x + U(PANEL_PAD) - box[0];
+-		geometry.dy = top + (height - bars_height) / 2 - box[1];
++		geometry.dx = geometry.lasers.x - box[0];
++		geometry.dy = top - box[1];
+ 	}
+ #undef U
+ 	return geometry;
+ }
+ 
+-/* Match the craft's HUD: the frame of its name pane and its readout text color. */
+-static uint32_t PanelFrameColor(const XvtHudDraw* draw) {
+-	for (unsigned page = 0; page < MFD_PAGE_COUNT; ++page) {
+-		const XvtCockpitPage* candidate = &draw->state->pages[page];
+-		if (candidate->visible && (candidate->border_argb >> 24) &&
+-			(candidate->placement.x + candidate->placement.width / 2) * 3 < draw->layout->source_width)
+-			return candidate->border_argb;
+-	}
+-	return 0xFFB01010;
++static unsigned PanelTextColor(const XvtHudDraw* draw) {
++	return draw->state->readouts.speed.visible ? draw->state->readouts.speed.foreground : 0x4E;
+ }
+ 
+ static int PanelText(const XvtHudDraw* draw, XvtSnapRect box, const char* text) {
+ 	XvtCockpitTextField field = { 0 };
+ 	field.caption.visible = 1;
+ 	field.caption.font_tier = 2;
+-	field.caption.foreground =
+-		draw->state->readouts.speed.visible ? draw->state->readouts.speed.foreground : 0x4E;
++	field.caption.foreground = (uint8_t)PanelTextColor(draw);
+ 	field.caption.background = 0;
+ 	field.caption.alignment = XVT_COCKPIT_ALIGN_CENTER;
+ 	field.caption.phase = XVT_COCKPIT_AFTER_CRT;
+@@ -296,24 +285,25 @@ int XvtHudInstruments_DrawPanel(const XvtHudDraw* parent) {
+ 	flat.spread = 0;
+ 	const XvtHudDraw* draw = &flat;
+ 	PanelGeometry geometry = MeasurePanel(draw);
+-	uint32_t frame = PanelFrameColor(draw), backing = 0xB0000000;
++	/* Readouts sit on a faint backing for legibility; the counter gains an
++	 * outline in the readout color while countermeasures are active. */
++	uint32_t backing = 0x90000000;
+ 	char text[16];
+ 	if (panel->countermeasures_visible) {
+ 		XvtHudDraw_Fill(draw, XVT_COCKPIT_AFTER_CRT, geometry.counter, backing);
+-		XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, geometry.counter, panel->chaff_active ? 0xFFFFFFFF : frame);
++		if (panel->chaff_active)
++			XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, geometry.counter,
++							 draw->state->palette_argb[PanelTextColor(draw) & 255]);
+ 		snprintf(text, sizeof text, "%u", panel->countermeasures);
+ 		if (!PanelText(draw, geometry.counter, text))
+ 			return 0;
+ 	}
+ 	XvtHudDraw_Fill(draw, XVT_COCKPIT_AFTER_CRT, geometry.clock, backing);
+-	XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, geometry.clock, frame);
+ 	snprintf(text, sizeof text, "%u:%02u", panel->clock_minutes, panel->clock_seconds);
+ 	if (!PanelText(draw, geometry.clock, text))
+ 		return 0;
+ 	if (!panel->lasers_visible || !panel->slot_count)
+ 		return 1;
+-	XvtHudDraw_Fill(draw, XVT_COCKPIT_AFTER_CRT, geometry.lasers, backing);
+-	XvtHudDraw_Frame(draw, XVT_COCKPIT_AFTER_CRT, geometry.lasers, frame);
+ 	if (!geometry.sprites) {
+ 		DrawFallbackBars(draw, geometry.lasers);
+ 		return 1;
+@@ -324,16 +314,16 @@ int XvtHudInstruments_DrawPanel(const XvtHudDraw* parent) {
+ 			XvtHudDraw_Part(draw, XVT_HUD_PANEL_CHARGE + slot,
+ 							segment < panel->segments[slot] ? panel->band[slot] : panel->empty_band[slot],
+ 							geometry.dx + segment * charge->step_x, geometry.dy, XVT_COCKPIT_AFTER_CRT);
+-		if (draw->state->weapons.slots[slot].visible)
+-			XvtHudDraw_Part(draw, XVT_HUD_PANEL_READY + slot, draw->state->weapons.slots[slot].ready, geometry.dx,
+-							geometry.dy, XVT_COCKPIT_AFTER_CRT);
+ 	}
+ 	return 1;
+ }
+ 
+ int XvtHudInstruments_PanelBottom(const XvtHudDraw* draw) {
+ 	PanelGeometry geometry = MeasurePanel(draw);
+-	return geometry.lasers.y + geometry.lasers.height + (int)(2 * draw->layout->source_width / 640.0f + .5f);
++	int bottom = geometry.lasers.y + geometry.lasers.height;
++	if (geometry.clock.y + geometry.clock.height > bottom)
++		bottom = geometry.clock.y + geometry.clock.height;
++	return bottom + (int)(3 * draw->layout->source_width / 640.0f + .5f);
+ }
+ 
+ void XvtHudInstruments_DrawCrtMarker(const XvtHudDraw* draw) {
+diff --git a/src/xvt_remaster/hud_layout.c b/src/xvt_remaster/hud_layout.c
+index 48e624e..e36a112 100644
+--- a/src/xvt_remaster/hud_layout.c
++++ b/src/xvt_remaster/hud_layout.c
+@@ -130,7 +130,7 @@ static int CompileSystems(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 		   BindFrames(layout, state, XVT_HUD_CRITICAL_WARNING, 50, 2, -1, 1);
+ }
+ 
+-/* Bind the forward cockpit's laser charge bars and ready lights for the
++/* Bind the forward cockpit's laser charge bars for the
+  * cockpit-off panel strip. Craft whose cockpit lacks them simply omit them. */
+ static void CompilePanel(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 	for (unsigned slot = 0; slot < state->view.laser_slots; ++slot) {
+@@ -148,11 +148,6 @@ static void CompilePanel(XvtHudLayout* layout, const XvtCockpitState* state) {
+ 		binding->step_x = layout->source_width == 320 ? 3 : (layout->source_width == 480 ? 4 : 6);
+ 		if (binding->mirrored)
+ 			binding->step_x = -binding->step_x;
+-		parts = layout->part_count;
+-		if (!BindFrames(layout, state, XVT_HUD_PANEL_READY + slot, 53 + slot, 4, -1, 1)) {
+-			layout->part_count = parts;
+-			memset(&layout->sprites[XVT_HUD_PANEL_READY + slot], 0, sizeof layout->sprites[0]);
+-		}
+ 	}
+ }
+ 
+diff --git a/src/xvt_remaster/hud_layout.h b/src/xvt_remaster/hud_layout.h
+index 7ca9cd1..92911a6 100644
+--- a/src/xvt_remaster/hud_layout.h
++++ b/src/xvt_remaster/hud_layout.h
+@@ -30,11 +30,10 @@ typedef enum XvtHudSpriteRole {
+ 	XVT_HUD_UNAVAILABLE_BEAM,
+ 	XVT_HUD_UNAVAILABLE_BEAM_POWER,
+ 	XVT_HUD_CMD_ARMAMENT,
+-	/* Forward-cockpit laser charge and ready lights reused by the widescreen
+-	 * cockpit-off panel strip. */
++	/* Forward-cockpit laser charge bars reused by the widescreen cockpit-off
++	 * panel strip. */
+ 	XVT_HUD_PANEL_CHARGE = XVT_HUD_CMD_ARMAMENT + 4,
+-	XVT_HUD_PANEL_READY = XVT_HUD_PANEL_CHARGE + XVT_HUD_WEAPON_SLOTS,
+-	XVT_HUD_SPRITE_ROLE_COUNT = XVT_HUD_PANEL_READY + XVT_HUD_WEAPON_SLOTS
++	XVT_HUD_SPRITE_ROLE_COUNT = XVT_HUD_PANEL_CHARGE + XVT_HUD_WEAPON_SLOTS
+ } XvtHudSpriteRole;
+ 
+ typedef enum XvtHudZone { XVT_HUD_ZONE_LEFT, XVT_HUD_ZONE_CENTER, XVT_HUD_ZONE_RIGHT, XVT_HUD_ZONE_COUNT } XvtHudZone;

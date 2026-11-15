@@ -1,0 +1,240 @@
+From 4ac7aa815cca01399c14775e853917a89aa52480 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sun, 11 Oct 2026 06:46:14 +1100
+Subject: [PATCH 45/59] XvT weapon switch tones, match speed click, skip empty
+ warhead launchers
+
+W plays XvT's setting tones (cannon bank 1/2, warheads, damaged system off); Enter's
+match speed plays the small click. game.skip_empty_warheads: W passes over launchers
+with nothing left and firing the last warhead returns to the cannons after half a
+second, as in XvT; selecting a launcher aims single fire at its fuller side.
+---
+ resources/config.yaml                    |  3 ++
+ src/xw/flight/object/laser.c             | 18 +++++++++++
+ src/xw/flight/object/laser.h             |  2 ++
+ src/xw/flight/player/user.c              | 39 ++++++++++++++++++++++--
+ src/xw_app/settings/game_page.c          |  2 ++
+ src/xw_runtime/config/flight_tweaks.c    |  5 +++
+ src/xw_runtime/config/flight_tweaks.h    |  5 +++
+ src/xw_runtime/config/preference_apply.c |  1 +
+ src/xw_runtime/config/settings.c         |  1 +
+ src/xw_runtime/config/settings.h         |  2 +-
+ 10 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 937d543..bd3d67e 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -295,6 +295,9 @@ game:
+   # D shows X-Wing vs TIE Fighter's damage display over the flight view (Up / Down
+   # pick a damaged system, Enter repairs it first) instead of X-Wing's damage screen.
+   xvt_damage_display: true
++  # As in X-Wing vs TIE Fighter: W skips warhead launchers with nothing left, and firing
++  # the last warhead switches back to the lasers.
++  skip_empty_warheads: true
+   # Killed or captured on a Tour of Duty mission: keep the pilot as it was before the
+   # mission (points, rank, medals, tour progress) instead of losing the tour, as with
+   # TIE Fighter's pre-mission pilot save. Fly the mission again.
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index bb863d6..367e77d 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -294,6 +294,12 @@ static int s_playerGroupsLinked;
+ 
+ int laser_canlinkcannongroups(const struct CraftData* craft) { return craft && craft->cannonClassCount >= 2; }
+ 
++int laser_playerlauncherwarheads(uint16_t launcherIndex) {
++	const CraftData* craft = g_playerFlightState.craft;
++	uint16_t first = g_craftTypeDefs[g_playerFlightState.craftTypeIndex].warheadFirstSlot[launcherIndex];
++	return craft->weaponSlots[first].count + craft->weaponSlots[first + 1].count;
++}
++
+ int laser_playergroupslinked(void) {
+ 	return s_playerGroupsLinked && g_playerFlightState.selectedWeaponMode == 0 &&
+ 		   laser_canlinkcannongroups(g_playerFlightState.craft);
+@@ -366,6 +372,18 @@ void laser_fireplayerweapon(void) {
+ 									   g_playerFlightState.selectedWeaponBank);
+ 				g_playerFlightState.craft->warheadFireTimers[g_playerFlightState.selectedWeaponBank] +=
+ 					g_elapsedTicks;
++#ifdef XW_MODERN
++				/* XvT (laser.c, after laser_firerocketsystem): the last warhead gone, back to the cannons, held
++				 * off for half a second so the trigger still down does not fire them at once. */
++				if (XwFlightTweaks_SkipEmptyWarheads() && g_playerFlightState.craft->cannonClassCount != 0 &&
++					laser_playerlauncherwarheads(g_playerFlightState.selectedWeaponBank) <= 0) {
++					g_playerFlightState.selectedWeaponMode = 0;
++					g_playerFlightState.selectedWeaponBank = 0;
++					for (uint16_t group = 0; group < g_playerFlightState.craft->cannonClassCount; ++group)
++						g_playerFlightState.craft->laserState.fireCooldownTicks[group] =
++							XW_SIMULATION_TICKS_PER_SECOND / 2;
++				}
++#endif
+ 			} else {
+ 				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+ #ifdef XW_MODERN
+diff --git a/src/xw/flight/object/laser.h b/src/xw/flight/object/laser.h
+index 6b32c07..f13e6b2 100644
+--- a/src/xw/flight/object/laser.h
++++ b/src/xw/flight/object/laser.h
+@@ -139,6 +139,8 @@ struct CraftData;
+ int laser_canlinkcannongroups(const struct CraftData* craft);
+ int laser_playergroupslinked(void);
+ void laser_setplayergroupslinked(int linked);
++/* Warheads left in the player's launcher (both of its slots). */
++int laser_playerlauncherwarheads(uint16_t launcherIndex);
+ #endif
+ 
+ #ifdef __cplusplus
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index c46a6c9..e4786a1 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -1120,15 +1120,47 @@ void user_inputforplane(void) {
+ 				bank = 0;
+ 				g_playerFlightState.selectedWeaponBank = 0;
+ 			}
++#ifdef XW_MODERN
++			/* XvT: launchers with nothing left are passed over; with every launcher empty, back to the cannons. */
++			if (mode != 0 && XwFlightTweaks_SkipEmptyWarheads()) {
++				while (bank < g_playerFlightState.craft->warheadLauncherCount && laser_playerlauncherwarheads(bank) <= 0)
++					++bank;
++				if (bank >= g_playerFlightState.craft->warheadLauncherCount) {
++					if (g_playerFlightState.craft->cannonClassCount != 0)
++						mode = 0;
++					bank = 0;
++				}
++				g_playerFlightState.selectedWeaponMode = mode;
++				g_playerFlightState.selectedWeaponBank = bank;
++				/* XvT also aims single fire at the fuller side, so an uneven launcher never fires an empty one. */
++				if (mode != 0) {
++					uint16_t first = g_craftTypeDefs[g_playerFlightState.craftTypeIndex].warheadFirstSlot[bank];
++					uint8_t* flags = &g_playerFlightState.craft->warheadLauncherFlags[bank];
++					int16_t left = g_playerFlightState.craft->weaponSlots[first].count;
++					int16_t right = g_playerFlightState.craft->weaponSlots[first + 1].count;
++					if ((*flags & XW_LAUNCHER_FIRE_MODE_MASK) != XW_LAUNCHER_FIRE_LINKED && left != right) {
++						if (right > left)
++							*flags |= LASER_LAUNCHER_SIDE_MASK;
++						else
++							*flags &= (uint8_t)~LASER_LAUNCHER_SIDE_MASK;
++					}
++				}
++			}
++#endif
+ 			g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+ 			if (mode == 0) {
+-				if ((g_playerFlightState.craft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0)
++				if ((g_playerFlightState.craft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0) {
+ 					msg_messageprintf((XwFlightMessageId)(bank + XW_MSG_LASER_CANNONS_ARMED));
+-				else {
++					/* XvT: a lower tone for the first cannon bank than the second. */
++					USER_CONTROL_SOUND(bank != 0 ? XW_CONTROL_SOUND_SETTING_LOW : XW_CONTROL_SOUND_SETTING_VERY_LOW,
++									   FSFX_CONTROL_ACKNOWLEDGE_SLOT);
++				} else {
+ 					g_msgArgTable[0] = bank + XW_MSG_SUBSYSTEM_LASER;
+ 					msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++					USER_CONTROL_SOUND(XW_CONTROL_SOUND_SETTING_OFF, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 				}
+ 			} else if ((g_playerFlightState.craft->workingSubsystems & XW_CRAFT_SUBSYSTEM_LAUNCHER) != 0) {
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_SETTING_MEDIUM, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ #ifdef XW_MODERN
+ 				/* Message IDs use the Windows projectile numbering. */
+ 				g_msgArgTable[0] =
+@@ -1154,8 +1186,8 @@ void user_inputforplane(void) {
+ 					XW_MSG_SUBSYSTEM_TORPEDO_LAUNCHER;
+ #endif
+ 				msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++				USER_CONTROL_SOUND(XW_CONTROL_SOUND_SETTING_OFF, FSFX_CONTROL_ACKNOWLEDGE_SLOT);
+ 			}
+-			fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
+ 			break;
+ 		}
+ 		case 'f':
+@@ -1945,6 +1977,7 @@ void user_inputforplane(void) {
+ 					for (engine = 0; engine < g_playerFlightState.engineCount; ++engine)
+ 						g_playerFlightState.craft->engineThrottle[engine] = 0;
+ 				}
++				USER_XVT_ONLY_SOUND(XW_CONTROL_SOUND_CLICK);
+ 			}
+ 			break;
+ 		default:
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index 5b9c8e6..df4775f 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -114,6 +114,8 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing", "Short (Half)" }, 2);
+ 	AeronUi_Selector(ui, "Damage Report (D)", &draft->xvt_damage_display,
+ 					 (const char* const[]) { "X-Wing Screen", "XvT Pop-up" }, 2);
++	AeronUi_Selector(ui, "Empty Warhead Launchers", &draft->skip_empty_warheads,
++					 (const char* const[]) { "X-Wing (Stay Selected)", "XvT (Back to Lasers)" }, 2);
+ 	AeronUi_Selector(ui, "Ion Cannons vs TIEs", &draft->ion_disable_only,
+ 					 (const char* const[]) { "X-Wing (Disabled TIEs Explode)", "Disable Only" }, 2);
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 756e61c..57ef4d3 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -16,6 +16,11 @@ static bool s_xvt_engine_wash = true;
+ static bool s_ion_disable_only = true;
+ static bool s_short_messages = true;
+ static bool s_xvt_damage_display = true;
++static bool s_skip_empty_warheads = true;
++
++bool XwFlightTweaks_SkipEmptyWarheads(void) { return s_skip_empty_warheads; }
++
++void XwFlightTweaks_SetSkipEmptyWarheads(bool enabled) { s_skip_empty_warheads = enabled; }
+ 
+ bool XwFlightTweaks_XvtDamageDisplay(void) { return s_xvt_damage_display; }
+ 
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index af4c9d4..ee07cdb 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -81,6 +81,11 @@ void XwFlightTweaks_SetShortMessages(bool enabled);
+  * leaving flight for X-Wing's damage screen. Up / Down pick a damaged system, Enter repairs it first. */
+ bool XwFlightTweaks_XvtDamageDisplay(void);
+ void XwFlightTweaks_SetXvtDamageDisplay(bool enabled);
++/* game.skip_empty_warheads: as in X-Wing vs TIE Fighter, W skips a launcher with no warheads left, and
++ * firing the last warhead switches back to the lasers (after half a second, so a held trigger does not fire
++ * them at once). */
++bool XwFlightTweaks_SkipEmptyWarheads(void);
++void XwFlightTweaks_SetSkipEmptyWarheads(bool enabled);
+ 
+ /* Cannon bolt speed, lifetime and launch distance ahead of the gun for projectile property index `index`
+  * (0-5 are laser and ion cannons), with xvt_lasers applied: XvT's own values (speed 2000/1800 lasers,
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 50cc542..c2d4a55 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -42,6 +42,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
+ 	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
+ 	XwFlightTweaks_SetXvtDamageDisplay(settings->xvt_damage_display != 0);
++	XwFlightTweaks_SetSkipEmptyWarheads(settings->skip_empty_warheads != 0);
+ 	XwFlightTweaks_SetXvtTargetingComputer(settings->xvt_targeting_computer != 0);
+ 	XwFlightTweaks_SetRestorePilot(settings->restore_pilot != 0);
+ 	XwFlightTweaks_SetXvtCockpit(settings->xvt_cockpit != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 5115933..29097b6 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -119,6 +119,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
+ 	SETTING_BOOL("game.short_messages", short_messages),
+ 	SETTING_BOOL("game.xvt_damage_display", xvt_damage_display),
++	SETTING_BOOL("game.skip_empty_warheads", skip_empty_warheads),
+ 	SETTING_BOOL("game.restore_pilot", restore_pilot),
+ 	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
+ 	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index d00527c..dd8b5a8 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -40,7 +40,7 @@ typedef struct XwSettings {
+ 	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+-	int short_messages, xvt_damage_display, xvt_control_sounds;
++	int short_messages, xvt_damage_display, xvt_control_sounds, skip_empty_warheads;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;

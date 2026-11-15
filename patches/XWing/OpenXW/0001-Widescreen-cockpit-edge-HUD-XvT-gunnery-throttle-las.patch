@@ -1,0 +1,1116 @@
+From 2c92fdd227df66bff2422eae56c7b53265bc0577 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 09:08:19 +1100
+Subject: [PATCH 01/59] Widescreen cockpit, edge HUD, XvT gunnery/throttle,
+ lasers+ions link, wreck flip fix
+
+- collide.c: halve the detached-component yaw offset as a signed value. The
+  unsigned shift turned a negative offset into a ~170 degree flip, sending
+  wrecks back into the pursuing player.
+- render.cockpit_stretch: the 4:3 cockpit art spans the window and the world
+  shows on both sides.
+- render.hud_widescreen: in cockpit-off views, side HUD panes move to the
+  screen edges (per pane; the message strip stays centered).
+- game.laser_convergence_metres: convergence at the target's range within
+  30 degrees and 0.02-2.5 km, otherwise at this distance.
+- game.xvt_lasers: XvT cannon refire (47 ticks) and bolts at 2x speed for
+  half the lifetime; HUD in-range prediction follows.
+- game.xvt_throttle: XvT accel/decel rates and big-gap braking.
+- game.ai_ion_link and the player X-key "lasers and ion cannons fire
+  linked" step for craft with two cannon groups.
+- Settings page entries for all of the above.
+---
+ CMakeLists.txt                           |  1 +
+ resources/config.yaml                    | 16 ++++
+ src/xw/flight/ai/paifight.c              | 17 ++++-
+ src/xw/flight/hud/msg.c                  | 15 ++++
+ src/xw/flight/hud/msg.h                  |  4 +
+ src/xw/flight/hud/panel.c                | 10 ++-
+ src/xw/flight/object/collide.c           | 13 +++-
+ src/xw/flight/object/create.c            |  4 +
+ src/xw/flight/object/dynamix.c           | 63 ++++++++++++++++
+ src/xw/flight/object/laser.c             | 93 ++++++++++++++++++------
+ src/xw/flight/object/laser.h             | 13 +++-
+ src/xw/flight/player/user.c              | 30 ++++++++
+ src/xw_app/settings/game_page.c          | 16 ++++
+ src/xw_app/settings/video_page.c         |  2 +
+ src/xw_remaster/flight.c                 |  6 +-
+ src/xw_remaster/hud_draw.c               | 37 ++++++++--
+ src/xw_remaster/hud_draw.h               |  8 ++
+ src/xw_remaster/hud_renderer.c           | 56 +++++++++++++-
+ src/xw_remaster/render_math.c            |  9 +++
+ src/xw_remaster/render_math.h            |  3 +
+ src/xw_runtime/config/flight_tweaks.c    | 44 +++++++++++
+ src/xw_runtime/config/flight_tweaks.h    | 50 +++++++++++++
+ src/xw_runtime/config/preference_apply.c | 13 ++++
+ src/xw_runtime/config/settings.c         |  6 ++
+ src/xw_runtime/config/settings.h         |  3 +
+ src/xw_runtime/runtime/flight_math.c     | 29 ++++++--
+ 26 files changed, 515 insertions(+), 46 deletions(-)
+ create mode 100644 src/xw_runtime/config/flight_tweaks.c
+ create mode 100644 src/xw_runtime/config/flight_tweaks.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 70f8c90..f2f1885 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -346,6 +346,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/integration/landru_adapter.c
+     src/xw_runtime/storage/directory.c
+     src/xw_runtime/config/config.c
++    src/xw_runtime/config/flight_tweaks.c
+     src/xw_runtime/config/preference_apply.c
+     src/xw_runtime/config/video_config.c
+     src/xw_runtime/config/settings.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 5968d0e..a7c5543 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -234,6 +234,18 @@ game:
+   # Player laser and ion cannons converge at the selected target's range.
+   # Applies when next opening mission selection.
+   laser_convergence: false
++  # With convergence on: converge at the target's range while it is within about
++  # 30 degrees and 0.02-2.5 km ahead, otherwise at this many metres. No target
++  # selected fires parallel.
++  laser_convergence_metres: 550
++  # Laser and ion cannons cycle and fly as in X-Wing vs TIE Fighter: faster
++  # refire, bolts twice as fast for half as long (same range). Every craft.
++  xvt_lasers: true
++  # AI craft with lasers and ion cannons fire both together (XWA style).
++  # 0 = off, 1 = friendly craft only, 2 = all craft. Disable orders keep ions only.
++  ai_ion_link: 2
++  # Craft accelerate and brake with X-Wing vs TIE Fighter's rates. Every craft.
++  xvt_throttle: true
+   starfighter_collision_damage: true
+   player_invulnerable: false
+   unlimited_ammunition: false
+@@ -278,6 +290,10 @@ render:
+   dos:
+     msaa_samples: 2
+   cockpit_undither: true
++  # Stretch the 4:3 cockpit art across a widescreen window.
++  cockpit_stretch: true
++  # With the cockpit hidden, move the side instruments out to the screen edges.
++  hud_widescreen: true
+   msaa_samples: 2
+   temporal_upscaling:
+     mode: "off"
+diff --git a/src/xw/flight/ai/paifight.c b/src/xw/flight/ai/paifight.c
+index 31a035c..53c684b 100644
+--- a/src/xw/flight/ai/paifight.c
++++ b/src/xw/flight/ai/paifight.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/ai/paifight.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #endif
+ 
+@@ -389,6 +390,18 @@ int16_t paifight_escorttargetorder(void) {
+ 	return 0;
+ }
+ 
++#ifdef XW_MODERN
++/* The active AI craft fires its ion cannons with its lasers (game.ai_ion_link). */
++static int paifight_ionlinkwithlasers(void) {
++	int mode = XwFlightTweaks_AiIonLink();
++	if (mode == XW_AI_ION_LINK_OFF)
++		return 0;
++	if (mode == XW_AI_ION_LINK_FRIENDLY)
++		return g_playerFlightState.object && g_objectTable[g_paiObjectIndex].iff == g_playerFlightState.object->iff;
++	return 1;
++}
++#endif
++
+ // FUNCTION: XW 0x415570
+ int16_t paifight_fightershootorder(void) {
+ 	CraftData* currentCraft = g_curCraft;
+@@ -438,9 +451,11 @@ int16_t paifight_fightershootorder(void) {
+ 		cannonCount = currentCraft->cannonClassCount;
+ 		for (cannonGroup = 0; cannonGroup < cannonCount; ++cannonGroup) {
+ #ifdef XW_MODERN
++			/* game.ai_ion_link: outside disable orders, ion cannons also fire with the lasers (XWA style). */
+ 			if (linkMode != 0 && ((currentCraft->laserState.projectileTypeId[cannonGroup] ==
+ 									   XwFlightTypes_ObjectType(XW_OBJ_ION_147) &&
+-								   order >= PAI_PLAN_DISABLE_FIRST && order <= PAI_PLAN_DISABLE_LAST) ||
++								   ((order >= PAI_PLAN_DISABLE_FIRST && order <= PAI_PLAN_DISABLE_LAST) ||
++									paifight_ionlinkwithlasers())) ||
+ 								  (currentCraft->laserState.projectileTypeId[cannonGroup] !=
+ 									   XwFlightTypes_ObjectType(XW_OBJ_ION_147) &&
+ 								   (order < PAI_PLAN_DISABLE_FIRST || order > PAI_PLAN_DISABLE_LAST))))
+diff --git a/src/xw/flight/hud/msg.c b/src/xw/flight/hud/msg.c
+index b0dc8e6..1de276c 100644
+--- a/src/xw/flight/hud/msg.c
++++ b/src/xw/flight/hud/msg.c
+@@ -249,6 +249,17 @@ void msg_messageinit(void) {
+ #endif
+ }
+ 
++#ifdef XW_MODERN
++/* Replacement template for the next msg_messageprintf call; it keeps messageId's identity. */
++static const char* s_messageTemplateOverride;
++
++void msg_messagetext(XwFlightMessageId messageId, const char* messageTemplate) {
++	s_messageTemplateOverride = messageTemplate;
++	msg_messageprintf(messageId);
++	s_messageTemplateOverride = NULL;
++}
++#endif
++
+ // FUNCTION: XW 0x411DB0
+ void msg_messageprintf(XwFlightMessageId messageId) {
+ 	const char* messageTemplate;
+@@ -264,6 +275,10 @@ void msg_messageprintf(XwFlightMessageId messageId) {
+ 	message.stateOrMessageId = messageId;
+ 	message.clockHours = g_missionElapsedClock.hours;
+ 	messageTemplate = g_flightMessageTemplates[messageId];
++#ifdef XW_MODERN
++	if (s_messageTemplateOverride)
++		messageTemplate = s_messageTemplateOverride;
++#endif
+ 	message.clockSubsecondTicks = g_missionElapsedClock.subsecondTicks;
+ 	message.clockSeconds = g_missionElapsedClock.seconds;
+ 	message.clockMinutes = g_missionElapsedClock.minutes;
+diff --git a/src/xw/flight/hud/msg.h b/src/xw/flight/hud/msg.h
+index 0c764e8..70a6f67 100644
+--- a/src/xw/flight/hud/msg.h
++++ b/src/xw/flight/hud/msg.h
+@@ -257,6 +257,10 @@ void msg_messageinit(void);
+ 
+ /* 0x411DB0 */
+ void msg_messageprintf(XwFlightMessageId messageId);
++#ifdef XW_MODERN
++/* msg_messageprintf with a replacement template (same pane-type prefix and color codes). */
++void msg_messagetext(XwFlightMessageId messageId, const char* messageTemplate);
++#endif
+ 
+ /* 0x412090 */
+ /* Requires a pending count from 0 through XW_MSG_MAX_PENDING_MESSAGES. */
+diff --git a/src/xw/flight/hud/panel.c b/src/xw/flight/hud/panel.c
+index 3695e77..7abe5fb 100644
+--- a/src/xw/flight/hud/panel.c
++++ b/src/xw/flight/hud/panel.c
+@@ -1269,8 +1269,16 @@ void panel_updatelasers(void) {
+ 		}
+ 		if (laserCharge > 0 && (playerCraft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0) {
+ 			if (g_playerFlightState.selectedWeaponMode == PANEL_LASER_WEAPON_MODE &&
+-				g_playerFlightState.selectedWeaponBank == laserGroup) {
++				(g_playerFlightState.selectedWeaponBank == laserGroup
++#ifdef XW_MODERN
++				 || laser_playergroupslinked()
++#endif
++					 )) {
++#ifdef XW_MODERN
++				switch (laser_playergroupslinked() ? LASER_LINK_ALL : playerCraft->laserState.linkMode[laserGroup]) {
++#else
+ 				switch (playerCraft->laserState.linkMode[laserGroup]) {
++#endif
+ 					case LASER_LINK_SINGLE:
+ 						state = playerCraft->laserState.nextSlot[laserGroup] == laserSlot
+ 									? PANEL_LASER_READY
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index d0917c2..2fcb626 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -13,6 +13,7 @@
+ #endif
+ #ifdef XW_MODERN
+ #include "xw_dos94/flight/object/effects.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_math.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/storage/dos94_assets.h"
+@@ -1064,8 +1065,16 @@ int16_t collide_targetinrange(uint16_t sourceObjectIndex, uint16_t targetObjectR
+ #else
+ 	int projectileIndex = projectileType - LASER_PROJECTILE_FIRST_TYPE;
+ #endif
++#ifdef XW_MODERN
++	/* Predict with the bolt actually fired (game.xvt_lasers doubles speed and halves lifetime). */
++	int16_t projectileSpeed =
++		XwFlightTweaks_ProjectileSpeed(projectileIndex, g_projectileSpeedByType[projectileIndex]);
++	int16_t predictionSteps = XwFlightTweaks_ProjectileLifetimeTicks(
++		projectileIndex, (int16_t)(g_simStepScale * g_projectileLifetimeSecondsByType[projectileIndex]));
++#else
+ 	int16_t projectileSpeed = g_projectileSpeedByType[projectileIndex];
+ 	int16_t predictionSteps = (int16_t)(g_simStepScale * g_projectileLifetimeSecondsByType[projectileIndex]);
++#endif
+ 	ObjectRecord* sourceObject;
+ 	uint16_t craftTypeIndex;
+ 	int16_t projectileStepDistance;
+@@ -1783,7 +1792,9 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		g_objectTable[victimObjIdx].rollImpulseRate = rollRate;
+ 	}
+ 	if ((uint16_t)componentYawOffset != 0) {
+-		g_objectTable[victimObjIdx].yaw -= (uint16_t)componentYawOffset >> 1;
++		/* Halve the signed offset. The original unsigned shift turned a negative (reverse tumble) offset into a
++		 * ~170 degree flip, sending the wreck back into the pursuing player. */
++		g_objectTable[victimObjIdx].yaw -= componentYawOffset / 2;
+ 		g_objectTable[victimObjIdx].orientMatrixDirty = 1;
+ 		g_objectTable[victimObjIdx].moveVectorDirty = 1;
+ 	}
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index 9560842..d333c7c 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -4574,6 +4574,10 @@ uint16_t create_createcraft(void) {
+ 	}
+ 	cannonSlotCount = 0;
+ 	g_curCraft->cannonClassCount = 0;
++#ifdef XW_MODERN
++	if (objectIndex == g_playerFlightState.objectIndex)
++		laser_setplayergroupslinked(0);
++#endif
+ 	for (groupIndex = 0;
+ 		 groupIndex < sizeof(definition->laserGroupWeaponType) / sizeof(definition->laserGroupWeaponType[0]);
+ 		 ++groupIndex) {
+diff --git a/src/xw/flight/object/dynamix.c b/src/xw/flight/object/dynamix.c
+index da02c45..6c66f6a 100644
+--- a/src/xw/flight/object/dynamix.c
++++ b/src/xw/flight/object/dynamix.c
+@@ -1,6 +1,8 @@
+ #include "xw/flight/object/dynamix.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/config/flight_tweaks.h"
++#include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/timing/flight_integration.h"
+ #include "xw_runtime/timing/flight_timing.h"
+ #endif
+@@ -14,6 +16,7 @@
+ #include "xw/math/math2.h"
+ #include "xw/math/trig2.h"
+ 
++#include <stdbool.h>
+ #include <stdlib.h>
+ 
+ // GLOBAL: XW 0x4C5368
+@@ -23,6 +26,60 @@ const uint16_t g_engineAverageFactorQ16ByCount[DYNAMIX_ENGINE_WEIGHT_COUNT] = {
+ // GLOBAL: XW 0x63BBC6
+ uint16_t g_dynamicsCraftTypeIndex = 0;
+ 
++#ifdef XW_MODERN
++/* game.xvt_throttle: X-Wing vs TIE Fighter's ModelDef accelRate/decelRate (XVT 0x51C560), indexed by species
++ * - 1. The 1998 object types use XvT's species numbering; zero means no XvT rate (keep X-Wing's). */
++enum { DYNAMIX_XVT_SPECIES = 69 };
++static const uint8_t g_xvtAccelRate[DYNAMIX_XVT_SPECIES] = {
++	36, 24, 48, 36, 45, 48, 30, 35, 48, 10, 10, 48, 48, 36, 36, 45, 25, 20, 30, 30, 15, 15, 15,
++	25, 20, 0,  0,  0,  0,  15, 10, 10, 10, 10, 12, 10, 15, 15, 10, 10, 10, 10, 10, 10, 10, 10,
++	10, 10, 10, 10, 8,  8,  10, 10, 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
++};
++static const uint8_t g_xvtDecelRate[DYNAMIX_XVT_SPECIES] = {
++	60, 45, 90, 52, 52, 60, 45, 50, 75, 20, 20, 60, 45, 52, 60, 75, 30, 25, 20, 20, 25, 25, 25,
++	30, 25, 0,  0,  0,  0,  25, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20,
++	20, 20, 20, 20, 20, 20, 20, 20, 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
++};
++
++/* XvT's cruise speed controller (XVT 0x4AD880 and its ACTIVE-craft caller), as in the OpenTIE build. Gaps of
++ * 200+ brake at a third of the gap per second; smaller ones ease in at the species decel rate, which grows as
++ * the throttle closes. Returns false when the craft has no XvT rates. */
++static bool dynamix_xvtadjustvelocity(uint16_t objectIndex, uint16_t targetSpeed, uint16_t throttleFraction) {
++	int species = XwFlightTypes_CanonicalType(g_objectTable[objectIndex].objectType) - 1;
++	if (species < 0 || species >= DYNAMIX_XVT_SPECIES || !g_xvtAccelRate[species] || !g_xvtDecelRate[species])
++		return false;
++	uint16_t current = g_objectTable[objectIndex].speed;
++	uint16_t rate, step, gap;
++	if (targetSpeed == current)
++		return true;
++	if (targetSpeed < current) {
++		gap = current - targetSpeed;
++		if (gap >= 200) {
++			dynamix_subvelocity(objectIndex, gap / 3);
++			return true;
++		}
++		rate = g_xvtDecelRate[species];
++		step = math2_fraction(rate, DYNAMIX_BASE_ACCELERATION_Q16);
++		if (step == 0)
++			step = 1;
++		if (rate > step)
++			step += math2_fraction((uint16_t)(rate - step), (uint16_t)(0xFFFFu - throttleFraction));
++		dynamix_subvelocity(objectIndex, gap < step ? gap : step);
++		return true;
++	}
++	gap = targetSpeed - current;
++	rate = g_xvtAccelRate[species];
++	step = math2_fraction(rate, DYNAMIX_BASE_ACCELERATION_Q16);
++	if (step == 0)
++		step = 1;
++	if (rate > step)
++		step += math2_fraction((uint16_t)(rate - step), throttleFraction);
++	step *= 3;
++	dynamix_addvelocity(objectIndex, gap < step ? gap : step);
++	return true;
++}
++#endif
++
+ // FUNCTION: XW 0x408FF0
+ void dynamix_planedynamics(void) {
+ 	unsigned int objectIndex;
+@@ -250,6 +307,12 @@ void dynamix_planedynamics(void) {
+ 					speedStep = math2_fraction(baseSpeed, DYNAMIX_POWER_SPEED_Q16);
+ 				baseSpeed += powerAdjustment * speedStep;
+ 				targetSpeed = math2_fraction(baseSpeed, combinedThrottle);
++#ifdef XW_MODERN
++				if (XwFlightTweaks_XvtThrottle() &&
++					!(g_deathStarSurfaceModeActive != 0 && g_objectTable[g_playerFlightState.objectIndex].worldZ < 0) &&
++					dynamix_xvtadjustvelocity((uint16_t)objectIndex, targetSpeed, combinedThrottle)) {
++				} else
++#endif
+ 				if (targetSpeed < object->speed) {
+ 					if (g_deathStarSurfaceModeActive != 0 &&
+ 						g_objectTable[g_playerFlightState.objectIndex].worldZ < 0)
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index f710e77..cee9b39 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/laser.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_math.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/timing/flight_timing.h"
+@@ -287,35 +288,65 @@ void laser_chargeshields(uint16_t shieldIndex, int16_t delta) {
+ 	}
+ }
+ 
++#ifdef XW_MODERN
++static int s_playerGroupsLinked;
++
++int laser_canlinkcannongroups(const CraftData* craft) { return craft && craft->cannonClassCount >= 2; }
++
++int laser_playergroupslinked(void) {
++	return s_playerGroupsLinked && g_playerFlightState.selectedWeaponMode == 0 &&
++		   laser_canlinkcannongroups(g_playerFlightState.craft);
++}
++
++void laser_setplayergroupslinked(int linked) { s_playerGroupsLinked = linked != 0; }
++#endif
++
++/* Fires one player cannon group if its cooldown allows; forceLinked fires every cannon in it. */
++static void laser_fireplayergroup(uint16_t group, int forceLinked) {
++	int16_t* cooldown = &g_playerFlightState.craft->laserState.fireCooldownTicks[group];
++	int16_t adjustedCooldown = *cooldown;
++	if (adjustedCooldown != 0) {
++		adjustedCooldown -= g_elapsedTicks;
++		if (adjustedCooldown < 0)
++			adjustedCooldown = 0;
++	}
++	if (adjustedCooldown < (int16_t)g_elapsedTicks) {
++		if (adjustedCooldown != 0)
++			*cooldown -= g_elapsedTicks;
++		else
++			*cooldown = 0;
++		if ((g_playerFlightState.craft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0) {
++			uint8_t savedLinkMode = g_playerFlightState.craft->laserState.linkMode[group];
++			if (forceLinked)
++				g_playerFlightState.craft->laserState.linkMode[group] = LASER_LINK_ALL;
++			laser_firelasersystem(g_playerFlightState.objectIndex, group);
++			g_playerFlightState.craft->laserState.linkMode[group] = savedLinkMode;
++			g_playerFlightState.craft->laserState.fireCooldownTicks[group] += g_elapsedTicks;
++		} else {
++			g_msgArgTable[0] = group + XW_MSG_SUBSYSTEM_LASER;
++			g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
++			msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
++		}
++	}
++}
++
+ // FUNCTION: XW 0x410AC0
+ void laser_fireplayerweapon(void) {
+ 	int16_t* cooldown;
+ 	int16_t adjustedCooldown;
+ 	if (g_playerFlightState.selectedWeaponMode == 0) {
+-		cooldown =
+-			&g_playerFlightState.craft->laserState.fireCooldownTicks[g_playerFlightState.selectedWeaponBank];
+-		adjustedCooldown = *cooldown;
+-		if (adjustedCooldown != 0) {
+-			adjustedCooldown -= g_elapsedTicks;
+-			if (adjustedCooldown < 0)
+-				adjustedCooldown = 0;
+-		}
+-		if (adjustedCooldown < (int16_t)g_elapsedTicks) {
+-			if (adjustedCooldown != 0)
+-				*cooldown -= g_elapsedTicks;
+-			else
+-				*cooldown = 0;
+-			if ((g_playerFlightState.craft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0) {
+-				laser_firelasersystem(g_playerFlightState.objectIndex,
+-									  g_playerFlightState.selectedWeaponBank);
+-				g_playerFlightState.craft->laserState
+-					.fireCooldownTicks[g_playerFlightState.selectedWeaponBank] += g_elapsedTicks;
+-			} else {
+-				g_msgArgTable[0] = g_playerFlightState.selectedWeaponBank + XW_MSG_SUBSYSTEM_LASER;
+-				g_msgArgTable[1] = XW_MSG_SUBSYSTEM_DAMAGED_AND_INOPERATIVE;
+-				msg_messageprintf(XW_MSG_SUBSYSTEM_STATUS);
+-			}
++#ifdef XW_MODERN
++		if (laser_playergroupslinked()) {
++			laser_fireplayergroup(g_playerFlightState.selectedWeaponBank, 1);
++			/* The cannon-system-offline message was already shown by the first group. */
++			if ((g_playerFlightState.craft->workingSubsystems & LASER_CANNON_SUBSYSTEM_MASK) != 0)
++				for (uint16_t group = 0; group < g_playerFlightState.craft->cannonClassCount; ++group)
++					if (group != g_playerFlightState.selectedWeaponBank)
++						laser_fireplayergroup(group, 1);
++			return;
+ 		}
++#endif
++		laser_fireplayergroup(g_playerFlightState.selectedWeaponBank, 0);
+ 	} else {
+ 		cooldown = &g_playerFlightState.craft->warheadFireTimers[g_playerFlightState.selectedWeaponBank];
+ 		adjustedCooldown = *cooldown;
+@@ -461,7 +492,13 @@ void laser_firelasersystem(uint16_t sourceObjectIndex, int laserGroup) {
+ 					g_playerFlightState.weaponStats.laserShotsFired += shotsFired;
+ 			}
+ 			g_curCraft->laserState.fireCooldownTicks[groupIndex] =
+-				LASER_COOLDOWN_PER_SHOT * shotsFired + LASER_COOLDOWN_BASE;
++#ifdef XW_MODERN
++				(XwFlightTweaks_XvtLasers() ? LASER_XVT_COOLDOWN_PER_SHOT : LASER_COOLDOWN_PER_SHOT) *
++#else
++				LASER_COOLDOWN_PER_SHOT *
++#endif
++					shotsFired +
++				LASER_COOLDOWN_BASE;
+ 		}
+ 	}
+ }
+@@ -608,6 +645,14 @@ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotI
+ 			sourceObject->speed + g_projectileBaseDamageByType[propertyIndex];
+ 		g_objectTable[projectileIndex].lifetimeTicks =
+ 			XW_SIMULATION_TICKS_PER_SECOND * g_projectileLifetimeSecondsByType[propertyIndex];
++#ifdef XW_MODERN
++		/* game.xvt_lasers: cannon bolts fly twice as fast for half as long. Damage keeps the original speed. */
++		g_objectTable[projectileIndex].speed =
++			sourceObject->speed +
++			XwFlightTweaks_ProjectileSpeed(propertyIndex, g_projectileSpeedByType[propertyIndex]);
++		g_objectTable[projectileIndex].lifetimeTicks = XwFlightTweaks_ProjectileLifetimeTicks(
++			propertyIndex, g_objectTable[projectileIndex].lifetimeTicks);
++#endif
+ 		worldY = sourceObject->worldY;
+ 		worldX = sourceObject->worldX;
+ 		worldZ = sourceObject->worldZ;
+diff --git a/src/xw/flight/object/laser.h b/src/xw/flight/object/laser.h
+index d29912f..7a4749d 100644
+--- a/src/xw/flight/object/laser.h
++++ b/src/xw/flight/object/laser.h
+@@ -50,7 +50,9 @@ enum {
+ 	LASER_PLAYER_CHARGE_COST = 4,
+ 	LASER_SHOT_SOUND_LIMIT = 2,
+ 	LASER_COOLDOWN_PER_SHOT = 78,
+-	LASER_COOLDOWN_BASE = 2
++	LASER_COOLDOWN_BASE = 2,
++	/* XvT 0x4065D0, used with game.xvt_lasers. */
++	LASER_XVT_COOLDOWN_PER_SHOT = 47
+ };
+ 
+ enum {
+@@ -129,6 +131,15 @@ uint16_t laser_firemissile(uint16_t objectIndex, uint16_t weaponSlotIndex, uint1
+ uint16_t laser_createprojectile(uint16_t sourceObjectIndex, uint16_t weaponSlotIndex,
+ 								uint16_t projectileObjectType);
+ 
++#ifdef XW_MODERN
++/* X-Wing Alliance style "lasers and ion cannons fire linked" for the player: one trigger fires every cannon
++ * group fully linked. Reset when the player's craft is created. */
++typedef struct CraftData CraftData;
++int laser_canlinkcannongroups(const CraftData* craft);
++int laser_playergroupslinked(void);
++void laser_setplayergroupslinked(int linked);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index 70f40cf..eaafe6e 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -30,6 +30,7 @@
+ #include "xw/flight/object/anim.h"
+ #include "xw/flight/object/craft.h"
+ #include "xw/flight/object/create.h"
++#include "xw/flight/object/laser.h"
+ #include "xw/flight/object/object.h"
+ #include "xw/flight/replay/replay.h"
+ #include "xw/flight/replay/replayio.h"
+@@ -833,6 +834,35 @@ void user_inputforplane(void) {
+ 									   XW_MSG_WARHEAD_LAUNCHERS_SINGLE_FIRE));
+ 				fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
+ 			} else {
++#ifdef XW_MODERN
++				/* XWA-style cycle: ... -> fire linked -> lasers and ion cannons linked -> single fire. */
++				if (laser_playergroupslinked()) {
++					laser_setplayergroupslinked(0);
++					g_playerFlightState.craft->laserState.linkMode[g_playerFlightState.selectedWeaponBank] =
++						LASER_LINK_SINGLE;
++					g_playerFlightState.craft->laserState.nextSlot[g_playerFlightState.selectedWeaponBank] =
++						g_craftTypeDefs[g_playerFlightState.craftTypeIndex]
++							.laserGroupFirstSlot[g_playerFlightState.selectedWeaponBank];
++					msg_messageprintf(XW_MSG_CANNONS_SINGLE_FIRE);
++					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					break;
++				}
++				if (laser_canlinkcannongroups(g_playerFlightState.craft) &&
++					g_playerFlightState.craft->laserState.linkMode[g_playerFlightState.selectedWeaponBank] ==
++						LASER_LINK_ALL) {
++					int hasIons = 0;
++					for (uint16_t group = 0; group < g_playerFlightState.craft->cannonClassCount; ++group) {
++						int type = XwFlightTypes_CanonicalType(
++							g_craftTypeDefs[g_playerFlightState.craftTypeIndex].laserGroupWeaponType[group]);
++						hasIons |= type == XW_OBJ_ION_147 || type == XW_OBJ_ION_148;
++					}
++					laser_setplayergroupslinked(1);
++					msg_messagetext(XW_MSG_CANNONS_LINKED_FIRE, hasIons ? "\005Lasers and ion cannons \007fire linked"
++																		: "\005All cannons \007fire linked");
++					fsfx_triggersfx(FSFX_CONTROL_ACKNOWLEDGE_SLOT, FSFX_UNPOSITIONED_OBJECT);
++					break;
++				}
++#endif
+ 				uint16_t link =
+ 					g_playerFlightState.craft->laserState.linkMode[g_playerFlightState.selectedWeaponBank] +
+ 					1;
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index 00006fa..e07e026 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -90,6 +90,22 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 	AeronUi_Selector(ui, "Laser Convergence", &draft->laser_convergence, off_on, 2);
+ 	if (XwProfile_HasMission() && XwProfile_MissionLaserConvergence() != (draft->laser_convergence != 0))
+ 		AeronUi_Help(ui, "Laser convergence changes apply when you next open mission selection.");
++	if (draft->laser_convergence) {
++		static const char* const distances[] = { "0.25 km", "0.40 km", "0.55 km", "0.75 km", "1.00 km" };
++		static const int metres[] = { 250, 400, 550, 750, 1000 };
++		int choice = 2;
++		for (int i = 0; i < 5; ++i)
++			if (draft->laser_convergence_metres == metres[i])
++				choice = i;
++		if (AeronUi_Selector(ui, "Default Convergence Distance", &choice, distances, 5))
++			draft->laser_convergence_metres = metres[choice];
++	}
++	AeronUi_Selector(ui, "Laser Rate and Speed", &draft->xvt_lasers, (const char* const[]) { "X-Wing", "XvT" },
++					 2);
++	AeronUi_Selector(ui, "Acceleration and Braking", &draft->xvt_throttle,
++					 (const char* const[]) { "X-Wing", "XvT" }, 2);
++	AeronUi_Selector(ui, "AI Laser & Ion Linking", &draft->ai_ion_link,
++					 (const char* const[]) { "Off", "Friendly Only", "All Craft" }, 3);
+ 	XwInstallationPage_Draw(ui, input);
+ 	AeronUi_EndScroll(ui);
+ }
+diff --git a/src/xw_app/settings/video_page.c b/src/xw_app/settings/video_page.c
+index 5b1fa9c..cf4a946 100644
+--- a/src/xw_app/settings/video_page.c
++++ b/src/xw_app/settings/video_page.c
+@@ -74,6 +74,8 @@ static void FlightControls(AeronUiContext* ui, XwSettings* draft) {
+ 	AeronUi_Toggle(ui, "Undither Cockpit Artwork", &r->cockpit_undither);
+ 	if (XwHudAssets_UnditherPending(r->cockpit_undither))
+ 		AeronUi_Help(ui, "This change will take effect on the next cockpit load.");
++	AeronUi_Toggle(ui, "Stretch Cockpit to Widescreen", &draft->cockpit_stretch);
++	AeronUi_Toggle(ui, "Widescreen Cockpit-Off HUD", &draft->hud_widescreen);
+ 	static const char* const quality[] = { "Off", "Low", "High" };
+ 	AeronUi_Selector(ui, "SSAO Quality", &r->scene.ssao.ssao_quality, quality, 3);
+ 	ShadowControl(ui, &r->scene.shadows);
+diff --git a/src/xw_remaster/flight.c b/src/xw_remaster/flight.c
+index 08ccf9a..216c628 100644
+--- a/src/xw_remaster/flight.c
++++ b/src/xw_remaster/flight.c
+@@ -159,8 +159,10 @@ bool XwRemasterFlight_Prepare(const XwRenderSnapshot* s, int w, int h) {
+ 	}
+ 	if (advance)
+ 		XwComponentAnimation_Prepare(s, reset);
+-	frame.content_rect =
+-		Expanded(&s->camera) ? (AeronRectI) { 0, 0, w, h } : XwRenderMath_LayoutRect(&frame.cockpit_layout);
++	/* A stretched cockpit covers the full width, so the world shows on both sides of the 4:3 art. */
++	frame.content_rect = Expanded(&s->camera) || XwRenderMath_CockpitStretchX(&s->camera, w, h) > 1.0f
++							 ? (AeronRectI) { 0, 0, w, h }
++							 : XwRenderMath_LayoutRect(&frame.cockpit_layout);
+ 	bool hdr = Aeron_OutputHdrEnabled();
+ 	float headroom = Aeron_OutputHdrHeadroom();
+ 	const XwRenderSettings* settings = XwRemasterConfig_Effective();
+diff --git a/src/xw_remaster/hud_draw.c b/src/xw_remaster/hud_draw.c
+index a364f72..27120b6 100644
+--- a/src/xw_remaster/hud_draw.c
++++ b/src/xw_remaster/hud_draw.c
+@@ -21,15 +21,36 @@ void XwHudDraw_Color(const XwHudDraw* draw, unsigned color, bool indexed, float
+ 	rgba[3] = 1;
+ }
+ 
+-static bool Clip(const XwHudDraw* d, XwSnapRect rect, AeronRectI* out) {
++/* Edge HUD: elements in the left or right 40% of the classic screen move out to the screen edges. Text and
++ * pane art clipped to a pane move with that pane (wide panes such as the message strip stay put); whole-screen
++ * clips decide by the element itself. */
++float XwHudDraw_PaneShift(const XwHudDraw* d, float x0, float x1) {
++	float sw = d->layout.source_width, center = (x0 + x1) * 0.5f;
++	if (d->edge_shift <= 0 || x1 - x0 >= sw * 0.6f)
++		return 0;
++	return center < sw * 0.4f ? -d->edge_shift : center > sw * 0.6f ? d->edge_shift : 0;
++}
++
++static float EdgeShift(const XwHudDraw* d, XwSnapRect rect, XwSnapRect clip) {
++	if (d->edge_shift <= 0)
++		return 0;
++	if (d->in_pane)
++		return d->pane_shift;
++	float sw = d->layout.source_width, sh = d->layout.source_height;
++	XwSnapRect basis = clip.width > 0 && (clip.width < sw || clip.height < sh) ? clip : rect;
++	return XwHudDraw_PaneShift(d, basis.x, basis.x + basis.width);
++}
++
++static bool Clip(const XwHudDraw* d, XwSnapRect rect, float shift, AeronRectI* out) {
+ 	if (rect.width <= 0 || rect.height <= 0)
+ 		return false;
+ 	/* Clamp rounded clipping bounds to the target while preserving fractional artwork positions. */
+ 	float width = d->layout.target_width, height = d->layout.target_height;
+-	int x = (int)fminf(width, fmaxf(0, floorf(d->offset_x + rect.x * d->layout.scale_x))),
++	float offset_x = d->offset_x + shift;
++	int x = (int)fminf(width, fmaxf(0, floorf(offset_x + rect.x * d->layout.scale_x))),
+ 		y = (int)fminf(height, fmaxf(0, floorf(d->offset_y + rect.y * d->layout.scale_y)));
+ 	int right = (int)fminf(width,
+-						   fmaxf(0, ceilf(d->offset_x + ((float)rect.x + rect.width) * d->layout.scale_x))),
++						   fmaxf(0, ceilf(offset_x + ((float)rect.x + rect.width) * d->layout.scale_x))),
+ 		bottom = (int)fminf(height,
+ 							fmaxf(0, ceilf(d->offset_y + ((float)rect.y + rect.height) * d->layout.scale_y)));
+ 	*out = (AeronRectI) { x, y, right - x, bottom - y };
+@@ -63,9 +84,10 @@ void XwHudDraw_Fill(const XwHudDraw* d, XwSnapRect rect, XwSnapRect clip, unsign
+ 	float rgba[4];
+ 	XwHudDraw_Color(d, color, indexed, rgba);
+ 	AeronRectI scissor;
+-	if (!Clip(d, clip, &scissor))
++	float shift = EdgeShift(d, rect, clip);
++	if (!Clip(d, clip, shift, &scissor))
+ 		return;
+-	AeronDrawList2DSprite sprite = { .dst_x = d->offset_x + rect.x * d->layout.scale_x,
++	AeronDrawList2DSprite sprite = { .dst_x = d->offset_x + shift + rect.x * d->layout.scale_x,
+ 									 .dst_y = d->offset_y + rect.y * d->layout.scale_y,
+ 									 .dst_w = rect.width * d->layout.scale_x,
+ 									 .dst_h = rect.height * d->layout.scale_y };
+@@ -79,7 +101,8 @@ static bool Sprite(const XwHudDraw* d, const XwHudImage* image, AeronSpriteRect
+ 	if (!image)
+ 		return false;
+ 	AeronRectI scissor;
+-	if (!Clip(d, clip, &scissor))
++	float shift = EdgeShift(d, rect, clip);
++	if (!Clip(d, clip, shift, &scissor))
+ 		return true;
+ 	const AeronRuntimeAtlas* a = XwHudAssets_Atlas(image);
+ 	if (!a)
+@@ -96,7 +119,7 @@ static bool Sprite(const XwHudDraw* d, const XwHudImage* image, AeronSpriteRect
+ 									 .src_v0 = (frame.y + source.y) / p.height,
+ 									 .src_u1 = mirrored ? u0 : u1,
+ 									 .src_v1 = (frame.y + source.y + source.h) / p.height,
+-									 .dst_x = d->offset_x + rect.x * d->layout.scale_x,
++									 .dst_x = d->offset_x + shift + rect.x * d->layout.scale_x,
+ 									 .dst_y = d->offset_y + rect.y * d->layout.scale_y,
+ 									 .dst_w = rect.width * d->layout.scale_x,
+ 									 .dst_h = rect.height * d->layout.scale_y,
+diff --git a/src/xw_remaster/hud_draw.h b/src/xw_remaster/hud_draw.h
+index 0c388f3..baa33a8 100644
+--- a/src/xw_remaster/hud_draw.h
++++ b/src/xw_remaster/hud_draw.h
+@@ -10,8 +10,16 @@ typedef struct XwHudDraw {
+ 	const XwCockpitDefinition* definition;
+ 	XwLayoutTransform layout;
+ 	float offset_x, offset_y;
++	/* render.hud_widescreen: target pixels that side elements move outward in cockpit-off views; 0 = off. */
++	float edge_shift;
++	/* Set while drawing pane records: the whole pane moves by pane_shift. */
++	bool in_pane;
++	float pane_shift;
+ } XwHudDraw;
+ 
++/* Edge HUD shift for a pane whose contents span classic x0..x1. */
++float XwHudDraw_PaneShift(const XwHudDraw* draw, float x0, float x1);
++
+ void XwHudDraw_Color(const XwHudDraw* draw, unsigned color, bool indexed, float rgba[4]);
+ void XwHudDraw_Fill(const XwHudDraw* draw, XwSnapRect rect, XwSnapRect clip, unsigned color, bool indexed);
+ bool XwHudDraw_Base(const XwHudDraw* draw);
+diff --git a/src/xw_remaster/hud_renderer.c b/src/xw_remaster/hud_renderer.c
+index bd4eaed..77aeb50 100644
+--- a/src/xw_remaster/hud_renderer.c
++++ b/src/xw_remaster/hud_renderer.c
+@@ -1,7 +1,9 @@
+ /* Native-resolution composition follows OpenXvT's retained Aeron draw-list path. */
+ #include "xw_remaster/hud_renderer.h"
+ #include "xw_remaster/hud_draw.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include <aeron/aeron.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -10,6 +12,8 @@ typedef struct HudKey {
+ 	XwRenderView view;
+ 	XwSnapTargetBox target;
+ 	int width, height;
++	float stretch_x;
++	int widescreen_hud; /* int keeps the memcmp key free of padding. */
+ } HudKey;
+ 
+ typedef struct Ordered {
+@@ -27,9 +31,38 @@ static int Compare(const void* a, const void* b) {
+ 	return (x->order > y->order) - (x->order < y->order);
+ }
+ 
+-static bool Panes(const XwHudDraw* draw) {
++static bool InRange(XwSnapRange r, unsigned i) { return i >= r.first && i - r.first < r.count; }
++
++/* render.hud_widescreen: each pane moves to the screen edge as a whole, judged by its contents' extent. */
++static void PaneShifts(const XwHudDraw* draw, float shifts[XW_SNAP_HUD_PANES]) {
++	const XwSnapCockpit* c = &draw->snapshot->cockpit;
++	for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
++		const XwSnapHudPane* pane = &c->panes[p];
++		float x0 = 1e9f, x1 = -1e9f;
++		for (unsigned i = 0; i < pane->glyphs.count; ++i) {
++			const XwSnapGlyph* g = &c->glyphs[pane->glyphs.first + i];
++			x0 = fminf(x0, g->x);
++			x1 = fmaxf(x1, g->x + g->advance);
++		}
++		for (unsigned i = 0; i < pane->paint.count; ++i) {
++			const XwSnapHudPaint* q = &c->paint[pane->paint.first + i];
++			x0 = fminf(x0, q->x0);
++			x1 = fmaxf(x1, q->x1);
++		}
++		for (unsigned i = 0; i < pane->sprites.count; ++i) {
++			const XwSnapRect* r = &c->sprites[pane->sprites.first + i].destination;
++			x0 = fminf(x0, r->x);
++			x1 = fmaxf(x1, r->x + r->width);
++		}
++		shifts[p] = x1 > x0 && p != XW_SNAP_PANE_READY_MESSAGE ? XwHudDraw_PaneShift(draw, x0, x1) : 0;
++	}
++}
++
++static bool Panes(XwHudDraw* draw) {
+ 	const XwSnapCockpit* c = &draw->snapshot->cockpit;
+ 	Ordered order[XW_SNAP_HUD_GLYPHS + XW_SNAP_HUD_PAINT + XW_SNAP_HUD_SPRITES];
++	float shifts[XW_SNAP_HUD_PANES];
++	PaneShifts(draw, shifts);
+ 	unsigned n = 0;
+ 	for (unsigned i = 0; i < c->glyph_count; ++i)
+ 		order[n++] = (Ordered) { c->glyphs[i].order, i, 0 };
+@@ -38,8 +71,19 @@ static bool Panes(const XwHudDraw* draw) {
+ 	for (unsigned i = 0; i < c->sprite_count; ++i)
+ 		order[n++] = (Ordered) { c->sprites[i].order, i, 2 };
+ 	qsort(order, n, sizeof order[0], Compare);
++	draw->in_pane = true;
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		unsigned index = order[i].index;
++		draw->pane_shift = 0;
++		for (unsigned p = 0; p < XW_SNAP_HUD_PANES; ++p) {
++			XwSnapRange r = order[i].kind == 0	 ? c->panes[p].glyphs
++							: order[i].kind == 1 ? c->panes[p].paint
++												 : c->panes[p].sprites;
++			if (InRange(r, index)) {
++				draw->pane_shift = shifts[p];
++				break;
++			}
++		}
+ 		if (order[i].kind == 0) {
+ 			if (!XwHudDraw_Glyph(draw, &c->glyphs[index]))
+ 				return false;
+@@ -55,6 +99,7 @@ static bool Panes(const XwHudDraw* draw) {
+ 				return false;
+ 		}
+ 	}
++	draw->in_pane = false;
+ 	return true;
+ }
+ 
+@@ -78,7 +123,9 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 				   .assets = XwHudAssets_Generation(),
+ 				   .target = snapshot->target_box,
+ 				   .width = width,
+-				   .height = height };
++				   .height = height,
++				   .stretch_x = XwRenderMath_CockpitStretchX(&snapshot->camera, width, height),
++				   .widescreen_hud = XwFlightTweaks_WidescreenHud() };
+ 	if (view)
+ 		key.view = *view;
+ 	if (valid && !memcmp(&key, &prepared, sizeof key)) {
+@@ -98,8 +145,13 @@ bool XwHudRenderer_Prepare(const XwRenderSnapshot* snapshot, const XwRenderView*
+ 	if (!draw.definition ||
+ 		!XwRenderMath_Layout(c->screen_width, c->screen_height, width, height, &draw.layout))
+ 		return false;
++	draw.layout.scale_x *= key.stretch_x;
+ 	draw.offset_x = (width - c->screen_width * draw.layout.scale_x) / 2;
+ 	draw.offset_y = (height - c->screen_height * draw.layout.scale_y) / 2;
++	const XwSnapCamera* camera = &snapshot->camera;
++	if (key.widescreen_hud && !camera->replay_mode &&
++		(camera->hud_state == XW_SNAP_VIEW_NO_COCKPIT || camera->hud_state == XW_SNAP_VIEW_FULL_FORWARD))
++		draw.edge_shift = draw.offset_x > 0 ? draw.offset_x : 0;
+ 	AeronDrawList_Begin(list, NULL, width, height, AERON_DRAWLIST2D_LOAD, NULL);
+ 	AeronDrawList_Begin(markers, NULL, width, height, AERON_DRAWLIST2D_LOAD, NULL);
+ 	if (!snapshot->target_box.direct_overlay)
+diff --git a/src/xw_remaster/render_math.c b/src/xw_remaster/render_math.c
+index 5e570a6..5c895ec 100644
+--- a/src/xw_remaster/render_math.c
++++ b/src/xw_remaster/render_math.c
+@@ -1,6 +1,7 @@
+ /* Matrix conventions and layout helpers adapted from OpenXvT f643323. */
+ #include "xw_remaster/render_math.h"
+ #include "aeron/asset/opt_model.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include <math.h>
+ #include <string.h>
+ 
+@@ -164,6 +165,14 @@ void XwRenderMath_LayoutInverse(const XwLayoutTransform* t, float ax, float ay,
+ 	*oy = (y - ay * (t->target_height - t->source_height * t->scale_y)) / t->scale_y;
+ }
+ 
++float XwRenderMath_CockpitStretchX(const XwSnapCamera* camera, float tw, float th) {
++	if (!camera || tw <= 0 || th <= 0 || !XwFlightTweaks_CockpitStretch() || camera->replay_mode ||
++		camera->hud_state == XW_SNAP_VIEW_NO_COCKPIT || camera->hud_state == XW_SNAP_VIEW_FULL_FORWARD)
++		return 1.0f;
++	float stretch = (tw / th) / (4.0f / 3.0f);
++	return stretch > 1.0f ? stretch : 1.0f;
++}
++
+ AeronRectI XwRenderMath_LayoutRect(const XwLayoutTransform* t) {
+ 	int w = (int)lroundf(t->source_width * t->scale_x), h = (int)lroundf(t->source_height * t->scale_y);
+ 	return (AeronRectI) { ((int)t->target_width - w) / 2, ((int)t->target_height - h) / 2, w, h };
+diff --git a/src/xw_remaster/render_math.h b/src/xw_remaster/render_math.h
+index 30058ad..e4c2c11 100644
+--- a/src/xw_remaster/render_math.h
++++ b/src/xw_remaster/render_math.h
+@@ -22,6 +22,9 @@ void XwRenderMath_LayoutPoint(const XwLayoutTransform* layout, float anchor_x, f
+ void XwRenderMath_LayoutInverse(const XwLayoutTransform* layout, float anchor_x, float anchor_y, float x,
+ 								float y, float* out_x, float* out_y);
+ AeronRectI XwRenderMath_LayoutRect(const XwLayoutTransform* layout);
++/* render.cockpit_stretch: horizontal factor that widens the 4:3 cockpit art to fill the target; 1 when the
++ * option is off, in cockpit-off views and in replays. */
++float XwRenderMath_CockpitStretchX(const XwSnapCamera* camera, float target_width, float target_height);
+ /* Wrapped integer subtraction precedes float conversion, matching X-Wing world arithmetic. */
+ void XwRenderMath_Local(const int32_t origin[3], const int32_t world[3], float out[3]);
+ bool XwRenderMath_BuildMainView(const XwSnapCamera* camera, const int32_t origin[3], int width, int height,
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+new file mode 100644
+index 0000000..ebac412
+--- /dev/null
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -0,0 +1,44 @@
++#include "xw_runtime/config/flight_tweaks.h"
++
++static bool s_cockpit_stretch = true;
++static bool s_widescreen_hud = true;
++static int s_laser_convergence_m = 550;
++static bool s_xvt_lasers = true;
++static int s_ai_ion_link = XW_AI_ION_LINK_ALL;
++static bool s_xvt_throttle = true;
++
++enum { CANNON_PROJECTILE_TYPES = 6 };
++
++bool XwFlightTweaks_CockpitStretch(void) { return s_cockpit_stretch; }
++
++void XwFlightTweaks_SetCockpitStretch(bool enabled) { s_cockpit_stretch = enabled; }
++
++bool XwFlightTweaks_WidescreenHud(void) { return s_widescreen_hud; }
++
++void XwFlightTweaks_SetWidescreenHud(bool enabled) { s_widescreen_hud = enabled; }
++
++int XwFlightTweaks_LaserConvergenceMetres(void) { return s_laser_convergence_m; }
++
++void XwFlightTweaks_SetLaserConvergenceMetres(int metres) { s_laser_convergence_m = metres > 0 ? metres : 0; }
++
++bool XwFlightTweaks_XvtLasers(void) { return s_xvt_lasers; }
++
++void XwFlightTweaks_SetXvtLasers(bool enabled) { s_xvt_lasers = enabled; }
++
++int XwFlightTweaks_AiIonLink(void) { return s_ai_ion_link; }
++
++void XwFlightTweaks_SetAiIonLink(int mode) {
++	s_ai_ion_link = mode < XW_AI_ION_LINK_OFF || mode > XW_AI_ION_LINK_ALL ? XW_AI_ION_LINK_OFF : mode;
++}
++
++bool XwFlightTweaks_XvtThrottle(void) { return s_xvt_throttle; }
++
++void XwFlightTweaks_SetXvtThrottle(bool enabled) { s_xvt_throttle = enabled; }
++
++int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base) {
++	return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES ? (int16_t)(2 * base) : base;
++}
++
++int16_t XwFlightTweaks_ProjectileLifetimeTicks(int index, int16_t baseTicks) {
++	return s_xvt_lasers && index >= 0 && index < CANNON_PROJECTILE_TYPES ? (int16_t)(baseTicks / 2) : baseTicks;
++}
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+new file mode 100644
+index 0000000..5b5c641
+--- /dev/null
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -0,0 +1,50 @@
++#ifndef XW_RUNTIME_CONFIG_FLIGHT_TWEAKS_H
++#define XW_RUNTIME_CONFIG_FLIGHT_TWEAKS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Widescreen and gameplay options ported from the OpenTIE/OpenXvT builds.
++ *
++ * cockpit_stretch (render.cockpit_stretch): the 4:3 cockpit art spans the whole
++ * widescreen view instead of sitting in a centered 4:3 region.
++ * widescreen_hud (render.hud_widescreen): with the cockpit hidden, the side
++ * instruments move out toward the screen edges.
++ * laser_convergence_m (game.laser_convergence_metres): fallback convergence
++ * distance when the target is off the nose or out of range (see
++ * XwFlightMath_ConvergeLaser).
++ * xvt_lasers (game.xvt_lasers): cannons cycle and fly as in X-Wing vs TIE
++ * Fighter: 47 instead of 78 cooldown ticks per shot, bolts at twice the speed
++ * for half the lifetime (same range). Applies to every craft.
++ * ai_ion_link (game.ai_ion_link): AI craft with lasers and ion cannons fire both
++ * together, X-Wing Alliance style. Disable orders keep ions only.
++ * xvt_throttle (game.xvt_throttle): craft accelerate and brake as in XvT.
++ * Applies to every craft. */
++enum { XW_AI_ION_LINK_OFF = 0, XW_AI_ION_LINK_FRIENDLY = 1, XW_AI_ION_LINK_ALL = 2 };
++
++bool XwFlightTweaks_CockpitStretch(void);
++void XwFlightTweaks_SetCockpitStretch(bool enabled);
++bool XwFlightTweaks_WidescreenHud(void);
++void XwFlightTweaks_SetWidescreenHud(bool enabled);
++int XwFlightTweaks_LaserConvergenceMetres(void);
++void XwFlightTweaks_SetLaserConvergenceMetres(int metres);
++bool XwFlightTweaks_XvtLasers(void);
++void XwFlightTweaks_SetXvtLasers(bool enabled);
++int XwFlightTweaks_AiIonLink(void);
++void XwFlightTweaks_SetAiIonLink(int mode);
++bool XwFlightTweaks_XvtThrottle(void);
++void XwFlightTweaks_SetXvtThrottle(bool enabled);
++
++/* Cannon bolt speed and lifetime for projectile property index `index` (0-5 are
++ * laser and ion cannons), with xvt_lasers applied. */
++int16_t XwFlightTweaks_ProjectileSpeed(int index, int16_t base);
++int16_t XwFlightTweaks_ProjectileLifetimeTicks(int index, int16_t baseTicks);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 30f35ab..3f490b2 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -17,6 +17,7 @@
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/audio/player_engine.h"
+ #include "xw_runtime/config/config.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/config/preferences.h"
+ #include "xw_runtime/runtime/profile.h"
+ #include <landru/fade.h>
+@@ -26,6 +27,16 @@ static XwSavedShellPreferences observed;
+ static int applied_renderer;
+ static int applied_sb16_filter;
+ 
++static void ApplyFlightTweaks(void) {
++	const XwSettings* settings = XwConfig_Settings();
++	XwFlightTweaks_SetCockpitStretch(settings->cockpit_stretch != 0);
++	XwFlightTweaks_SetWidescreenHud(settings->hud_widescreen != 0);
++	XwFlightTweaks_SetLaserConvergenceMetres(settings->laser_convergence_metres);
++	XwFlightTweaks_SetXvtLasers(settings->xvt_lasers != 0);
++	XwFlightTweaks_SetAiIonLink(settings->ai_ion_link);
++	XwFlightTweaks_SetXvtThrottle(settings->xvt_throttle != 0);
++}
++
+ static void ApplyAudioFilter(void) {
+ 	int enabled = XwConfig_Settings()->sb16_filter_enabled;
+ 	if (enabled == applied_sb16_filter)
+@@ -93,6 +104,7 @@ void XwPreferences_BeginMission(void) {
+ void XwPreferences_InitRuntime(void) {
+ 	applied_sb16_filter = -1;
+ 	ApplyAudioFilter();
++	ApplyFlightTweaks();
+ 	observed = XwConfig_Settings()->game;
+ 	g_savedShellPreferences = observed;
+ 	g_shellPreferences = observed.preferences;
+@@ -102,6 +114,7 @@ void XwPreferences_InitRuntime(void) {
+ 
+ void XwPreferences_ApplyPending(void) {
+ 	ApplyAudioFilter();
++	ApplyFlightTweaks();
+ 	const XwSavedShellPreferences* next = &XwConfig_Settings()->game;
+ 	if (XwPreferences_HasPendingSave() || !memcmp(&observed, next, sizeof observed))
+ 		return;
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 5ce5c2d..5e24805 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -108,6 +108,12 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.player_invulnerable", player_invulnerable),
+ 	SETTING_BOOL("game.unlimited_ammunition", unlimited_ammunition),
+ 	SETTING_BOOL("game.laser_convergence", laser_convergence),
++	SETTING_INT("game.laser_convergence_metres", laser_convergence_metres, 0, 2500),
++	SETTING_BOOL("game.xvt_lasers", xvt_lasers),
++	SETTING_INT("game.ai_ion_link", ai_ion_link, 0, 2),
++	SETTING_BOOL("game.xvt_throttle", xvt_throttle),
++	SETTING_BOOL("render.cockpit_stretch", cockpit_stretch),
++	SETTING_BOOL("render.hud_widescreen", hud_widescreen),
+ 	SETTING_STRING("music.arrangement", music.arrangement),
+ 	SETTING_STRING("music.backend", music.backend),
+ 	SETTING_STRING("music.soundfont", music.soundfont),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 578ae39..9994d46 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -36,6 +36,9 @@ typedef struct XwSettings {
+ 	int player_engine_sound_volume_percent;
+ 	int starfighter_collision_damage, player_invulnerable, unlimited_ammunition;
+ 	int laser_convergence;
++	/* Options ported from the OpenTIE/OpenXvT builds; see flight_tweaks.h. */
++	int laser_convergence_metres, xvt_lasers, ai_ion_link, xvt_throttle;
++	int cockpit_stretch, hud_widescreen;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/runtime/flight_math.c b/src/xw_runtime/runtime/flight_math.c
+index ed7d480..2e7481b 100644
+--- a/src/xw_runtime/runtime/flight_math.c
++++ b/src/xw_runtime/runtime/flight_math.c
+@@ -7,9 +7,12 @@
+ #include "xw/flight/player/user.h"
+ #include "xw/flight/xw.h"
+ #include "xw/math/trig2.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/runtime/profile.h"
+ 
++#include <math.h>
++
+ /* DOS clears the multiplication high word before adding/subtracting world Y. */
+ void XwFlightMath_MoveHyperspace(int rate) {
+ 	int delta = rate * g_elapsedTicks;
+@@ -42,14 +45,26 @@ bool XwFlightMath_ConvergeLaser(uint16_t sourceIndex, int32_t muzzleX, int32_t m
+ 			   g_missionObjects[target - XW_MISSION_OBJECT_REF_BASE].objectType == XW_OBJ_NONE)
+ 		return false;
+ 
+-	/* Converge straight ahead at the selected target's distance. */
+-	pai_distancebetween(sourceIndex, target);
+-	int distance = g_trig2PolarDistance;
+-	if (distance < 4096)
+-		distance = 4096;
+-	if (distance > 65536)
+-		distance = 65536;
++	/* Converge straight ahead (XWA style, as in the OpenXvT/OpenTIE builds): at the target's range along the
++	 * nose while it is within about 30 degrees and 0.02-2.5 km ahead, otherwise at
++	 * game.laser_convergence_metres. panel_outputdistance: units * 161 >> 16 = km/100. */
++	enum { UNITS_PER_KM = 40706, COS_30_Q15 = 28378 };
+ 	const ObjectRecord* source = &g_objectTable[sourceIndex];
++	int64_t distance = (int64_t)XwFlightTweaks_LaserConvergenceMetres() * UNITS_PER_KM / 1000;
++	{
++		create_getworldposition(target, 0);
++		int64_t tx = (int32_t)((uint32_t)g_resolvedWorldX - (uint32_t)source->worldX);
++		int64_t ty = (int32_t)((uint32_t)g_resolvedWorldY - (uint32_t)source->worldY);
++		int64_t tz = (int32_t)((uint32_t)g_resolvedWorldZ - (uint32_t)source->worldZ);
++		int64_t along = (tx * source->cachedForwardX + ty * source->cachedForwardY + tz * source->cachedForwardZ) >>
++						FVIEW_MATRIX_FRACTION_BITS;
++		double range = sqrt((double)tx * tx + (double)ty * ty + (double)tz * tz);
++		if (along >= UNITS_PER_KM / 50 && along <= UNITS_PER_KM * 5 / 2 && range > 0 &&
++			(double)along * 32768.0 >= COS_30_Q15 * range)
++			distance = along;
++	}
++	if (distance <= 0)
++		return false;
+ 	int32_t dx =
+ 		(int32_t)((uint32_t)source->worldX - (uint32_t)muzzleX +
+ 				  (uint32_t)(((int64_t)distance * source->cachedForwardX) >> FVIEW_MATRIX_FRACTION_BITS));

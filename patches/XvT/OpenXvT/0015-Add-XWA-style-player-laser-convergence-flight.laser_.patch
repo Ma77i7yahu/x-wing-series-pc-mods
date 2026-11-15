@@ -1,0 +1,114 @@
+From a3a7728327b9123e378844071586c1834a3b2efe Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 21:31:10 +1100
+Subject: [PATCH 15/25] Add XWA-style player laser convergence
+ (flight.laser_convergence)
+
+---
+ resources/config.yaml             |  2 ++
+ src/xvt/flight/object/laser.c     | 41 +++++++++++++++++++++++++++++++
+ src/xvt_runtime/config/settings.c |  1 +
+ src/xvt_runtime/config/settings.h |  2 ++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index b4ae7cb..2b14dad 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -445,3 +445,5 @@ effects:
+ 
+ flight:
+   update_rate: unlocked
++  # Metres ahead where player cannons converge (X-Wing Alliance style); 0 = parallel.
++  laser_convergence: 600
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index 6a9863b..25f97ee 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -5,6 +5,7 @@
+ #ifdef XVT_MODERN
+ #include "xvt_runtime/timing/flight_timing.h"
+ #include "xvt_runtime/timing/reference_motion.h"
++#include "xvt_runtime/config/config.h"
+ #endif
+ 
+ #include "xvt/assets/model_bounds.h"
+@@ -1120,6 +1121,40 @@ int laser_firemissile(int objectIndex, int weaponSlotIndex, int projectileTypeId
+ }
+ 
+ // FUNCTION: XVT 0x4065D0
++#ifdef XVT_MODERN
++/* X-Wing Alliance style convergence: aim a player's cannon bolt from its
++ * hardpoint at a point the configured distance straight ahead of the craft,
++ * instead of parallel to the nose. Single-player only, since the setting is
++ * local and multiplayer simulations must agree. */
++static void laser_ConvergePlayerBolt(const ObjectRecord* source, ObjectRecord* bolt, int projectileObjectType) {
++	enum { UNITS_PER_KM = 40706 }; /* the HUD shows distance as units * 161 / 65536 hundredths of a km */
++	const XvtSettings* settings = XvtConfig_Settings();
++	int metres = settings ? settings->laser_convergence_m : 0;
++	if (metres <= 0)
++		return;
++	for (int player = 0; player < (int)(sizeof g_players / sizeof g_players[0]); ++player)
++		if (player != g_localPlayer && g_players[player].network.directPlayId != 0)
++			return;
++	int distance = (int)((int64_t)metres * UNITS_PER_KM / 1000);
++	/* The muzzle is the hardpoint position; the bolt starts a launch offset ahead of it. */
++	int muzzleX = bolt->mobj->prevWorldX, muzzleY = bolt->mobj->prevWorldY, muzzleZ = bolt->mobj->prevWorldZ;
++	int pointX = source->world_x + Math_MulQ15(distance, source->mobj->cachedFwdX);
++	int pointY = source->world_y + Math_MulQ15(distance, source->mobj->cachedFwdY);
++	int pointZ = source->world_z + Math_MulQ15(distance, source->mobj->cachedFwdZ);
++	trig2_ctop(pointX - muzzleX, pointY - muzzleY, pointZ - muzzleZ);
++	int16_t yaw = (int16_t)trig2_xyangle, pitch = (int16_t)pitchQ16;
++	bolt->yaw = yaw;
++	bolt->pitch = pitch;
++	bolt->roll = 0;
++	bolt->mobj->orientMatrixDirty = 1;
++	FVIEW_calcrotatemove(pitch, yaw, bolt);
++	int offset = g_projectileDamageByObjectType.launchOffset[projectileObjectType - PROJECTILE_OBJECT_TYPE_FIRST];
++	bolt->world_x = muzzleX + Math_MulQ15(g_fviewMoveX_Q15, offset);
++	bolt->world_y = muzzleY + Math_MulQ15(g_fviewMoveY_Q15, offset);
++	bolt->world_z = muzzleZ + Math_MulQ15(g_fviewMoveZ_Q15, offset);
++}
++#endif
++
+ int laser_createprojectile(int sourceObjectIndex, int weaponSlotIndex, int projectileObjectType) {
+ 	ObjectRecord* source;
+ 	uint16_t rangeEnd;
+@@ -1264,6 +1299,12 @@ int laser_createprojectile(int sourceObjectIndex, int weaponSlotIndex, int proje
+ 			g_objectTable[projectileIndex].mobj->orientMatrixDirty = 0;
+ 			g_objectTable[projectileIndex].mobj->moveVectorDirty =
+ 				g_objectTable[projectileIndex].mobj->orientMatrixDirty;
++#ifdef XVT_MODERN
++			if (source->playerOwnerIdx != -1 &&
++				g_projectileDamageByObjectType.warheadClass[projectileObjectType - PROJECTILE_OBJECT_TYPE_FIRST] ==
++					0)
++				laser_ConvergePlayerBolt(source, &g_objectTable[projectileIndex], projectileObjectType);
++#endif
+ 		}
+ 		guidanceIndex = (uint16_t)(projectileIndex - g_projectileObjectSlotStart);
+ 		g_projectileGuidanceStates[guidanceIndex].homingTier = 0;
+diff --git a/src/xvt_runtime/config/settings.c b/src/xvt_runtime/config/settings.c
+index 34e149f..77c84fc 100644
+--- a/src/xvt_runtime/config/settings.c
++++ b/src/xvt_runtime/config/settings.c
+@@ -31,6 +31,7 @@ typedef struct XvtSettingField {
+ 
+ static const XvtSettingField g_fields[] = {
+ 	SETTING_BOOL("startup.skip_intro", skip_intro),
++	SETTING_INT("flight.laser_convergence", laser_convergence_m, 0, 5000),
+ 	SETTING_STRING("paths.game_data", game_data),
+ 	SETTING_STRING("ui.font", ui_font),
+ 	SETTING_STRING("network.lobby_url", lobby_url),
+diff --git a/src/xvt_runtime/config/settings.h b/src/xvt_runtime/config/settings.h
+index 2df6818..b31e418 100644
+--- a/src/xvt_runtime/config/settings.h
++++ b/src/xvt_runtime/config/settings.h
+@@ -90,6 +90,8 @@ typedef struct XvtRenderSettings {
+ typedef struct XvtSettings {
+ 	int skip_intro;
+ 	int flight_unlocked;
++	/* Player cannons converge this many metres ahead; 0 fires parallel. */
++	int laser_convergence_m;
+ 	char game_data[XVT_PATH_CAPACITY];
+ 	char ui_font[XVT_PATH_CAPACITY];
+ 	char lobby_url[AERON_DPLAY_DIRECTORY_URL_CAPACITY];

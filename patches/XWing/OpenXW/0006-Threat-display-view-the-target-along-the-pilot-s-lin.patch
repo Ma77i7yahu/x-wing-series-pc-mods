@@ -1,0 +1,76 @@
+From dad210032f206d2a9552b78e8867103778d12300 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:52:41 +1100
+Subject: [PATCH 06/59] Threat display: view the target along the pilot's line
+ of sight, frame the whole craft, close when the target is lost
+
+---
+ src/xw/flight/player/user.c            | 22 +++++++++++++++-------
+ src/xw_runtime/runtime/flight_camera.c | 13 ++++++++++++-
+ 2 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index cee7546..f0576f1 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -65,7 +65,8 @@ int user_targetviewactive(void) { return s_targetViewActive; }
+ 
+ /* XvT's threat display frames the target: chase distance from the game's own model size. */
+ static void user_frametargetview(uint16_t target) {
+-	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 2;
++	/* Far enough that the whole craft fits the display window, as in XvT. */
++	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 7 / 2;
+ 	if (distance < USER_CAMERA_MIN_DISTANCE)
+ 		distance = USER_CAMERA_MIN_DISTANCE;
+ 	/* Capital ships need more room than the manual zoom's USER_CAMERA_MAX_DISTANCE. */
+@@ -265,13 +266,20 @@ void user_userinterface(void) {
+ 	uint16_t target;
+ 
+ #ifdef XW_MODERN
+-	/* The viewed target exploded (its slot becomes an explosion effect and may then be reused): return to
+-	 * the cockpit instead of following whatever takes the slot. */
+-	if (g_replayviewmode == 0 && s_targetViewActive) {
+-		const ObjectRecord* focus = &g_objectTable[g_flightCamera.focusObjectRef];
++	/* As in XvT, the threat display closes when the target is lost: it is destroyed or dropped from the
++	 * targeting computer (which happens as soon as a craft starts dying), or something else (the game's own
++	 * focus reset, another view key) has already pointed the camera back at the player. */
++	if (g_replayviewmode == 0 && s_targetViewFlag) {
++		uint16_t focusRef = g_flightCamera.focusObjectRef;
++		const ObjectRecord* focus = focusRef < XW_OBJECT_COUNT ? &g_objectTable[focusRef] : NULL;
+ 		uint16_t target = g_playerFlightState.currentTargetObjectIdx;
+-		if (focus->objectType == XW_OBJ_NONE || focus->genusId == XW_GENUS_EXPLOSION_EFFECT ||
+-			focus->familyId != XW_OBJECT_FAMILY_CRAFT) {
++		if (!g_flightCamera.externalViewActive) {
++			/* Left through another view key; keep that view. */
++			s_targetViewFlag = 0;
++			g_flightCamera.externalDistance = s_targetViewPreviousDistance;
++		} else if (!focus || focusRef == g_playerFlightState.objectIndex || focus->objectType == XW_OBJ_NONE ||
++				   focus->genusId == XW_GENUS_EXPLOSION_EFFECT || focus->familyId != XW_OBJECT_FAMILY_CRAFT ||
++				   target == XW_OBJECT_SLOT_UNAVAILABLE) {
+ 			g_flightCamera.focusObjectRef = g_playerFlightState.objectIndex;
+ 			user_endtargetview();
+ 			user_resetview();
+diff --git a/src/xw_runtime/runtime/flight_camera.c b/src/xw_runtime/runtime/flight_camera.c
+index 6f5f4e8..13581d8 100644
+--- a/src/xw_runtime/runtime/flight_camera.c
++++ b/src/xw_runtime/runtime/flight_camera.c
+@@ -101,7 +101,18 @@ void XwFlightCamera_Update(void) {
+ 		fview_newcalcview(g_flightCamera.viewRoll, g_flightCamera.viewPitch, g_flightCamera.viewYaw, 0,
+ 						  g_flightCamera.hudAimX, g_flightCamera.hudAimY, NULL);
+ 	} else if (g_flightCamera.externalViewActive != 0) {
+-		if (XwFlightTiming_IsUnlocked()) {
++		if (user_targetviewactive()) {
++			/* XvT's threat display: the target as seen from the player's craft, along the line of sight,
++			 * with the player's roll so up matches the pilot's view. */
++			const ObjectRecord* focus = &g_objectTable[g_flightCamera.focusObjectRef];
++			XwFlightCamera_CartesianToPolar(
++				(int32_t)((uint32_t)focus->worldX - (uint32_t)g_playerFlightState.object->worldX),
++				(int32_t)((uint32_t)focus->worldY - (uint32_t)g_playerFlightState.object->worldY),
++				(int32_t)((uint32_t)focus->worldZ - (uint32_t)g_playerFlightState.object->worldZ));
++			g_flightCamera.viewRoll = g_playerFlightState.object->roll;
++			g_flightCamera.viewPitch = g_trig2Pitch;
++			g_flightCamera.viewYaw = g_trig2Yaw;
++		} else if (XwFlightTiming_IsUnlocked()) {
+ 			UpdateChase();
+ 		} else {
+ 			int16_t historyIndex = g_flightCamera.angleHistory.writeIndex - XW_EXTERNAL_VIEW_LAG;

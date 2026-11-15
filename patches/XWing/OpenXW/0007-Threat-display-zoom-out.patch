@@ -1,0 +1,22 @@
+From 43dc3f42c5c874915e08de16082424b58e4e2362 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:53:12 +1100
+Subject: [PATCH 07/59] Threat display: zoom out
+
+---
+ src/xw/flight/player/user.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index f0576f1..1f156ab 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -66,7 +66,7 @@ int user_targetviewactive(void) { return s_targetViewActive; }
+ /* XvT's threat display frames the target: chase distance from the game's own model size. */
+ static void user_frametargetview(uint16_t target) {
+ 	/* Far enough that the whole craft fits the display window, as in XvT. */
+-	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 7 / 2;
++	int distance = g_modelTypeTable[g_objectTable[target].objectType].maxBoundsExtent * 5;
+ 	if (distance < USER_CAMERA_MIN_DISTANCE)
+ 		distance = USER_CAMERA_MIN_DISTANCE;
+ 	/* Capital ships need more room than the manual zoom's USER_CAMERA_MAX_DISTANCE. */

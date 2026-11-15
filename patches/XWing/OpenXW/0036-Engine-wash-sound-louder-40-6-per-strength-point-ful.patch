@@ -1,0 +1,26 @@
+From 9b60dbe7747d2ae81a93b46a9e55101fdb390a1e Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 22:30:47 +1100
+Subject: [PATCH 36/59] Engine wash sound: louder (40 + 6 per strength point,
+ full from strength 15)
+
+---
+ src/xw_runtime/audio/engine_wash_sound.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/xw_runtime/audio/engine_wash_sound.c b/src/xw_runtime/audio/engine_wash_sound.c
+index 335a12b..4985650 100644
+--- a/src/xw_runtime/audio/engine_wash_sound.c
++++ b/src/xw_runtime/audio/engine_wash_sound.c
+@@ -64,8 +64,9 @@ void XwEngineWashSound_Update(void) {
+ 					  : 1;
+ 		if (!g_washHandles[playing])
+ 			playing = -1;
+-		/* XvT: 4 * exterior volume * strength / 10, capped at 127; full volume from about half strength. */
+-		volume = strength * 127 / 32;
++		/* XvT: 4 * exterior volume * strength / 10, capped at 127. Here audible from the wash's edge and full
++		 * from a quarter strength (the user found half strength too quiet). */
++		volume = 40 + strength * 6;
+ 		if (volume > 127)
+ 			volume = 127;
+ 		volume = volume * g_flightSfxVolume / 16;

@@ -1,0 +1,961 @@
+From 592c243e1e05c00d3238ce75727c4d98be7989a2 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Tue, 10 Nov 2026 22:57:06 +1100
+Subject: [PATCH 53/59] game.xvt_components: X-Wing vs TIE Fighter starship
+ components
+
+1998 flight, every craft but starfighters. The OPT mesh descriptors decide
+everything, as in XvT: meshes with explosion flag 2 get XvT's hit points for
+their type (g_meshTypeComponentMaxHp) and stay drawn (X-Wing hides every
+starship's turrets but the corvette's); hits on meshes with flag 1 go to the
+component first once both shield banks are empty (Craft_DamageComponent's
+16-point units, remainder to the hull), except shield generators, which take
+hits through the shields as X-Wing's ISD generators do. A destroyed turret or
+gun stops the turret slots nearest it (X-Wing's hardpoints have no mesh index;
+this reproduces X-Wing's corvette mapping), and the last shield generator
+takes the shields and shield system with it, as on X-Wing's ISD.
+
+The player targets components with , and Shift+, (XvT's selectable-mesh
+rule, nearest hull section on a new target, next one when it is destroyed).
+A starship's targeted component is boxed on the HUD, ranges the CMD and the
+warhead lock, and player warheads home on it. The CMD names it (XvT CMD:
+in place of "Hull"). Game page: Starship Components.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                           |   1 +
+ resources/config.yaml                    |  10 +
+ src/xw/flight/object/collide.c           |  10 +-
+ src/xw/flight/object/create.c            |   5 +
+ src/xw/flight/object/laser.c             |  13 +
+ src/xw/flight/object/move.c              |  12 +
+ src/xw/flight/object/starship.c          |  40 ++-
+ src/xw/flight/player/targeting.c         |   7 +
+ src/xw/flight/player/user.c              |  10 +
+ src/xw/flight/player/user.h              |   3 +
+ src/xw_app/settings/game_page.c          |   5 +
+ src/xw_remaster/hud_readout.c            |  12 +-
+ src/xw_runtime/config/flight_tweaks.c    |   5 +
+ src/xw_runtime/config/flight_tweaks.h    |   3 +
+ src/xw_runtime/config/preference_apply.c |   1 +
+ src/xw_runtime/config/settings.c         |   1 +
+ src/xw_runtime/config/settings.h         |   2 +-
+ src/xw_runtime/input/actions.c           |   3 +
+ src/xw_runtime/input/actions.h           |   2 +
+ src/xw_runtime/runtime/xvt_components.c  | 323 +++++++++++++++++++++++
+ src/xw_runtime/runtime/xvt_components.h  |  57 ++++
+ src/xw_runtime/snapshot/render_readout.c |  15 +-
+ src/xw_runtime/snapshot/render_types.h   |   1 +
+ 23 files changed, 528 insertions(+), 13 deletions(-)
+ create mode 100644 src/xw_runtime/runtime/xvt_components.c
+ create mode 100644 src/xw_runtime/runtime/xvt_components.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5000bfa..6d21c31 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -369,6 +369,7 @@ set(XW_RUNTIME_SOURCES
+     src/xw_runtime/runtime/computer_task.c
+     src/xw_runtime/runtime/options_task.c
+     src/xw_runtime/runtime/gate_collision_task.c
++    src/xw_runtime/runtime/xvt_components.c
+     src/xw_runtime/runtime/xvt_hardpoints.c
+     src/xw_runtime/runtime/flight_frame.c
+     src/xw_runtime/runtime/flight_input.c
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 3ad4419..7637503 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -94,6 +94,11 @@ input:
+       - {key: "I"}
+     target_attacker_of_target:
+       - {key: "A"}
++    # X-Wing vs TIE Fighter's starship component targeting (game.xvt_components).
++    target_component_next:
++      - {key: ","}
++    target_component_prev:
++      - {key: ",", modifiers: [shift]}
+     target_preset_recall_1:
+       - {key: "F5"}
+     target_preset_store_1:
+@@ -303,6 +308,11 @@ game:
+   # their systems start dropping, the player is fully disabled after 10 such hits
+   # (5 charged), and a disabled craft loses its shields.
+   xvt_ions: true
++  # Starship components as in X-Wing vs TIE Fighter (1998 flight): turrets, guns, shield
++  # generators, launchers and more can be targeted (, and Shift+,) and destroyed once the
++  # ship's shields are down (shield generators at any time, as X-Wing's ISD ones are).
++  # A destroyed turret stops firing; the last shield generator takes the shields with it.
++  xvt_components: true
+   # Flight messages stay up half as long (2 s instead of 4; 6 s instead of 12),
+   # never less than 1.5 s.
+   short_messages: true
+diff --git a/src/xw/flight/object/collide.c b/src/xw/flight/object/collide.c
+index 0a72d0e..b92094f 100644
+--- a/src/xw/flight/object/collide.c
++++ b/src/xw/flight/object/collide.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/collide.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/timing/flight_integration.h"
+ #endif
+ 
+@@ -1705,9 +1706,12 @@ int16_t collide_damagecraft(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16_
+ 		damageAmount >>= COLLIDE_FREIGHTER_DAMAGE_SHIFT;
+ 	}
+ #ifdef XW_MODERN
+-	if (XwFlightTypes_CanonicalType(g_objectTable[victimObjIdx].objectType) ==
+-			XW_OBJ_IMPERIAL_STAR_DESTROYER ||
+-		XwFlightTypes_CanonicalType(g_objectTable[victimObjIdx].objectType) == XW_OBJ_CORELLIAN_CORVETTE) {
++	if (XwXvtComponents_Active()
++			? XwXvtComponents_RouteDamage(victimObjIdx, hitMeshIndex)
++			: XwFlightTypes_CanonicalType(g_objectTable[victimObjIdx].objectType) ==
++					  XW_OBJ_IMPERIAL_STAR_DESTROYER ||
++				  XwFlightTypes_CanonicalType(g_objectTable[victimObjIdx].objectType) ==
++					  XW_OBJ_CORELLIAN_CORVETTE) {
+ #else
+ 	if (g_objectTable[victimObjIdx].objectType == XW_OBJ_IMPERIAL_STAR_DESTROYER ||
+ 		g_objectTable[victimObjIdx].objectType == XW_OBJ_CORELLIAN_CORVETTE) {
+diff --git a/src/xw/flight/object/create.c b/src/xw/flight/object/create.c
+index 3f0029d..3906b46 100644
+--- a/src/xw/flight/object/create.c
++++ b/src/xw/flight/object/create.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/create.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/timing/flight_integration.h"
+ #endif
+ 
+@@ -4752,6 +4753,10 @@ uint16_t create_createcraft(void) {
+ 			g_curCraft->componentHp[CREATE_CRAFT_CORVETTE_SECOND_COMPONENT] =
+ 				CREATE_CRAFT_CORVETTE_COMPONENT_HP;
+ 		}
++#ifdef XW_MODERN
++		if (XwXvtComponents_Active())
++			XwXvtComponents_InitCraft(objectIndex);
++#endif
+ 	}
+ 	g_curCraft->aiWaypointIndex = 1;
+ 	leaderPlan = g_orderLeaderPlanId[g_missionFlightGroups[g_currentFlightGroupIdx].order];
+diff --git a/src/xw/flight/object/laser.c b/src/xw/flight/object/laser.c
+index 178ef1d..f2e4870 100644
+--- a/src/xw/flight/object/laser.c
++++ b/src/xw/flight/object/laser.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/laser.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/flight_math.h"
+ #include "xw_runtime/runtime/flight_types.h"
+@@ -48,7 +49,13 @@ void laser_weaponsfire(void) {
+ 			uint16_t maxLockAngleScore;
+ 			unsigned int maxLockRange;
+ 			int targetDistance;
++#ifdef XW_MODERN
++			/* game.xvt_components: XvT locks on a starship's targeted component (0x404710). */
++			XwXvtComponents_DistanceTo(g_playerFlightState.objectIndex, g_playerFlightState.currentTargetObjectIdx,
++									   XwXvtComponents_BoxComponent());
++#else
+ 			pai_distancebetween(g_playerFlightState.objectIndex, g_playerFlightState.currentTargetObjectIdx);
++#endif
+ 			targetDistance = g_trig2PolarDistance;
+ 			if (targetDistance >= LASER_LOCK_ANGLE_DISTANCE_LIMIT)
+ 				maxLockAngleScore = LASER_LOCK_MIN_ANGLE_SCORE;
+@@ -620,6 +627,12 @@ uint16_t laser_firemissile(uint16_t objectIndex, uint16_t weaponSlotIndex, uint1
+ 					g_playerFlightState.currentTargetObjectIdx;
+ 			else
+ 				g_warheadGuidanceTable[guidanceIndex].targetObjIdx = g_curCraft->aiTargetRef;
++#ifdef XW_MODERN
++			/* game.xvt_components: XvT's warheads home on the targeted component (0x406F40). */
++			XwXvtComponents_SetGuidance(guidanceIndex, g_warheadGuidanceTable[guidanceIndex].targetObjIdx,
++										playerObjectIndex == objectIndex ? XwXvtComponents_BoxComponent()
++																		 : XW_XVT_COMPONENT_NONE);
++#endif
+ 			if (g_warheadGuidanceTable[guidanceIndex].targetObjIdx == playerObjectIndex) {
+ 				msg_messageprintf(XW_MSG_INCOMING_MISSILE_TARGET_PROMPT);
+ 				fsfx_triggersfx(LASER_INCOMING_MISSILE_SOUND, XW_OBJECT_SLOT_UNAVAILABLE);
+diff --git a/src/xw/flight/object/move.c b/src/xw/flight/object/move.c
+index 1966f38..83acd70 100644
+--- a/src/xw/flight/object/move.c
++++ b/src/xw/flight/object/move.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/move.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #include "xw_runtime/timing/flight_integration.h"
+ #include "xw_runtime/timing/flight_timing.h"
+@@ -298,7 +299,18 @@ void move_moveobjects(void) {
+ 					if (object->objectType == XW_OBJ_WARHEAD_149)
+ #endif
+ 						homingRateIndex += MOVE_TORPEDO_HOMING_RATE_OFFSET;
++#ifdef XW_MODERN
++					{
++						uint16_t component = XwXvtComponents_Guidance(
++							(unsigned)(guidance - g_warheadGuidanceTable), targetObjectRef);
++						if (component != XW_XVT_COMPONENT_NONE)
++							XwXvtComponents_DistanceTo(objectIndex, targetObjectRef, component);
++						else
++							pai_distancebetween(objectIndex, targetObjectRef);
++					}
++#else
+ 					pai_distancebetween(objectIndex, targetObjectRef);
++#endif
+ #ifdef XW_MODERN
+ 					if (XwFlightTiming_IsUnlocked()) {
+ 						object->yaw = XwFlightIntegration_Home(
+diff --git a/src/xw/flight/object/starship.c b/src/xw/flight/object/starship.c
+index 7ffa4a8..2938439 100644
+--- a/src/xw/flight/object/starship.c
++++ b/src/xw/flight/object/starship.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/object/starship.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/timing/reference_motion.h"
+ #endif
+ 
+@@ -636,21 +637,48 @@ int starship_damagecomponent(uint16_t victimObjIdx, int16_t hitMeshIndex, uint16
+ 		return Dos94_starship_damagecomponent(victimObjIdx, hitMeshIndex, damageAmount);
+ 	}
+ #endif
+-	if (hitMeshIndex == 0)
++#ifdef XW_MODERN
++	const bool xvt = XwXvtComponents_Active();
++#else
++	const bool xvt = false;
++#endif
++	if (hitMeshIndex <= 0)
+ 		return damageAmount;
+ 	meshIndex = hitMeshIndex - 1;
+ 	meshSlot = meshIndex;
+ 	componentHp = g_curCraft->componentHp[meshSlot];
+ 	if (componentHp == 0 || componentHp == STARSHIP_COMPONENT_HP_INDESTRUCTIBLE)
+ 		return damageAmount;
+-	damageAmount >>= STARSHIP_COMPONENT_DAMAGE_SHIFT;
+-	if (componentHp <= damageAmount) {
++	if (xvt) {
++#ifdef XW_MODERN
++		/* XvT Craft_DamageComponent (0x4A6990): hit points are in units of 16 damage, nothing is lost to the
++		 * shift, a hit always does at least 1, and the remainder carries on to the hull. */
++		unsigned componentDamage = 16u * componentHp;
++		if (damageAmount == 0)
++			damageAmount = 1;
++		if (damageAmount < componentDamage) {
++			int remaining = (int)(componentDamage - damageAmount) >> 4;
++			g_curCraft->componentHp[meshSlot] = (uint8_t)(remaining != 0 ? remaining : 1);
++			return 0;
++		}
+ 		g_curCraft->componentHp[meshSlot] = 0;
+-		damageAmount = (damageAmount - componentHp) << STARSHIP_COMPONENT_DAMAGE_SHIFT;
++		damageAmount = (uint16_t)(damageAmount - componentDamage);
++		if (!XwXvtComponents_Destroyed(victimObjIdx, meshIndex))
++			return damageAmount;
++#endif
++	} else
++		damageAmount >>= STARSHIP_COMPONENT_DAMAGE_SHIFT;
++	if (xvt || componentHp <= damageAmount) {
+ 		victimSlot = victimObjIdx;
+-		g_curCraft->componentState[meshSlot] = STARSHIP_COMPONENT_DESTROYED;
++		if (!xvt) {
++			g_curCraft->componentHp[meshSlot] = 0;
++			damageAmount = (damageAmount - componentHp) << STARSHIP_COMPONENT_DAMAGE_SHIFT;
++			g_curCraft->componentState[meshSlot] = STARSHIP_COMPONENT_DESTROYED;
++		}
+ 		objectType = g_objectTable[victimSlot].objectType;
+-		if (objectType == XW_OBJ_CORELLIAN_CORVETTE) {
++		if (xvt) {
++			/* XwXvtComponents_Destroyed applied XvT's effects. */
++		} else if (objectType == XW_OBJ_CORELLIAN_CORVETTE) {
+ 			if (meshIndex == STARSHIP_DESTRUCTION_MESH_2) {
+ 				g_curCraft->weaponSlots[0].firingGate = 0;
+ 				g_curCraft->weaponSlots[1].firingGate = 0;
+diff --git a/src/xw/flight/player/targeting.c b/src/xw/flight/player/targeting.c
+index 5c46120..b412e86 100644
+--- a/src/xw/flight/player/targeting.c
++++ b/src/xw/flight/player/targeting.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/player/targeting.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/snapshot/render_hud.h"
+ #endif
+ #include "xw/assets/model_mesh.h"
+@@ -18,8 +19,14 @@
+ 
+ // FUNCTION: XW 0x42E1B0
+ void Targeting_w_DrawObjectBox(void) {
++#ifdef XW_MODERN
++	/* game.xvt_components: XvT boxes a starship's targeted component (RenderBillboard 0x41F...). */
++	Targeting_DrawObjectBox(g_playerFlightState.currentTargetObjectIdx, XwXvtComponents_BoxComponent(),
++							TARGETING_CURRENT_TARGET_COLOR);
++#else
+ 	Targeting_DrawObjectBox(g_playerFlightState.currentTargetObjectIdx, TARGETING_COMPONENT_NONE,
+ 							TARGETING_CURRENT_TARGET_COLOR);
++#endif
+ }
+ 
+ // FUNCTION: XW 0x42E1D0
+diff --git a/src/xw/flight/player/user.c b/src/xw/flight/player/user.c
+index bf02bf0..8b4e75f 100644
+--- a/src/xw/flight/player/user.c
++++ b/src/xw/flight/player/user.c
+@@ -1,6 +1,7 @@
+ #include "xw/flight/player/user.h"
+ 
+ #ifdef XW_MODERN
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_dos94/render/detail.h"
+ #include "xw_dos94/render/transfm2.h"
+ #include "xw_runtime/hooks/orientation_hook.h"
+@@ -1588,6 +1589,12 @@ void user_inputforplane(void) {
+ 		case USER_KEY_TARGET_ATTACKER_OF_TARGET:
+ 			user_setnewtarget(user_findattackeroftarget(g_playerFlightState.currentTargetObjectIdx));
+ 			break;
++		case USER_KEY_TARGET_COMPONENT_NEXT:
++			XwXvtComponents_Cycle(1);
++			break;
++		case USER_KEY_TARGET_COMPONENT_PREV:
++			XwXvtComponents_Cycle(-1);
++			break;
+ 		case USER_KEY_CRAFT_LIST_FRIENDLY:
+ 			user_togglecraftlist(USER_CRAFT_LIST_FRIENDLY);
+ 			break;
+@@ -2519,6 +2526,9 @@ void user_setnewtarget(uint16_t newTargetObjIdx) {
+ 			g_playerFlightState.currentTargetObjectIdx = newTargetObjIdx;
+ 			g_playerFlightState.missileLockState = 0;
+ 			g_playerFlightState.craft->warheadLockTicks = 0;
++#ifdef XW_MODERN
++			XwXvtComponents_OnNewTarget();
++#endif
+ 			if ((g_playerFlightState.craft->activeHudFeatureMask & USER_HUD_TARGETING_FEATURE) != 0 &&
+ 				g_flightCamera.hudStateLive == USER_TARGET_ANNOUNCEMENT_HUD_STATE &&
+ 				newTargetObjIdx < XW_CRAFT_OBJECT_COUNT) {
+diff --git a/src/xw/flight/player/user.h b/src/xw/flight/player/user.h
+index 2115398..882b528 100644
+--- a/src/xw/flight/player/user.h
++++ b/src/xw/flight/player/user.h
+@@ -60,6 +60,9 @@ enum {
+ 	USER_KEY_ALL_LASERS_TO_SHIELDS = 240,
+ 	/* Modern addition: TIE Fighter's Alt+T time acceleration (1x, 2x, 4x). Handled before recording. */
+ 	USER_KEY_TIME_ACCELERATION = 241,
++	/* Modern additions: X-Wing vs TIE Fighter's , and Shift+, component targeting (game.xvt_components). */
++	USER_KEY_TARGET_COMPONENT_NEXT = 242,
++	USER_KEY_TARGET_COMPONENT_PREV = 243,
+ };
+ 
+ #ifdef XW_MODERN
+diff --git a/src/xw_app/settings/game_page.c b/src/xw_app/settings/game_page.c
+index 8118c7a..5705f06 100644
+--- a/src/xw_app/settings/game_page.c
++++ b/src/xw_app/settings/game_page.c
+@@ -1,6 +1,7 @@
+ #include "xw_app/settings/game_page.h"
+ #include "xw_app/settings/installation_page.h"
+ #include "xw_app/settings/settings.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include "xw_runtime/runtime/profile.h"
+ #include <string.h>
+ 
+@@ -122,6 +123,10 @@ void XwGamePage_Draw(AeronUiContext* ui, const AeronInputSnapshot* input) {
+ 					 (const char* const[]) { "X-Wing (Disabled TIEs Explode)", "Disable Only" }, 2);
+ 	AeronUi_Selector(ui, "Ion Hits", &draft->xvt_ions,
+ 					 (const char* const[]) { "X-Wing", "XvT (System Strength per Craft)" }, 2);
++	AeronUi_Selector(ui, "Starship Components", &draft->xvt_components,
++					 (const char* const[]) { "X-Wing", "XvT (Targetable)" }, 2);
++	if (XwProfile_HasMission() && draft->xvt_components != XwFlightTweaks_XvtComponents())
++		AeronUi_Help(ui, "Component changes apply to craft that arrive after the change.");
+ 	AeronUi_Selector(ui, "Turning", &draft->xvt_turning,
+ 					 (const char* const[]) { "X-Wing", "XvT (Best at 1/3 Throttle)" }, 2);
+ 	AeronUi_Selector(ui, "Twist Roll", &draft->xwa_roll,
+diff --git a/src/xw_remaster/hud_readout.c b/src/xw_remaster/hud_readout.c
+index 8307872..d1731c0 100644
+--- a/src/xw_remaster/hud_readout.c
++++ b/src/xw_remaster/hud_readout.c
+@@ -450,7 +450,7 @@ static void DrawXvtCmd(const XwHudDraw* d, const Pen* pen, const XwSnapReadout*
+ 	if (r->capital) {
+ 		if (r->cargo_valid)
+ 			what = r->target_cargo;
+-		detail = "Hull";
++		detail = r->target_component[0] ? r->target_component : "Hull";
+ 		detail_rgb = XVT_YELLOW;
+ 	}
+ 	Text(pen, left, orders_y, what, XVT_LABEL, width);
+@@ -646,7 +646,9 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		float last = bottom - line - 1, row = last - line;
+ 		Centered(&pen, box, last, dist, VALUE);
+ 		float half = box->width / 2.0f - 3;
+-		if (r->target_order_target[0])
++		if (r->target_component[0])
++			snprintf(detail, sizeof detail, "%s", r->target_component);
++		else if (r->target_order_target[0])
+ 			snprintf(detail, sizeof detail, "%s", r->target_order_target);
+ 		else if (r->cargo_valid)
+ 			snprintf(detail, sizeof detail, "%s", r->target_cargo);
+@@ -727,6 +729,12 @@ bool XwHudCmd_Draw(const XwHudDraw* d) {
+ 		image_bottom -= line;
+ 		Centered(&pen, box, image_bottom + 1, detail, VALUE);
+ 	}
++	if (r->target_component[0]) {
++		char component[32];
++		snprintf(component, sizeof component, "TARGET %s", r->target_component);
++		image_bottom -= line;
++		Centered(&pen, box, image_bottom + 1, component, VALUE);
++	}
+ 
+ 	TargetModel(d, &pen, box, top + (1 + stat_lines) * line, image_bottom, cockpit_off);
+ 	return true;
+diff --git a/src/xw_runtime/config/flight_tweaks.c b/src/xw_runtime/config/flight_tweaks.c
+index 15fc256..72bbfd4 100644
+--- a/src/xw_runtime/config/flight_tweaks.c
++++ b/src/xw_runtime/config/flight_tweaks.c
+@@ -16,6 +16,7 @@ static bool s_start_overshield = true;
+ static bool s_xvt_engine_wash = true;
+ static bool s_ion_disable_only = true;
+ static bool s_xvt_ions = true;
++static bool s_xvt_components = true;
+ static bool s_short_messages = true;
+ static bool s_xvt_damage_display = true;
+ static bool s_skip_empty_warheads = true;
+@@ -45,6 +46,10 @@ bool XwFlightTweaks_XvtIons(void) { return s_xvt_ions; }
+ 
+ void XwFlightTweaks_SetXvtIons(bool enabled) { s_xvt_ions = enabled; }
+ 
++bool XwFlightTweaks_XvtComponents(void) { return s_xvt_components; }
++
++void XwFlightTweaks_SetXvtComponents(bool enabled) { s_xvt_components = enabled; }
++
+ bool XwFlightTweaks_XvtEngineWash(void) { return s_xvt_engine_wash; }
+ 
+ void XwFlightTweaks_SetXvtEngineWash(bool enabled) { s_xvt_engine_wash = enabled; }
+diff --git a/src/xw_runtime/config/flight_tweaks.h b/src/xw_runtime/config/flight_tweaks.h
+index 663843b..a7a43ae 100644
+--- a/src/xw_runtime/config/flight_tweaks.h
++++ b/src/xw_runtime/config/flight_tweaks.h
+@@ -83,6 +83,9 @@ void XwFlightTweaks_SetIonDisableOnly(bool enabled);
+  * player craft loses every system when the count reaches it, and a disabled craft's shields drop to zero. */
+ bool XwFlightTweaks_XvtIons(void);
+ void XwFlightTweaks_SetXvtIons(bool enabled);
++/* game.xvt_components: X-Wing vs TIE Fighter's starship components (xw_runtime/runtime/xvt_components.h). */
++bool XwFlightTweaks_XvtComponents(void);
++void XwFlightTweaks_SetXvtComponents(bool enabled);
+ /* game.short_messages: flight messages stay up half as long (2 s, 3.5 s or 6 s by kind instead of 4, 7 or
+  * 12), and never less than 1.5 s while others wait. */
+ bool XwFlightTweaks_ShortMessages(void);
+diff --git a/src/xw_runtime/config/preference_apply.c b/src/xw_runtime/config/preference_apply.c
+index 1943921..387dfa4 100644
+--- a/src/xw_runtime/config/preference_apply.c
++++ b/src/xw_runtime/config/preference_apply.c
+@@ -42,6 +42,7 @@ static void ApplyFlightTweaks(void) {
+ 	XwFlightTweaks_SetXvtEngineWash(settings->xvt_engine_wash != 0);
+ 	XwFlightTweaks_SetIonDisableOnly(settings->ion_disable_only != 0);
+ 	XwFlightTweaks_SetXvtIons(settings->xvt_ions != 0);
++	XwFlightTweaks_SetXvtComponents(settings->xvt_components != 0);
+ 	XwFlightTweaks_SetShortMessages(settings->short_messages != 0);
+ 	XwFlightTweaks_SetXvtDamageDisplay(settings->xvt_damage_display != 0);
+ 	XwFlightTweaks_SetSkipEmptyWarheads(settings->skip_empty_warheads != 0);
+diff --git a/src/xw_runtime/config/settings.c b/src/xw_runtime/config/settings.c
+index 927cdd0..fec69ab 100644
+--- a/src/xw_runtime/config/settings.c
++++ b/src/xw_runtime/config/settings.c
+@@ -119,6 +119,7 @@ static const XwSettingField g_fields[] = {
+ 	SETTING_BOOL("game.xvt_engine_wash", xvt_engine_wash),
+ 	SETTING_BOOL("game.ion_disable_only", ion_disable_only),
+ 	SETTING_BOOL("game.xvt_ions", xvt_ions),
++	SETTING_BOOL("game.xvt_components", xvt_components),
+ 	SETTING_BOOL("game.short_messages", short_messages),
+ 	SETTING_BOOL("game.xvt_damage_display", xvt_damage_display),
+ 	SETTING_BOOL("game.skip_empty_warheads", skip_empty_warheads),
+diff --git a/src/xw_runtime/config/settings.h b/src/xw_runtime/config/settings.h
+index 0335b40..10067c6 100644
+--- a/src/xw_runtime/config/settings.h
++++ b/src/xw_runtime/config/settings.h
+@@ -41,7 +41,7 @@ typedef struct XwSettings {
+ 	int cockpit_stretch, hud_widescreen, xvt_weapon_sounds, xvt_targeting_computer, restore_pilot;
+ 	int xvt_cockpit, xvt_shields, xvt_turning, start_overshield, xvt_engine_wash, ion_disable_only;
+ 	int short_messages, xvt_damage_display, xvt_control_sounds, skip_empty_warheads, xvt_recharge, xwa_roll;
+-	int xvt_ions;
++	int xvt_ions, xvt_components;
+ 	char xw93_data[XW_PATH_CAPACITY], xw94_data[XW_PATH_CAPACITY], xw98_data[XW_PATH_CAPACITY];
+ 	char ui_font[XW_PATH_CAPACITY];
+ 	int mouse_flight, mouse_sensitivity, mouse_invert_y;
+diff --git a/src/xw_runtime/input/actions.c b/src/xw_runtime/input/actions.c
+index e956bea..cc9b905 100644
+--- a/src/xw_runtime/input/actions.c
++++ b/src/xw_runtime/input/actions.c
+@@ -31,6 +31,9 @@ static const struct {
+ 	{ "target_newest_craft", "Newest craft", XW_INPUT_ACTION_CATEGORY_TARGETING, 232 },
+ 	{ "target_incoming_warhead", "Nearest incoming warhead", XW_INPUT_ACTION_CATEGORY_TARGETING, 233 },
+ 	{ "target_attacker_of_target", "Target's attacker", XW_INPUT_ACTION_CATEGORY_TARGETING, 234 },
++	/* Not in X-Wing: XvT's , and Shift+, (USER_KEY_TARGET_COMPONENT_NEXT / PREV). */
++	{ "target_component_next", "Next target component", XW_INPUT_ACTION_CATEGORY_TARGETING, 242 },
++	{ "target_component_prev", "Previous target component", XW_INPUT_ACTION_CATEGORY_TARGETING, 243 },
+ 	{ "target_preset_recall_1", "Recall target 1", XW_INPUT_ACTION_CATEGORY_TARGETING, 199 },
+ 	{ "target_preset_store_1", "Store target 1", XW_INPUT_ACTION_CATEGORY_TARGETING, 211 },
+ 	{ "target_preset_recall_2", "Recall target 2", XW_INPUT_ACTION_CATEGORY_TARGETING, 200 },
+diff --git a/src/xw_runtime/input/actions.h b/src/xw_runtime/input/actions.h
+index 5743603..b3b8eb1 100644
+--- a/src/xw_runtime/input/actions.h
++++ b/src/xw_runtime/input/actions.h
+@@ -26,6 +26,8 @@ typedef enum XwInputAction {
+ 	XW_INPUT_ACTION_TARGET_NEWEST_CRAFT,
+ 	XW_INPUT_ACTION_TARGET_INCOMING_WARHEAD,
+ 	XW_INPUT_ACTION_TARGET_ATTACKER_OF_TARGET,
++	XW_INPUT_ACTION_TARGET_COMPONENT_NEXT,
++	XW_INPUT_ACTION_TARGET_COMPONENT_PREV,
+ 	XW_INPUT_ACTION_TARGET_PRESET_RECALL_1,
+ 	XW_INPUT_ACTION_TARGET_PRESET_STORE_1,
+ 	XW_INPUT_ACTION_TARGET_PRESET_RECALL_2,
+diff --git a/src/xw_runtime/runtime/xvt_components.c b/src/xw_runtime/runtime/xvt_components.c
+new file mode 100644
+index 0000000..c1f201f
+--- /dev/null
++++ b/src/xw_runtime/runtime/xvt_components.c
+@@ -0,0 +1,323 @@
++#include "xw_runtime/runtime/xvt_components.h"
++#include "xw/assets/model_mesh.h"
++#include "xw/audio/fsfx.h"
++#include "xw/flight/ai/pai.h"
++#include "xw/flight/object/craft.h"
++#include "xw/flight/object/create.h"
++#include "xw/flight/object/laser.h"
++#include "xw/flight/object/starship.h"
++#include "xw/flight/player/user.h"
++#include "xw/flight/xw.h"
++#include "xw/math/trig2.h"
++#include "xw_runtime/config/flight_tweaks.h"
++#include "xw_runtime/runtime/flight_types.h"
++#include <string.h>
++
++/* XvT MeshComponentType values used here. */
++enum {
++	MESH_HULL = 1,
++	MESH_FUSELAGE = 3,
++	MESH_LASER_TURRET = 4,
++	MESH_LASER_GUN = 5,
++	MESH_SHIELD_GENERATOR = 8,
++	MESH_HULL_18 = 18,
++	MESH_ANTENNA = 19,
++	MESH_LASER_TURRET_21 = 21,
++	MESH_TYPE_COUNT = 32,
++	EXPLOSION_ROUTES_DAMAGE = 1,
++	EXPLOSION_DESTROYABLE = 2,
++	COMPONENT_HP_NONE = 0xFF,
++	COMPONENT_SLOTS = 50,
++};
++
++/* XvT 0x524220 g_meshTypeComponentMaxHp, in 16-damage units. */
++static const uint8_t kMaxHp[MESH_TYPE_COUNT] = {
++	0xFF, 0xFF, 0xFF, 0xFF, 0x18, 0x04, 0xFF, 0xFF, 0x40, 0xFF, 0x20, 0x30, 0x30, 0x30, 0x70, 0xFF,
++	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x18, 0x20, 0x30, 0x30, 0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++};
++
++/* XvT strings.txt 1734-1765. */
++static const char* const kNames[MESH_TYPE_COUNT] = {
++	"Hull",		"Hull",		"Wing",		"Fuselage", "Lasr Tur", "Lasr Gun", "Engine",	"Bridge",
++	"Shld Gen", "Enrg Gen", "Whead Ln", "Comm Sys", "Beam Sys", "Comm Sys", "Dock Plt", "Land Plt",
++	"Hangar",	"Cargo",	"Hull",		"Antenna",	"Wing",		"Lasr Tur", "Whead Ln", "Comm Sys",
++	"Beam Sys", "Comm Sys", "Cockpit",	"Hull",		"Hull",		"Hull",		"Hull",		"Hull",
++};
++
++static uint16_t s_target = XW_PLAYER_NO_TARGET;
++static uint8_t s_targetType;
++static uint16_t s_component = XW_XVT_COMPONENT_NONE;
++static struct {
++	uint16_t target, component;
++} s_guidance[LASER_WARHEAD_GUIDANCE_COUNT];
++
++bool XwXvtComponents_Active(void) { return XwFlightTweaks_XvtComponents() && !XwFlightTypes_Dos(); }
++
++static int MeshCount(int objectType) {
++	int count = ModelMesh_GetCachedObjectTypeMeshCount(objectType);
++	return count < 0 ? 0 : count > COMPONENT_SLOTS ? COMPONENT_SLOTS : count;
++}
++
++static const MeshDescriptor* Descriptor(int objectType, int meshIndex) {
++	return meshIndex < MeshCount(objectType) ? ModelMesh_GetCachedDescriptor(objectType, meshIndex) : NULL;
++}
++
++static int MeshType(int objectType, int meshIndex) {
++	const MeshDescriptor* descriptor = Descriptor(objectType, meshIndex);
++	return descriptor ? descriptor->meshType : -1;
++}
++
++/* MeshDescriptor +0x4 is XvT's explosionType, +0x38 its targetId. */
++static int Explosion(int objectType, int meshIndex) {
++	const MeshDescriptor* descriptor = Descriptor(objectType, meshIndex);
++	return descriptor ? descriptor->field_04 : 0;
++}
++
++static int TargetGroup(int objectType, int meshIndex) {
++	const MeshDescriptor* descriptor = Descriptor(objectType, meshIndex);
++	int32_t group = 0;
++	if (descriptor)
++		memcpy(&group, descriptor->gap38, sizeof group);
++	return group;
++}
++
++static bool IsCraft(uint16_t ref) {
++	return ref < XW_CRAFT_OBJECT_COUNT && g_objectTable[ref].objectType != XW_OBJ_NONE &&
++		   g_objectTable[ref].familyId == XW_OBJECT_FAMILY_CRAFT && g_objectTable[ref].instanceData != NULL;
++}
++
++void XwXvtComponents_InitCraft(uint16_t objectIndex) {
++	/* Starfighters keep X-Wing's setup: their guns have no turret firing gate to stop, and X-Wing hides
++	 * their gun meshes. */
++	if (!IsCraft(objectIndex) || g_objectTable[objectIndex].genusId == XW_GENUS_STARFIGHTER)
++		return;
++	CraftData* craft = g_objectTable[objectIndex].instanceData;
++	int objectType = g_objectTable[objectIndex].objectType;
++	for (unsigned i = 0; i < COMPONENT_SLOTS; ++i) {
++		craft->componentState[i] = 0;
++		craft->meshRotation[i] = 0;
++		craft->componentHp[i] = COMPONENT_HP_NONE;
++	}
++	/* XvT Mission spawn (0x45F0F0): hit points for every destroyable mesh. */
++	int count = MeshCount(objectType);
++	for (int mesh = 0; mesh < count; ++mesh) {
++		int type = MeshType(objectType, mesh);
++		if (type >= 0 && type < MESH_TYPE_COUNT && (Explosion(objectType, mesh) & EXPLOSION_DESTROYABLE))
++			craft->componentHp[mesh] = kMaxHp[type];
++	}
++}
++
++bool XwXvtComponents_RouteDamage(uint16_t victimObjIdx, int16_t hitMeshIndex) {
++	if (hitMeshIndex <= 0 || !IsCraft(victimObjIdx) || g_objectTable[victimObjIdx].genusId == XW_GENUS_STARFIGHTER)
++		return false;
++	int objectType = g_objectTable[victimObjIdx].objectType, mesh = hitMeshIndex - 1;
++	if (!(Explosion(objectType, mesh) & EXPLOSION_ROUTES_DAMAGE))
++		return false;
++	const CraftData* craft = g_objectTable[victimObjIdx].instanceData;
++	/* XvT 0x41FC50 (difficulty above easy): components only once both shield banks are empty. X-Wing's ISD
++	 * shield generators take hits through the shields, which its missions are built around. */
++	return MeshType(objectType, mesh) == MESH_SHIELD_GENERATOR ||
++		   craft->shieldEnergy[XW_SHIELD_FRONT] + craft->shieldEnergy[XW_SHIELD_REAR] <= 0;
++}
++
++/* XvT selects by mesh (Craft_IsSelectableDamageComponentMesh): not the decorative hull pieces, and only the
++ * first mesh of each hull target group. */
++static bool Selectable(int objectType, int mesh) {
++	int type = MeshType(objectType, mesh);
++	if (type < 0 || type == MESH_HULL_18 || type == MESH_ANTENNA)
++		return false;
++	int group = TargetGroup(objectType, mesh);
++	if (group == 0 || (group == 1 && type != MESH_HULL && type != MESH_FUSELAGE))
++		return true;
++	int count = MeshCount(objectType);
++	for (int other = 0; other < count; ++other)
++		if (TargetGroup(objectType, other) == group && MeshType(objectType, other) == type)
++			return other == mesh;
++	return false;
++}
++
++static bool Intact(const CraftData* craft, int objectType, int mesh) {
++	return craft->componentState[mesh] == 0 && craft->componentHp[mesh] != 0 && Selectable(objectType, mesh);
++}
++
++void XwXvtComponents_DistanceTo(uint16_t fromRef, uint16_t toRef, uint16_t meshIndex) {
++	int toX, toY, toZ;
++	create_getworldposition(toRef, 0);
++	toX = g_resolvedWorldX;
++	toY = g_resolvedWorldY;
++	toZ = g_resolvedWorldZ;
++	if (meshIndex != XW_XVT_COMPONENT_NONE && IsCraft(toRef)) {
++		int objectType = g_objectTable[toRef].objectType;
++		/* As Targeting_ProjectObjectOrMissionPoint places a component. */
++		pai_RotateLocalVectorToWorldScratch(&g_objectTable[toRef], ModelMesh_GetCenterX(objectType, meshIndex),
++											ModelMesh_GetCenterZ(objectType, meshIndex),
++											(int32_t)(0u - (uint32_t)ModelMesh_GetCenterY(objectType, meshIndex)));
++		toX = (int32_t)((uint32_t)toX + (uint32_t)g_rotatedX);
++		toY = (int32_t)((uint32_t)toY + (uint32_t)g_rotatedY);
++		toZ = (int32_t)((uint32_t)toZ + (uint32_t)g_rotatedZ);
++	}
++	create_getworldposition(fromRef, 0);
++	trig2_ctop((int)((unsigned)toX - (unsigned)g_resolvedWorldX), (int)((unsigned)toY - (unsigned)g_resolvedWorldY),
++			   (int)((unsigned)toZ - (unsigned)g_resolvedWorldZ));
++}
++
++/* XvT Player_SelectTargetComponentMesh: the nearest hull or fuselage of a starship; the first one of any
++ * other craft. */
++static uint16_t AutoSelect(uint16_t target) {
++	int objectType = g_objectTable[target].objectType, count = MeshCount(objectType);
++	bool starship = g_objectTable[target].genusId == XW_GENUS_STARSHIP;
++	uint16_t best = 0;
++	uint32_t nearest = UINT32_MAX;
++	int32_t polar = g_trig2PolarDistance;
++	int16_t pitch = g_trig2Pitch, yaw = g_trig2Yaw;
++	for (int mesh = 0; mesh < count; ++mesh) {
++		int type = MeshType(objectType, mesh);
++		if (type != MESH_HULL && type != MESH_FUSELAGE)
++			continue;
++		if (!starship) {
++			best = (uint16_t)mesh;
++			break;
++		}
++		XwXvtComponents_DistanceTo(g_playerFlightState.objectIndex, target, (uint16_t)mesh);
++		if ((uint32_t)g_trig2PolarDistance < nearest) {
++			nearest = (uint32_t)g_trig2PolarDistance;
++			best = (uint16_t)mesh;
++		}
++	}
++	g_trig2PolarDistance = polar;
++	g_trig2Pitch = pitch;
++	g_trig2Yaw = yaw;
++	return best;
++}
++
++void XwXvtComponents_OnNewTarget(void) {
++	uint16_t target = g_playerFlightState.currentTargetObjectIdx;
++	s_target = target;
++	s_component = XW_XVT_COMPONENT_NONE;
++	if (!XwXvtComponents_Active() || !IsCraft(target) || g_objectTable[target].genusId == XW_GENUS_STARFIGHTER)
++		return;
++	s_targetType = (uint8_t)g_objectTable[target].objectType;
++	s_component = AutoSelect(target);
++}
++
++uint16_t XwXvtComponents_Selected(void) {
++	uint16_t target = g_playerFlightState.currentTargetObjectIdx;
++	if (!XwXvtComponents_Active() || !IsCraft(target) || g_objectTable[target].genusId == XW_GENUS_STARFIGHTER)
++		return XW_XVT_COMPONENT_NONE;
++	/* Targets set without user_setnewtarget, or a slot reused by a new craft. */
++	if (target != s_target || g_objectTable[target].objectType != s_targetType)
++		XwXvtComponents_OnNewTarget();
++	return s_component;
++}
++
++uint16_t XwXvtComponents_BoxComponent(void) {
++	uint16_t component = XwXvtComponents_Selected();
++	uint16_t target = g_playerFlightState.currentTargetObjectIdx;
++	return component != XW_XVT_COMPONENT_NONE && g_objectTable[target].genusId == XW_GENUS_STARSHIP
++			   ? component
++			   : XW_XVT_COMPONENT_NONE;
++}
++
++static bool Advance(uint16_t target, int direction) {
++	const CraftData* craft = g_objectTable[target].instanceData;
++	int objectType = g_objectTable[target].objectType, count = MeshCount(objectType);
++	if (count <= 0)
++		return false;
++	int mesh = s_component == XW_XVT_COMPONENT_NONE ? (direction > 0 ? -1 : 0) : s_component;
++	for (int attempt = 0; attempt < count; ++attempt) {
++		mesh = (mesh + direction + count) % count;
++		if (Intact(craft, objectType, mesh)) {
++			s_component = (uint16_t)mesh;
++			return true;
++		}
++	}
++	return false;
++}
++
++void XwXvtComponents_Cycle(int direction) {
++	if (XwXvtComponents_Selected() == XW_XVT_COMPONENT_NONE)
++		return;
++	if (Advance(g_playerFlightState.currentTargetObjectIdx, direction < 0 ? -1 : 1))
++		fsfx_triggersfx(FSFX_TARGET_SELECTED_SLOT, FSFX_UNPOSITIONED_OBJECT);
++}
++
++const char* XwXvtComponents_Name(int objectType, uint16_t meshIndex) {
++	int type = MeshType(objectType, meshIndex);
++	return type >= 0 && type < MESH_TYPE_COUNT ? kNames[type] : "";
++}
++
++/* Which turret or gun mesh carries an X-Wing weapon slot: the nearest one to its hardpoint (X-Wing's table
++ * has no mesh index; for the corvette this gives X-Wing's own mesh 2 = slots 0-1, mesh 0 = slots 2-3). */
++static int SlotMesh(const CraftData* craft, int objectType, unsigned slot) {
++	const XwWeaponHardpoint* point = &g_craftTypeDefs[craft->craftTypeIndex].weaponHardpoints[slot];
++	/* Hardpoints are (side, up, forward); mesh centres (x, y, z) with forward = -y. */
++	int64_t side = point->x, up = point->z, forward = point->y;
++	int best = -1, count = MeshCount(objectType);
++	int64_t nearest = INT64_MAX;
++	for (int mesh = 0; mesh < count; ++mesh) {
++		int type = MeshType(objectType, mesh);
++		if (type != MESH_LASER_TURRET && type != MESH_LASER_GUN && type != MESH_LASER_TURRET_21)
++			continue;
++		int64_t dx = ModelMesh_GetCenterX(objectType, mesh) - side;
++		int64_t dy = -ModelMesh_GetCenterY(objectType, mesh) - forward;
++		int64_t dz = ModelMesh_GetCenterZ(objectType, mesh) - up;
++		int64_t distance = dx * dx + dy * dy + dz * dz;
++		if (distance < nearest) {
++			nearest = distance;
++			best = mesh;
++		}
++	}
++	return best;
++}
++
++bool XwXvtComponents_Destroyed(uint16_t victimObjIdx, uint16_t meshIndex) {
++	if (!IsCraft(victimObjIdx))
++		return false;
++	CraftData* craft = g_objectTable[victimObjIdx].instanceData;
++	int objectType = g_objectTable[victimObjIdx].objectType;
++	if (!(Explosion(objectType, meshIndex) & EXPLOSION_DESTROYABLE))
++		return false;
++	craft->componentState[meshIndex] = STARSHIP_COMPONENT_DESTROYED;
++
++	/* XvT Craft_DamageComponent: a player whose selected component goes moves on to the next one. */
++	if (victimObjIdx == g_playerFlightState.currentTargetObjectIdx && victimObjIdx == s_target &&
++		s_component == meshIndex)
++		Advance(victimObjIdx, 1);
++
++	int type = MeshType(objectType, meshIndex);
++	if (type == MESH_LASER_TURRET || type == MESH_LASER_GUN || type == MESH_LASER_TURRET_21) {
++		/* XvT fires each slot from its mesh only while the mesh has hit points (0x404710, 0x4166A0). The
++		 * starship turret sweep skips slots whose firingGate is 0, as for X-Wing's corvette turrets. */
++		for (unsigned slot = 0; slot < craft->laserSlotCount && slot < 12; ++slot)
++			if (craft->weaponSlots[slot].firingGate != 0 && SlotMesh(craft, objectType, slot) == meshIndex) {
++				craft->weaponSlots[slot].firingGate = 0;
++				craft->weaponSlots[slot].laserCharge = 0;
++			}
++	} else if (type == MESH_SHIELD_GENERATOR) {
++		/* X-Wing's ISD rule for every craft with generators: the last one takes the shields with it. */
++		int count = MeshCount(objectType);
++		for (int mesh = 0; mesh < count; ++mesh)
++			if (MeshType(objectType, mesh) == MESH_SHIELD_GENERATOR && craft->componentHp[mesh] != 0)
++				return true;
++		craft->shieldEnergy[XW_SHIELD_FRONT] = 0;
++		craft->shieldEnergy[XW_SHIELD_REAR] = 0;
++		craft->workingSubsystems &= (uint8_t)~XW_CRAFT_SUBSYSTEM_SHIELDS;
++	}
++	return true;
++}
++
++void XwXvtComponents_SetGuidance(unsigned guidanceIndex, uint16_t target, uint16_t meshIndex) {
++	if (guidanceIndex < LASER_WARHEAD_GUIDANCE_COUNT) {
++		s_guidance[guidanceIndex].target = target;
++		s_guidance[guidanceIndex].component = meshIndex;
++	}
++}
++
++uint16_t XwXvtComponents_Guidance(unsigned guidanceIndex, uint16_t target) {
++	/* Slots also launched by paths that never set this (surface guns, starship turrets): the target must
++	 * match. */
++	if (guidanceIndex >= LASER_WARHEAD_GUIDANCE_COUNT || !XwXvtComponents_Active() ||
++		s_guidance[guidanceIndex].target != target || !IsCraft(target))
++		return XW_XVT_COMPONENT_NONE;
++	return s_guidance[guidanceIndex].component;
++}
+diff --git a/src/xw_runtime/runtime/xvt_components.h b/src/xw_runtime/runtime/xvt_components.h
+new file mode 100644
+index 0000000..67d4554
+--- /dev/null
++++ b/src/xw_runtime/runtime/xvt_components.h
+@@ -0,0 +1,57 @@
++#ifndef XW_RUNTIME_RUNTIME_XVT_COMPONENTS_H
++#define XW_RUNTIME_RUNTIME_XVT_COMPONENTS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct CraftData;
++
++/* game.xvt_components: starship components as in X-Wing vs TIE Fighter (1998 flight only). The OPT's mesh
++ * descriptors decide everything, as in XvT: every mesh with explosion flag 2 gets XvT's hit points for its
++ * type (g_meshTypeComponentMaxHp) and stays visible (X-Wing hides the turrets of every starship but the
++ * corvette); laser and warhead hits on a mesh with explosion flag 1 go to the component first once the
++ * craft's shields are down (shield generators take them at any time, as X-Wing's ISD generators do); a
++ * destroyed turret or gun stops the weapon slots it carries; losing the last shield generator drops the
++ * shields; and the player can target components (, and Shift+,), shown in the CMD, boxed on the HUD, used
++ * for the CMD range and warhead lock, and homed on by warheads. Mesh indices are 0-based. */
++enum { XW_XVT_COMPONENT_NONE = 0xFFFF };
++
++bool XwXvtComponents_Active(void);
++
++/* create.c: replace X-Wing's component setup for a new craft (not starfighters). */
++void XwXvtComponents_InitCraft(uint16_t objectIndex);
++
++/* collide_damagecraft: whether a hit on mesh ordinal hitMeshIndex (1-based, as passed) goes to the
++ * component first. */
++bool XwXvtComponents_RouteDamage(uint16_t victimObjIdx, int16_t hitMeshIndex);
++
++/* starship_damagecomponent, once a component's hit points reach zero: XvT's effects. False when the mesh
++ * is not destroyable (no explosion, it stays drawn). */
++bool XwXvtComponents_Destroyed(uint16_t victimObjIdx, uint16_t meshIndex);
++
++/* The player's targeted component of the current target, or XW_XVT_COMPONENT_NONE. */
++uint16_t XwXvtComponents_Selected(void);
++/* The component to box and range: the selection when the target is a starship. */
++uint16_t XwXvtComponents_BoxComponent(void);
++/* user_setnewtarget: pick the nearest hull section, as XvT does. */
++void XwXvtComponents_OnNewTarget(void);
++/* , and Shift+,: the next or previous selectable component that is still intact. */
++void XwXvtComponents_Cycle(int direction);
++/* XvT's component name ("Lasr Tur", "Shld Gen"...). */
++const char* XwXvtComponents_Name(int objectType, uint16_t meshIndex);
++
++/* pai_distancebetween to the centre of toRef's mesh (trig2 polar globals). */
++void XwXvtComponents_DistanceTo(uint16_t fromRef, uint16_t toRef, uint16_t meshIndex);
++
++/* Warheads the player launches home on the targeted component. */
++void XwXvtComponents_SetGuidance(unsigned guidanceIndex, uint16_t target, uint16_t meshIndex);
++uint16_t XwXvtComponents_Guidance(unsigned guidanceIndex, uint16_t target);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/xw_runtime/snapshot/render_readout.c b/src/xw_runtime/snapshot/render_readout.c
+index c780a3a..400330c 100644
+--- a/src/xw_runtime/snapshot/render_readout.c
++++ b/src/xw_runtime/snapshot/render_readout.c
+@@ -19,6 +19,7 @@
+ #include "xw_dos94/flight/hud/replay.h"
+ #include "xw_runtime/runtime/flight_panel.h"
+ #include "xw_runtime/runtime/flight_types.h"
++#include "xw_runtime/runtime/xvt_components.h"
+ #include "xw_runtime/snapshot/render_objects.h"
+ #include <ctype.h>
+ #include <math.h>
+@@ -224,7 +225,13 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 	/* pai_distancebetween changes trig2 globals; keep the CMD's distance scale (units * 161 >> 16). */
+ 	int32_t polar = g_trig2PolarDistance;
+ 	int16_t pitch = g_trig2Pitch, yaw = g_trig2Yaw;
+-	pai_distancebetween(g_playerFlightState.objectIndex, ref);
++	/* game.xvt_components: XvT ranges a starship by its targeted component (Hud 0x4314F0). */
++	uint16_t component = ref == g_playerFlightState.currentTargetObjectIdx ? XwXvtComponents_BoxComponent()
++																		  : XW_XVT_COMPONENT_NONE;
++	if (component != XW_XVT_COMPONENT_NONE)
++		XwXvtComponents_DistanceTo(g_playerFlightState.objectIndex, ref, component);
++	else
++		pai_distancebetween(g_playerFlightState.objectIndex, ref);
+ 	unsigned hundredths = (unsigned)(((uint64_t)(uint32_t)g_trig2PolarDistance * PANEL_DISTANCE_SCALE) >>
+ 									 PANEL_DISTANCE_SCALE_SHIFT);
+ 	r->target_distance_hundredths = (uint16_t)(hundredths > 9999 ? 9999 : hundredths);
+@@ -265,6 +272,12 @@ static void CaptureTarget(XwSnapReadout* r) {
+ 	}
+ 	uint8_t genus = g_objectTable[ref].genusId;
+ 	r->capital = genus == XW_GENUS_STARSHIP || genus == XW_GENUS_FREIGHTER;
++	if (r->capital && ref == g_playerFlightState.currentTargetObjectIdx) {
++		uint16_t component = XwXvtComponents_Selected();
++		if (component != XW_XVT_COMPONENT_NONE)
++			CopyText(r->target_component, sizeof r->target_component,
++					 XwXvtComponents_Name(g_objectTable[ref].objectType, component));
++	}
+ 	if (craft->aiCurrentPlanId < USER_AI_STATUS_COUNT) {
+ 		unsigned message = g_aiPlanStatusMessageIds[craft->aiCurrentPlanId];
+ 		if (message && message < XW_MSG_TEMPLATE_COUNT)
+diff --git a/src/xw_runtime/snapshot/render_types.h b/src/xw_runtime/snapshot/render_types.h
+index 264a99e..fd24a25 100644
+--- a/src/xw_runtime/snapshot/render_types.h
++++ b/src/xw_runtime/snapshot/render_types.h
+@@ -251,6 +251,7 @@ typedef struct XwSnapReadout {
+ 	XwSnapRect cmd;                      /* The CMD screen in classic cockpit pixels. */
+ 	char target_name[32], target_cargo[20], target_orders[40], target_order_target[32];
+ 	char target_order_word[16]; /* XvT's one-word form of target_orders ("Attacking"). */
++	char target_component[16];  /* game.xvt_components: the targeted component ("Shld Gen"), or "". */
+ 	/* view_target (Z): XvT's threat display. The destination is the target's current AI aim (waypoint or
+ 	 * craft); time_remaining_s is -1 when unknown (stationary). */
+ 	uint8_t threat_view, destination_valid;

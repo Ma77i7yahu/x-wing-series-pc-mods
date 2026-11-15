@@ -1,0 +1,73 @@
+From 1048c0c891f3f922bcda3dc28ec64d1bf71a5522 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 21:47:35 +1100
+Subject: [PATCH 16/25] Converge player cannons on the target ahead, 550 m
+ otherwise
+
+---
+ resources/config.yaml         |  5 +++--
+ src/xvt/flight/object/laser.c | 24 +++++++++++++++++++++---
+ 2 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 2b14dad..6b75008 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -445,5 +445,6 @@ effects:
+ 
+ flight:
+   update_rate: unlocked
+-  # Metres ahead where player cannons converge (X-Wing Alliance style); 0 = parallel.
+-  laser_convergence: 600
++  # X-Wing Alliance style cannon convergence: on the current target when it is
++  # ahead (0.1-2.5 km), otherwise this many metres ahead; 0 = parallel fire.
++  laser_convergence: 550
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index 25f97ee..231530b 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -31,6 +31,7 @@
+ #include "xvt/render/renderer.h"
+ #include "xvt/util/game_rand.h"
+ #include <limits.h>
++#include <math.h>
+ 
+ // GLOBAL: XVT 0x51A3B8
+ const struct ProjectileTypeDataTables g_projectileDamageByObjectType = {
+@@ -1123,9 +1124,9 @@ int laser_firemissile(int objectIndex, int weaponSlotIndex, int projectileTypeId
+ // FUNCTION: XVT 0x4065D0
+ #ifdef XVT_MODERN
+ /* X-Wing Alliance style convergence: aim a player's cannon bolt from its
+- * hardpoint at a point the configured distance straight ahead of the craft,
+- * instead of parallel to the nose. Single-player only, since the setting is
+- * local and multiplayer simulations must agree. */
++ * hardpoint at a point straight ahead of the craft (at the target's range, or
++ * the configured distance), instead of parallel to the nose. Single-player
++ * only, since the setting is local and multiplayer simulations must agree. */
+ static void laser_ConvergePlayerBolt(const ObjectRecord* source, ObjectRecord* bolt, int projectileObjectType) {
+ 	enum { UNITS_PER_KM = 40706 }; /* the HUD shows distance as units * 161 / 65536 hundredths of a km */
+ 	const XvtSettings* settings = XvtConfig_Settings();
+@@ -1136,6 +1137,23 @@ static void laser_ConvergePlayerBolt(const ObjectRecord* source, ObjectRecord* b
+ 		if (player != g_localPlayer && g_players[player].network.directPlayId != 0)
+ 			return;
+ 	int distance = (int)((int64_t)metres * UNITS_PER_KM / 1000);
++	/* Like XWA, converge on the current target when it is ahead of the nose:
++	 * its distance along the forward axis, while within about 30 degrees of it. */
++	{
++		enum { COS_30_Q15 = 28378, MIN_UNITS = UNITS_PER_KM / 10, MAX_UNITS = UNITS_PER_KM * 5 / 2 };
++		uint16_t target = (uint16_t)g_players[source->playerOwnerIdx].currentTargetObjectIdx;
++		if (target != UINT16_MAX && target < 0x8000u && g_objectTable[target].objectType != 0) {
++			int64_t dx = g_objectTable[target].world_x - source->world_x;
++			int64_t dy = g_objectTable[target].world_y - source->world_y;
++			int64_t dz = g_objectTable[target].world_z - source->world_z;
++			int64_t along = (dx * source->mobj->cachedFwdX + dy * source->mobj->cachedFwdY +
++							 dz * source->mobj->cachedFwdZ) >> 15;
++			double range = sqrt((double)dx * dx + (double)dy * dy + (double)dz * dz);
++			if (along >= MIN_UNITS && along <= MAX_UNITS && range > 0 &&
++				along * 32768.0 >= COS_30_Q15 * range)
++				distance = (int)along;
++		}
++	}
+ 	/* The muzzle is the hardpoint position; the bolt starts a launch offset ahead of it. */
+ 	int muzzleX = bolt->mobj->prevWorldX, muzzleY = bolt->mobj->prevWorldY, muzzleZ = bolt->mobj->prevWorldZ;
+ 	int pointX = source->world_x + Math_MulQ15(distance, source->mobj->cachedFwdX);

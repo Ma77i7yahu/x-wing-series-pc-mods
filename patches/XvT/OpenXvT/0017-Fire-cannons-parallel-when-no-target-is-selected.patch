@@ -1,0 +1,38 @@
+From 6986667ff4ac4f7ec87cf728ff35c267cf185642 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 21:48:19 +1100
+Subject: [PATCH 17/25] Fire cannons parallel when no target is selected
+
+---
+ resources/config.yaml         | 3 ++-
+ src/xvt/flight/object/laser.c | 5 ++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/resources/config.yaml b/resources/config.yaml
+index 6b75008..1808b62 100644
+--- a/resources/config.yaml
++++ b/resources/config.yaml
+@@ -446,5 +446,6 @@ effects:
+ flight:
+   update_rate: unlocked
+   # X-Wing Alliance style cannon convergence: on the current target when it is
+-  # ahead (0.1-2.5 km), otherwise this many metres ahead; 0 = parallel fire.
++  # ahead (0.1-2.5 km), otherwise this many metres ahead; parallel with no
++  # target selected. 0 = always parallel.
+   laser_convergence: 550
+diff --git a/src/xvt/flight/object/laser.c b/src/xvt/flight/object/laser.c
+index 231530b..cde6c7a 100644
+--- a/src/xvt/flight/object/laser.c
++++ b/src/xvt/flight/object/laser.c
+@@ -1142,7 +1142,10 @@ static void laser_ConvergePlayerBolt(const ObjectRecord* source, ObjectRecord* b
+ 	{
+ 		enum { COS_30_Q15 = 28378, MIN_UNITS = UNITS_PER_KM / 10, MAX_UNITS = UNITS_PER_KM * 5 / 2 };
+ 		uint16_t target = (uint16_t)g_players[source->playerOwnerIdx].currentTargetObjectIdx;
+-		if (target != UINT16_MAX && target < 0x8000u && g_objectTable[target].objectType != 0) {
++		/* No target selected: fire parallel, as the original game does. */
++		if (target == UINT16_MAX || target >= 0x8000u || g_objectTable[target].objectType == 0)
++			return;
++		{
+ 			int64_t dx = g_objectTable[target].world_x - source->world_x;
+ 			int64_t dy = g_objectTable[target].world_y - source->world_y;
+ 			int64_t dz = g_objectTable[target].world_z - source->world_z;

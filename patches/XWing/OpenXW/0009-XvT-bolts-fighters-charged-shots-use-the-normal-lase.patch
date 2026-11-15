@@ -1,0 +1,41 @@
+From bf9521f1abfdd42689da74ab9b61be3faacfe1fb Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 12:03:24 +1100
+Subject: [PATCH 09/59] XvT bolts: fighters' charged shots use the normal
+ laser/ion model, not the turbolaser one
+
+---
+ src/xw_remaster/flight_scene.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/xw_remaster/flight_scene.c b/src/xw_remaster/flight_scene.c
+index 207a7f5..9255c02 100644
+--- a/src/xw_remaster/flight_scene.c
++++ b/src/xw_remaster/flight_scene.c
+@@ -10,6 +10,8 @@
+ #include "xw_remaster/lighting.h"
+ #include "xw_remaster/sky.h"
+ #include "xw_remaster/special_world.h"
++#include "xw/flight/object/object.h"
++#include "xw_runtime/config/flight_tweaks.h"
+ #include <aeron/aeron.h>
+ #include <aeron/asset/opt_model.h>
+ #include <stdlib.h>
+@@ -115,6 +117,17 @@ static bool Submit(const XwRenderSnapshot* s, const XwPreparedFlight* frame, boo
+ 		const XwSnapObject* object = &s->objects[i];
+ 		if (!XwShip_Eligible(s, object))
+ 			continue;
++		/* game.xvt_lasers: X-Wing draws a fighter's charged shot (144/146/148) with the turbolaser model; XvT
++		 * fighters always fire the normal bolt, and only starships use the turbolaser models. */
++		XwSnapObject xvt_bolt;
++		if (XwFlightTweaks_XvtLasers() && XwShip_Projectile(object) &&
++			(object->type == XW_OBJ_LASER_144 || object->type == XW_OBJ_LASER_146 || object->type == XW_OBJ_ION_148) &&
++			object->source_type < set->bindings.type_count &&
++			set->bindings.types[object->source_type].genus == XW_GENUS_STARFIGHTER) {
++			xvt_bolt = *object;
++			--xvt_bolt.type;
++			object = &xvt_bolt;
++		}
+ 		XwShipSelection selection;
+ 		int selected = XwShip_Select(&set->bindings, object, &selection);
+ 		if (selected < 0)

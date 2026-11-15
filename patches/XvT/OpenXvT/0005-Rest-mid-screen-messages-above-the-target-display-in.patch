@@ -1,0 +1,124 @@
+From b83517631e57ac0108bc8ec88dae9a02cf194c25 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Wed, 7 Oct 2026 22:29:46 +1100
+Subject: [PATCH 05/25] Rest mid-screen messages above the target display in
+ widescreen HUD
+
+---
+ src/xvt_remaster/hud_assets.c   | 15 +++++++++++++--
+ src/xvt_remaster/hud_assets.h   |  2 ++
+ src/xvt_remaster/hud_draw.h     |  3 +++
+ src/xvt_remaster/hud_panes.c    | 13 +++++++++++++
+ src/xvt_remaster/hud_renderer.c |  1 +
+ 5 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/xvt_remaster/hud_assets.c b/src/xvt_remaster/hud_assets.c
+index 04bae24..c2d029d 100644
+--- a/src/xvt_remaster/hud_assets.c
++++ b/src/xvt_remaster/hud_assets.c
+@@ -274,7 +274,8 @@ static int CompareElementArea(const void* a, const void* b) {
+  * center lies inside a larger element's box inherit its zone (radar blips,
+  * text inside frames), the rest are placed by which third holds their center.
+  * owner receives each pixel's zone + 1 and regions each element box's zone + 1. */
+-static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t* owner, uint8_t* regions) {
++static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t* owner, uint8_t* regions,
++						   int16_t* console_top) {
+ 	size_t pixels = (size_t)width * height;
+ 	int32_t* labels = calloc(pixels, sizeof *labels);
+ 	int32_t* stack = malloc(pixels * sizeof *stack);
+@@ -342,6 +343,14 @@ static int AssignBaseZones(const uint8_t* rgba, int width, int height, uint8_t*
+ 			}
+ 			for (size_t pixel = 0; pixel < pixels; ++pixel)
+ 				owner[pixel] = labels[pixel] ? elements[labels[pixel] - 1].zone : 0;
++			/* The console is the center element reaching the bottom quarter. */
++			*console_top = 0;
++			for (unsigned index = 0; index < count; ++index) {
++				const BaseElement* element = &elements[index];
++				if (element->zone == XVT_HUD_ZONE_CENTER + 1 && element->bottom * 4 >= height * 3 &&
++					element->top * 2 > height && (!*console_top || element->top < *console_top))
++					*console_top = (int16_t)element->top;
++			}
+ 		} else if (ok)
+ 			memset(owner, 0, pixels);
+ 		free(order);
+@@ -380,7 +389,8 @@ static int BuildBase(AeronCommandBuffer* cmd, XvtHudAssetSet* set) {
+ 	uint8_t* owner = rgba ? malloc(pixels) : NULL;
+ 	uint8_t* zoned = owner ? malloc(pixels * 4 * XVT_HUD_ZONE_COUNT) : NULL;
+ 	set->base_zones = zoned ? calloc(pixels, 1) : NULL;
+-	int ok = set->base_zones && AssignBaseZones(rgba, bitmap.width, bitmap.height, owner, set->base_zones);
++	int ok = set->base_zones && AssignBaseZones(rgba, bitmap.width, bitmap.height, owner, set->base_zones,
++												&set->base_console_top);
+ 	AeronRuntimeAtlasFrame frames[XVT_HUD_ZONE_COUNT];
+ 	for (unsigned zone = 0; ok && zone < XVT_HUD_ZONE_COUNT; ++zone) {
+ 		uint8_t* frame = zoned + pixels * 4 * zone;
+@@ -510,6 +520,7 @@ int XvtHudAssets_PrepareResources(AeronCommandBuffer* cmd, const XvtCockpitResou
+ 			set->base_zones = shared->base_zones;
+ 			set->base_zones_width = shared->base_zones_width;
+ 			set->base_zones_height = shared->base_zones_height;
++			set->base_console_top = shared->base_console_top;
+ 		} else {
+ 			g_pending->owns_base[view] = 1;
+ 			if (!BuildBase(cmd, set)) {
+diff --git a/src/xvt_remaster/hud_assets.h b/src/xvt_remaster/hud_assets.h
+index 38dacbc..c4708f0 100644
+--- a/src/xvt_remaster/hud_assets.h
++++ b/src/xvt_remaster/hud_assets.h
+@@ -19,6 +19,8 @@ typedef struct XvtHudAssetSet {
+ 	/* Per-pixel zone (0 = unassigned) covering each element's bounding box. */
+ 	uint8_t* base_zones;
+ 	uint16_t base_zones_width, base_zones_height;
++	/* Top row of the bottom-center console (target display), or 0 when none. */
++	int16_t base_console_top;
+ 	uint64_t base_asset_id;
+ 	uint32_t palette[256];
+ 	uint16_t part_count;
+diff --git a/src/xvt_remaster/hud_draw.h b/src/xvt_remaster/hud_draw.h
+index d34b4ba..c01ed8f 100644
+--- a/src/xvt_remaster/hud_draw.h
++++ b/src/xvt_remaster/hud_draw.h
+@@ -15,6 +15,9 @@ typedef struct XvtHudDraw {
+ 	/* Message panes that start above this source row move down by
+ 	 * message_shift, making room for the cockpit panel strip. */
+ 	int message_top, message_shift;
++	/* When nonzero, mid-screen message panes sit just above this source row
++	 * (the console top) instead of near the aiming reticle. */
++	int message_floor;
+ 	int width, height;
+ } XvtHudDraw;
+ 
+diff --git a/src/xvt_remaster/hud_panes.c b/src/xvt_remaster/hud_panes.c
+index 3782266..8e8fa1b 100644
+--- a/src/xvt_remaster/hud_panes.c
++++ b/src/xvt_remaster/hud_panes.c
+@@ -133,6 +133,19 @@ int XvtHudPanes_DrawMessages(const XvtHudDraw* draw) {
+ 		XvtSnapRect placement = message->placement;
+ 		if (placement.y < draw->message_top)
+ 			placement.y += draw->message_shift;
++		else if (draw->message_floor && message->visible && placement.y * 3 > draw->layout->source_height &&
++				 placement.y < draw->message_floor &&
++				 message->first_glyph + message->glyph_count <= draw->state->overlay_content.glyph_count) {
++			/* Rest the text's lowest line two rows above the console. */
++			int bottom = 0;
++			for (unsigned index = 0; index < message->glyph_count; ++index) {
++				const XvtCockpitGlyph* glyph = &draw->state->overlay_content.glyphs[message->first_glyph + index];
++				if (glyph->y + glyph->height > bottom)
++					bottom = glyph->y + glyph->height;
++			}
++			if (bottom)
++				placement.y = draw->message_floor - 2 - bottom;
++		}
+ 		if (message->visible && !DrawOverlayGlyphs(draw, message->first_glyph, message->glyph_count,
+ 												   placement, XVT_COCKPIT_AFTER_CRT))
+ 			return 0;
+diff --git a/src/xvt_remaster/hud_renderer.c b/src/xvt_remaster/hud_renderer.c
+index 41e98fe..a885dcd 100644
+--- a/src/xvt_remaster/hud_renderer.c
++++ b/src/xvt_remaster/hud_renderer.c
+@@ -132,6 +132,7 @@ int XvtHudRenderer_Prepare(AeronCommandBuffer* cmd, const XvtCockpitState* state
+ 	if (panel) {
+ 		draw.message_top = XvtHudInstruments_PanelBottom(&draw);
+ 		draw.message_shift = draw.message_top;
++		draw.message_floor = draw.assets ? draw.assets->base_console_top : 0;
+ 	}
+ 	int crt_visible = state->crt.valid && crt_color;
+ 	XvtHudDraw display = XvtHudDraw_ForRect(&draw, state->crt.destination);

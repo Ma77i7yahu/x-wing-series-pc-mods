@@ -1,0 +1,98 @@
+From b263f87903bcf73f4b92616c8e6b0d69678d6b65 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Thu, 8 Oct 2026 06:30:13 +1100
+Subject: [PATCH 11/25] Add widescreen HUD and stretched cockpit toggles to
+ Video settings
+
+---
+ src/xvt_app/settings/video_page.c     |  4 ++++
+ src/xvt_runtime/config/video_config.c | 12 +++++++++++-
+ src/xvt_runtime/config/video_config.h |  2 ++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/xvt_app/settings/video_page.c b/src/xvt_app/settings/video_page.c
+index e33f2d6..2e14941 100644
+--- a/src/xvt_app/settings/video_page.c
++++ b/src/xvt_app/settings/video_page.c
+@@ -76,6 +76,10 @@ static void XvtVideoPage_DrawControls(AeronUiContext* ui) {
+ 		changed = true;
+ 	if (XvtHudAssets_UnditherPending(options.cockpit_undither))
+ 		AeronUi_Help(ui, "This change will take effect on the next cockpit load.");
++	if (AeronUi_Toggle(ui, "Widescreen Cockpit-Off HUD", &options.hud_widescreen))
++		changed = true;
++	if (AeronUi_Toggle(ui, "Stretch Cockpit to Widescreen", &options.cockpit_stretch))
++		changed = true;
+ 	static const char* const quality_labels[] = { "Off", "Low", "High" };
+ 	int ssao_quality = options.ssao_quality;
+ 	if (AeronUi_Selector(ui, "SSAO Quality", &ssao_quality, quality_labels, 3)) {
+diff --git a/src/xvt_runtime/config/video_config.c b/src/xvt_runtime/config/video_config.c
+index 794cbac..0587059 100644
+--- a/src/xvt_runtime/config/video_config.c
++++ b/src/xvt_runtime/config/video_config.c
+@@ -7,6 +7,8 @@
+ void XvtVideoSettings_Read(const XvtSettings* settings, XvtVideoSettings* out) {
+ 	memset(out, 0, sizeof *out);
+ 	out->cockpit_undither = settings->render.cockpit_undither;
++	out->hud_widescreen = settings->render.hud_widescreen;
++	out->cockpit_stretch = settings->render.cockpit_stretch;
+ 	out->fullscreen = settings->fullscreen;
+ 	out->hdr = settings->render.presentation.hdr_output;
+ 	out->sdr_gamma = settings->render.presentation.sdr_gamma;
+@@ -22,7 +24,8 @@ void XvtVideoSettings_Read(const XvtSettings* settings, XvtVideoSettings* out) {
+ }
+ 
+ bool XvtVideoSettings_Equals(const XvtVideoSettings* left, const XvtVideoSettings* right) {
+-	return left->cockpit_undither == right->cockpit_undither && left->fullscreen == right->fullscreen &&
++	return left->cockpit_undither == right->cockpit_undither && left->hud_widescreen == right->hud_widescreen &&
++		   left->cockpit_stretch == right->cockpit_stretch && left->fullscreen == right->fullscreen &&
+ 		   left->hdr == right->hdr && left->sdr_gamma == right->sdr_gamma &&
+ 		   left->paper_white_nits == right->paper_white_nits && left->ssao_quality == right->ssao_quality &&
+ 		   left->shadows_enabled == right->shadows_enabled &&
+@@ -35,6 +38,7 @@ bool XvtVideoSettings_Equals(const XvtVideoSettings* left, const XvtVideoSetting
+ bool XvtVideoSettings_Validate(const XvtVideoSettings* o, char* error, size_t capacity) {
+ 	bool valid =
+ 		o && (o->cockpit_undither == 0 || o->cockpit_undither == 1) &&
++		(o->hud_widescreen == 0 || o->hud_widescreen == 1) && (o->cockpit_stretch == 0 || o->cockpit_stretch == 1) &&
+ 		(o->fullscreen == 0 || o->fullscreen == 1) && (o->hdr == 0 || o->hdr == 1) &&
+ 		(o->sdr_gamma == -1 || o->sdr_gamma == 0 || o->sdr_gamma == 2.2f || o->sdr_gamma == 2.4f) &&
+ 		isfinite(o->paper_white_nits) && o->paper_white_nits >= 0 && o->ssao_quality >= 0 &&
+@@ -54,6 +58,8 @@ bool XvtVideoSettings_Validate(const XvtVideoSettings* o, char* error, size_t ca
+ 
+ void XvtVideoSettings_ApplyTo(const XvtVideoSettings* options, XvtRenderSettings* render) {
+ 	render->cockpit_undither = options->cockpit_undither;
++	render->hud_widescreen = options->hud_widescreen;
++	render->cockpit_stretch = options->cockpit_stretch;
+ 	render->presentation.hdr_output = options->hdr;
+ 	render->presentation.sdr_gamma = options->sdr_gamma;
+ 	render->presentation.paper_white_nits = options->paper_white_nits;
+@@ -69,6 +75,8 @@ void XvtVideoSettings_ApplyTo(const XvtVideoSettings* options, XvtRenderSettings
+ 
+ static const char* const g_videoPaths[] = {
+ 	"render.cockpit_undither",
++	"render.hud_widescreen",
++	"render.cockpit_stretch",
+ 	"video.window_mode",
+ 	"presentation.hdr_output",
+ 	"presentation.sdr_gamma",
+@@ -87,6 +95,8 @@ static bool XvtConfig_WriteVideo(AeronConfigFile* document, const XvtVideoSettin
+ 								 AeronConfigError* detail) {
+ 	static const char* modes[] = { "off", "native_aa", "quality", "balanced", "performance" };
+ 	return AeronConfigFile_SetBool(document, "render.cockpit_undither", options->cockpit_undither, detail) &&
++		   AeronConfigFile_SetBool(document, "render.hud_widescreen", options->hud_widescreen, detail) &&
++		   AeronConfigFile_SetBool(document, "render.cockpit_stretch", options->cockpit_stretch, detail) &&
+ 		   AeronConfigFile_SetString(document, "video.window_mode",
+ 									 options->fullscreen ? "fullscreen" : "windowed", detail) &&
+ 		   AeronConfigFile_SetBool(document, "presentation.hdr_output", options->hdr, detail) &&
+diff --git a/src/xvt_runtime/config/video_config.h b/src/xvt_runtime/config/video_config.h
+index f12b7cd..4fccfdf 100644
+--- a/src/xvt_runtime/config/video_config.h
++++ b/src/xvt_runtime/config/video_config.h
+@@ -4,6 +4,8 @@
+ 
+ typedef struct XvtVideoSettings {
+ 	int cockpit_undither;
++	int hud_widescreen;
++	int cockpit_stretch;
+ 	int fullscreen;
+ 	int hdr;
+ 	float sdr_gamma;

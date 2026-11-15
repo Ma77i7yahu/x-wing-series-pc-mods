@@ -1,0 +1,86 @@
+From db004210ffb2e3ce5b4be336cf8473d1699c2cb7 Mon Sep 17 00:00:00 2001
+From: Matthew <matthewhale@live.com.au>
+Date: Sat, 10 Oct 2026 11:23:57 +1100
+Subject: [PATCH 04/59] Charged cannon shots keep their heavier XvT sound
+
+---
+ src/xw/audio/fsfx.c                  | 9 +--------
+ src/xw_runtime/audio/weapon_sounds.c | 9 ---------
+ src/xw_runtime/audio/weapon_sounds.h | 4 +---
+ 3 files changed, 2 insertions(+), 20 deletions(-)
+
+diff --git a/src/xw/audio/fsfx.c b/src/xw/audio/fsfx.c
+index c7e77cf..e92e82b 100644
+--- a/src/xw/audio/fsfx.c
++++ b/src/xw/audio/fsfx.c
+@@ -4,7 +4,6 @@
+ #include "xw_dos94/audio/fsfx.h"
+ #include "xw_runtime/audio/imuse_session.h"
+ #include "xw_runtime/audio/player_engine.h"
+-#include "xw_runtime/audio/weapon_sounds.h"
+ #include "xw_runtime/runtime/flight_dispatch.h"
+ #include "xw_runtime/runtime/flight_types.h"
+ #endif
+@@ -198,14 +197,8 @@ int16_t fsfx_triggerlasersfx(uint16_t projectileObjectIndex) {
+ #ifdef XW_MODERN
+ 	{
+ 		int sound = XwFlightTypes_ProjectileSound(objectType);
+-		if (sound >= 0) {
+-			uint16_t source = g_objectTable[projectileObjectIndex].sourceObjectRef;
+-			bool starship = source < XW_CRAFT_OBJECT_COUNT && (g_objectTable[source].genusId == XW_GENUS_STARSHIP ||
+-															   g_objectTable[source].genusId == XW_GENUS_FREIGHTER);
+-			sound = XwWeaponSounds_SoundIndex(sound - FSFX_FIRST_PLAYABLE_SLOT, starship) +
+-					FSFX_FIRST_PLAYABLE_SLOT;
++		if (sound >= 0)
+ 			return fsfx_triggersfx(sound, projectileObjectIndex);
+-		}
+ 	}
+ 	return objectType;
+ #else
+diff --git a/src/xw_runtime/audio/weapon_sounds.c b/src/xw_runtime/audio/weapon_sounds.c
+index 6ce43cc..c71d502 100644
+--- a/src/xw_runtime/audio/weapon_sounds.c
++++ b/src/xw_runtime/audio/weapon_sounds.c
+@@ -12,7 +12,6 @@
+ /* XvT's SFXBLAST.LST order for species 137-142, matching X-Wing projectile indices 0-5. */
+ static const char* const g_xvtCannonSounds[6] = { "REB-LS-2", "REB-LS-4", "TL-SHT-1",
+ 												  "TL-BIG-B", "W-LASR-3", "CANNON-1" };
+-static bool g_loaded;
+ 
+ static uint32_t Le32(const uint8_t* p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+ 
+@@ -79,7 +78,6 @@ static uint16_t WavToVoc(const uint8_t* wav, size_t size) {
+ }
+ 
+ void XwWeaponSounds_Apply(void) {
+-	g_loaded = false;
+ 	if (!XwConfig_Settings()->xvt_weapon_sounds)
+ 		return;
+ 	uint16_t handles[6] = { 0 };
+@@ -104,11 +102,4 @@ void XwWeaponSounds_Apply(void) {
+ 			Memory_FreeHandle(g_fsfxLoadedSoundHandles[slot]);
+ 		g_fsfxLoadedSoundHandles[slot] = handles[i];
+ 	}
+-	g_loaded = true;
+-}
+-
+-int XwWeaponSounds_SoundIndex(int projectileIndex, bool sourceIsStarship) {
+-	if (g_loaded && !sourceIsStarship && (projectileIndex == 1 || projectileIndex == 5))
+-		return projectileIndex - 1;
+-	return projectileIndex;
+ }
+diff --git a/src/xw_runtime/audio/weapon_sounds.h b/src/xw_runtime/audio/weapon_sounds.h
+index 4fbecee..0a84609 100644
+--- a/src/xw_runtime/audio/weapon_sounds.h
++++ b/src/xw_runtime/audio/weapon_sounds.h
+@@ -7,9 +7,7 @@
+ /* audio.xvt_weapon_sounds: replace the six cannon bolt sounds (rebel/Imperial laser and turbolaser, ion and
+  * turbo ion) with X-Wing vs TIE Fighter's, read from RESOURCE xvt_weapon_sounds/<NAME>.WAV (8-bit PCM WAV,
+  * copied from an XvT installation at packaging time). Call after the flight sound bank loads. */
++/* X-Wing's charged shots (projectile 144/148) keep their heavier slot, so they get XvT's heavier sounds. */
+ void XwWeaponSounds_Apply(void);
+-/* With the XvT set loaded, starfighters' charged shots (projectile index 1 or 5) use the plain starfighter
+- * cannon sound as in XvT; turbolaser sounds stay with starship guns. Returns the projectile index to voice. */
+-int XwWeaponSounds_SoundIndex(int projectileIndex, bool sourceIsStarship);
+ 
+ #endif
